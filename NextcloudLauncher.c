@@ -22,10 +22,14 @@
 #define ID_TRAY_MENU_CLEAR_CACHE 2
 #define ID_TRAY_MENU_OPEN 3
 #define ID_TRAY_MENU_EXIT 4
+#define ID_TIMER_INITIAL_HIDE_JS 2
+#define INITIAL_HIDE_JS_DELAY_MS 2000
 
 typedef struct {
     wchar_t url[2048];
     wchar_t windowTitle[256];
+    wchar_t onHideJs[4096];
+    wchar_t onShowJs[4096];
 } Configuration;
 
 // Globals
@@ -63,6 +67,7 @@ void DebugPrint(const wchar_t* format, ...);
 void SetSpellCheckLanguages(ICoreWebView2* webview, const wchar_t* languages);
 void ReloadTargetPage(void);
 void ClearWebViewCacheAndReload(void);
+void ExecuteJavaScript(const wchar_t* js);
 
 // WebView2 Callbacks
 HRESULT STDMETHODCALLTYPE EnvCompletedHandler_QueryInterface(
@@ -116,10 +121,29 @@ typedef struct {
     LONG refCount;
 } ClearBrowsingDataCompletedHandler;
 
+// ExecuteScript completion handler (fire-and-forget)
+HRESULT STDMETHODCALLTYPE ExecuteScriptCompletedHandler_QueryInterface(
+    ICoreWebView2ExecuteScriptCompletedHandler* This,
+    REFIID riid, void** ppvObject);
+ULONG STDMETHODCALLTYPE ExecuteScriptCompletedHandler_AddRef(
+    ICoreWebView2ExecuteScriptCompletedHandler* This);
+ULONG STDMETHODCALLTYPE ExecuteScriptCompletedHandler_Release(
+    ICoreWebView2ExecuteScriptCompletedHandler* This);
+HRESULT STDMETHODCALLTYPE ExecuteScriptCompletedHandler_Invoke(
+    ICoreWebView2ExecuteScriptCompletedHandler* This,
+    HRESULT errorCode, LPCWSTR resultObjectAsJson);
+
+typedef struct {
+    ICoreWebView2ExecuteScriptCompletedHandlerVtbl* lpVtbl;
+    LONG refCount;
+} ExecuteScriptCompletedHandler;
+
 // Configuration functions
 void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     wcscpy_s(config->url, 2048, L"https://www.google.com/");
     wcscpy_s(config->windowTitle, 256, L"Nextcloud Launcher");
+    config->onHideJs[0] = L'\0';
+    config->onShowJs[0] = L'\0';
 
     if (!PathFileExistsW(iniPath)) {
         CreateDefaultIni(iniPath);
@@ -179,6 +203,10 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
         wcscpy_s(config->url, 2048, value);
     } else if (wcscmp(key, L"windowtitle") == 0) {
         wcscpy_s(config->windowTitle, 256, value);
+    } else if (wcscmp(key, L"onhidejs") == 0) {
+        wcscpy_s(config->onHideJs, 4096, value);
+    } else if (wcscmp(key, L"onshowjs") == 0) {
+        wcscpy_s(config->onShowJs, 4096, value);
     }
 }
 
@@ -343,8 +371,13 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
         
         // Set spell check languages to en-US and pl-PL
         SetSpellCheckLanguages(webview2, L"en-US,pl-PL");
-        
+
         InterlockedExchange(&g_isInitialized, TRUE);
+
+        // Schedule initial onHideJs execution (app starts hidden)
+        if (g_config.onHideJs[0] != L'\0') {
+            SetTimer(hwnd, ID_TIMER_INITIAL_HIDE_JS, INITIAL_HIDE_JS_DELAY_MS, NULL);
+        }
     }
 
     return S_OK;
@@ -389,6 +422,73 @@ HRESULT STDMETHODCALLTYPE ClearBrowsingDataCompletedHandler_Invoke(
     }
     ReloadTargetPage();
     return S_OK;
+}
+
+// ExecuteScript handler implementation (fire-and-forget)
+HRESULT STDMETHODCALLTYPE ExecuteScriptCompletedHandler_QueryInterface(
+    ICoreWebView2ExecuteScriptCompletedHandler* This,
+    REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2ExecuteScriptCompletedHandler)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE ExecuteScriptCompletedHandler_AddRef(
+    ICoreWebView2ExecuteScriptCompletedHandler* This) {
+    ExecuteScriptCompletedHandler* handler = (ExecuteScriptCompletedHandler*)This;
+    return InterlockedIncrement(&handler->refCount);
+}
+
+ULONG STDMETHODCALLTYPE ExecuteScriptCompletedHandler_Release(
+    ICoreWebView2ExecuteScriptCompletedHandler* This) {
+    ExecuteScriptCompletedHandler* handler = (ExecuteScriptCompletedHandler*)This;
+    ULONG refCount = InterlockedDecrement(&handler->refCount);
+    if (refCount == 0) {
+        free(handler);
+    }
+    return refCount;
+}
+
+HRESULT STDMETHODCALLTYPE ExecuteScriptCompletedHandler_Invoke(
+    ICoreWebView2ExecuteScriptCompletedHandler* This,
+    HRESULT errorCode, LPCWSTR resultObjectAsJson) {
+    (void)resultObjectAsJson;  // Unused
+    if (FAILED(errorCode)) {
+        DebugPrint(L"[WARNING] ExecuteScript failed. HRESULT: 0x%08X\n", errorCode);
+    }
+    return S_OK;
+}
+
+// Helper to execute JavaScript in WebView2
+void ExecuteJavaScript(const wchar_t* js) {
+    if (!g_webView || !js || js[0] == L'\0') return;
+
+    ExecuteScriptCompletedHandler* handler =
+        (ExecuteScriptCompletedHandler*)calloc(1, sizeof(ExecuteScriptCompletedHandler));
+    if (!handler) return;
+
+    static ICoreWebView2ExecuteScriptCompletedHandlerVtbl executeScriptVtbl = {
+        ExecuteScriptCompletedHandler_QueryInterface,
+        ExecuteScriptCompletedHandler_AddRef,
+        ExecuteScriptCompletedHandler_Release,
+        ExecuteScriptCompletedHandler_Invoke
+    };
+
+    handler->lpVtbl = &executeScriptVtbl;
+    handler->refCount = 1;
+
+    HRESULT hr = g_webView->lpVtbl->ExecuteScript(
+        g_webView, js, (ICoreWebView2ExecuteScriptCompletedHandler*)handler);
+    if (FAILED(hr)) {
+        DebugPrint(L"[WARNING] ExecuteScript call failed. HRESULT: 0x%08X\n", hr);
+    }
+
+    handler->lpVtbl->Release((ICoreWebView2ExecuteScriptCompletedHandler*)handler);
 }
 
 // Display helpers
@@ -449,12 +549,22 @@ void ShowMainWindow(void) {
         GetClientRect(g_hwnd, &bounds);
         g_webViewController->lpVtbl->put_Bounds(g_webViewController, bounds);
     }
-    
+
+    // Execute optional onShowJs from config
+    if (g_config.onShowJs[0] != L'\0') {
+        ExecuteJavaScript(g_config.onShowJs);
+    }
+
     DebugPrint(L"[INFO] Main window shown at %dx%d, size %dx%d\n", x, y, windowWidth, windowHeight);
 }
 
 void HideMainWindow(void) {
 	if (!g_hwnd) return;
+
+    // Execute optional onHideJs from config before hiding
+    if (g_config.onHideJs[0] != L'\0') {
+        ExecuteJavaScript(g_config.onHideJs);
+    }
 
     ShowWindow(g_hwnd, SW_HIDE);
 
@@ -664,6 +774,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 if (HasDisplaySettingsChanged()) {
                     RefreshTrayIcon();
                     CaptureDisplaySettings();
+                }
+            } else if (wParam == ID_TIMER_INITIAL_HIDE_JS) {
+                KillTimer(hwnd, ID_TIMER_INITIAL_HIDE_JS);
+                // Execute onHideJs on startup (app starts hidden)
+                if (g_config.onHideJs[0] != L'\0') {
+                    ExecuteJavaScript(g_config.onHideJs);
+                    DebugPrint(L"[INFO] Executed initial onHideJs\n");
                 }
             }
             return 0;
