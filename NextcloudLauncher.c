@@ -32,6 +32,12 @@ typedef struct {
     wchar_t onShowJs[4096];
 } Configuration;
 
+typedef enum {
+    JS_VISIBILITY_UNKNOWN = -1,
+    JS_VISIBILITY_HIDDEN = 0,
+    JS_VISIBILITY_SHOWN = 1
+} JsVisibility;
+
 // Globals
 static Configuration g_config;
 static HWND g_hwnd = NULL;
@@ -50,6 +56,7 @@ static float g_lastDpiX = 0.0f;
 static float g_lastDpiY = 0.0f;
 static volatile LONG g_isInitialized = FALSE;
 static HINSTANCE g_hInstance;
+static JsVisibility g_jsVisibility = JS_VISIBILITY_UNKNOWN;
 
 // Forward declarations
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
@@ -68,6 +75,9 @@ void SetSpellCheckLanguages(ICoreWebView2* webview, const wchar_t* languages);
 void ReloadTargetPage(void);
 void ClearWebViewCacheAndReload(void);
 void ExecuteJavaScript(const wchar_t* js);
+static BOOL IsWebViewReady(void);
+static BOOL IsWindowShownForJs(HWND hwnd);
+static void UpdateJsVisibilityState(HWND hwnd);
 
 // WebView2 Callbacks
 HRESULT STDMETHODCALLTYPE EnvCompletedHandler_QueryInterface(
@@ -374,8 +384,8 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
 
         InterlockedExchange(&g_isInitialized, TRUE);
 
-        // Schedule initial onHideJs execution (app starts hidden)
-        if (g_config.onHideJs[0] != L'\0') {
+        // Schedule initial JS sync after WebView is ready.
+        if (g_config.onHideJs[0] != L'\0' || g_config.onShowJs[0] != L'\0') {
             SetTimer(hwnd, ID_TIMER_INITIAL_HIDE_JS, INITIAL_HIDE_JS_DELAY_MS, NULL);
         }
     }
@@ -491,6 +501,36 @@ void ExecuteJavaScript(const wchar_t* js) {
     handler->lpVtbl->Release((ICoreWebView2ExecuteScriptCompletedHandler*)handler);
 }
 
+static BOOL IsWebViewReady(void) {
+    return InterlockedCompareExchange(&g_isInitialized, TRUE, TRUE) == TRUE && g_webView != NULL;
+}
+
+static BOOL IsWindowShownForJs(HWND hwnd) {
+    if (!hwnd) return FALSE;
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return FALSE;
+    return GetForegroundWindow() == hwnd;
+}
+
+static void UpdateJsVisibilityState(HWND hwnd) {
+    if (!IsWebViewReady()) return;
+
+    JsVisibility newState = IsWindowShownForJs(hwnd) ? JS_VISIBILITY_SHOWN : JS_VISIBILITY_HIDDEN;
+    if (newState == g_jsVisibility) return;
+
+    g_jsVisibility = newState;
+    if (newState == JS_VISIBILITY_SHOWN) {
+        if (g_config.onShowJs[0] != L'\0') {
+            ExecuteJavaScript(g_config.onShowJs);
+            DebugPrint(L"[INFO] Executed onShowJs (window active/visible)\n");
+        }
+    } else {
+        if (g_config.onHideJs[0] != L'\0') {
+            ExecuteJavaScript(g_config.onHideJs);
+            DebugPrint(L"[INFO] Executed onHideJs (window inactive/hidden)\n");
+        }
+    }
+}
+
 // Display helpers
 void CaptureDisplaySettings(void) {
     HDC hdcScreen = GetDC(NULL);
@@ -550,10 +590,7 @@ void ShowMainWindow(void) {
         g_webViewController->lpVtbl->put_Bounds(g_webViewController, bounds);
     }
 
-    // Execute optional onShowJs from config
-    if (g_config.onShowJs[0] != L'\0') {
-        ExecuteJavaScript(g_config.onShowJs);
-    }
+    UpdateJsVisibilityState(g_hwnd);
 
     DebugPrint(L"[INFO] Main window shown at %dx%d, size %dx%d\n", x, y, windowWidth, windowHeight);
 }
@@ -561,12 +598,8 @@ void ShowMainWindow(void) {
 void HideMainWindow(void) {
 	if (!g_hwnd) return;
 
-    // Execute optional onHideJs from config before hiding
-    if (g_config.onHideJs[0] != L'\0') {
-        ExecuteJavaScript(g_config.onHideJs);
-    }
-
     ShowWindow(g_hwnd, SW_HIDE);
+    UpdateJsVisibilityState(g_hwnd);
 
 	if (g_webView && g_initialUrl[0]) {
 		LPWSTR currentUrl = NULL;
@@ -777,20 +810,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 }
             } else if (wParam == ID_TIMER_INITIAL_HIDE_JS) {
                 KillTimer(hwnd, ID_TIMER_INITIAL_HIDE_JS);
-                // Execute appropriate JS based on current window state
-                if (IsWindowVisible(hwnd)) {
-                    if (g_config.onShowJs[0] != L'\0') {
-                        ExecuteJavaScript(g_config.onShowJs);
-                        DebugPrint(L"[INFO] Executed initial onShowJs (window visible)\n");
-                    }
-                } else {
-                    if (g_config.onHideJs[0] != L'\0') {
-                        ExecuteJavaScript(g_config.onHideJs);
-                        DebugPrint(L"[INFO] Executed initial onHideJs (window hidden)\n");
-                    }
-                }
+                UpdateJsVisibilityState(hwnd);
             }
             return 0;
+
+        case WM_ACTIVATE:
+            UpdateJsVisibilityState(hwnd);
+            break;
             
         case WM_SYSCOMMAND:
             if ((wParam & 0xFFF0) == SC_MINIMIZE) {
