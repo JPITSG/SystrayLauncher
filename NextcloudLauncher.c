@@ -495,11 +495,11 @@ void CreateTrayIcon(HWND hwnd) {
     ReleaseDC(NULL, hdcScreen);
     
     int iconSize = (dpiX >= 120) ? 32 : 16;
-    g_nid.hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCE(IDI_TRAYICON),
+    g_nid.hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_TRAYICON),
                                      IMAGE_ICON, iconSize, iconSize, LR_DEFAULTCOLOR);
-    
+
     if (!g_nid.hIcon) {
-        g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+        g_nid.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
     }
     
     wcscpy_s(g_nid.szTip, sizeof(g_nid.szTip)/sizeof(wchar_t), g_config.windowTitle);
@@ -785,11 +785,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.lpszClassName = L"NextcloudLauncherClass";
     
     // Load embedded icon for the application window
-    wc.hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCE(IDI_TRAYICON));
-    wc.hIconSm = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCE(IDI_TRAYICON),
+    wc.hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_TRAYICON));
+    wc.hIconSm = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_TRAYICON),
                                    IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
-    
-    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+
+    wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     
     if (!RegisterClassExW(&wc)) {

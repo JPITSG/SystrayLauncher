@@ -17,7 +17,7 @@ SDK_INCLUDE = $(SDK_DIR)/build/native/include
 SDK_DLL = $(SDK_DIR)/build/native/x64/WebView2Loader.dll
 SDK_LIB = $(SDK_DIR)/build/native/x64/WebView2Loader.dll.lib
 
-CFLAGS = -mwindows -I$(SDK_INCLUDE) -I.
+CFLAGS = -mwindows -isystem $(SDK_INCLUDE) -I.
 LDFLAGS = -mwindows
 LIBS = $(SDK_LIB) -lole32 -lshell32 -lshlwapi -luuid -luser32 -lgdi32 -lcomctl32
 
