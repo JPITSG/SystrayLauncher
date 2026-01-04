@@ -32,7 +32,8 @@ $(TARGET): $(OBJ)
 	@echo "Linking executable..."
 	$(CC) -o $@ $(OBJ) $(LDFLAGS) $(LIBS)
 	@rm -f $(OBJ)
-	@echo "Build complete: $(TARGET)"
+	@cp $(SDK_DLL) .
+	@echo "Build complete: $(TARGET) + WebView2Loader.dll"
 
 main.o: $(SOURCES)
 	@echo "Compiling $(SOURCES)..."
@@ -80,7 +81,7 @@ dist: all
 	@echo "Distribution ready in dist/"
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ) $(TARGET) WebView2Loader.dll
 
 clean-all: clean
 	rm -rf $(SDK_DIR) webview2.nupkg dist
