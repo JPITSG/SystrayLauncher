@@ -777,10 +777,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 }
             } else if (wParam == ID_TIMER_INITIAL_HIDE_JS) {
                 KillTimer(hwnd, ID_TIMER_INITIAL_HIDE_JS);
-                // Execute onHideJs on startup (app starts hidden)
-                if (g_config.onHideJs[0] != L'\0') {
-                    ExecuteJavaScript(g_config.onHideJs);
-                    DebugPrint(L"[INFO] Executed initial onHideJs\n");
+                // Execute appropriate JS based on current window state
+                if (IsWindowVisible(hwnd)) {
+                    if (g_config.onShowJs[0] != L'\0') {
+                        ExecuteJavaScript(g_config.onShowJs);
+                        DebugPrint(L"[INFO] Executed initial onShowJs (window visible)\n");
+                    }
+                } else {
+                    if (g_config.onHideJs[0] != L'\0') {
+                        ExecuteJavaScript(g_config.onHideJs);
+                        DebugPrint(L"[INFO] Executed initial onHideJs (window hidden)\n");
+                    }
                 }
             }
             return 0;
