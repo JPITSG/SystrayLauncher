@@ -457,12 +457,26 @@ void HideMainWindow(void) {
 	if (!g_hwnd) return;
 
     ShowWindow(g_hwnd, SW_HIDE);
-	
+
 	if (g_webView && g_initialUrl[0]) {
-		g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
-		DebugPrint(L"[INFO] Reset URL to initial on hide: %s\n", g_initialUrl);
+		LPWSTR currentUrl = NULL;
+		HRESULT hr = g_webView->lpVtbl->get_Source(g_webView, &currentUrl);
+
+		if (SUCCEEDED(hr) && currentUrl) {
+			if (wcscmp(currentUrl, g_initialUrl) != 0) {
+				g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
+				DebugPrint(L"[INFO] Reset URL to initial on hide: %s (was: %s)\n", g_initialUrl, currentUrl);
+			} else {
+				DebugPrint(L"[INFO] URL unchanged, skipping navigation on hide\n");
+			}
+			CoTaskMemFree(currentUrl);
+		} else {
+			// Fallback: navigate anyway if we couldn't get current URL
+			g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
+			DebugPrint(L"[INFO] Reset URL to initial on hide (couldn't check current): %s\n", g_initialUrl);
+		}
 	}
-	
+
     DebugPrint(L"[INFO] Main window hidden\n");
 }
 
