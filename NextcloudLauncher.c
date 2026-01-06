@@ -24,6 +24,8 @@
 #define ID_TRAY_MENU_EXIT 4
 #define ID_TIMER_INITIAL_HIDE_JS 2
 #define INITIAL_HIDE_JS_DELAY_MS 2000
+#define ID_TIMER_VISIBILITY_CHECK 3
+#define VISIBILITY_CHECK_INTERVAL_MS 250
 
 typedef struct {
     wchar_t url[2048];
@@ -76,8 +78,10 @@ void ReloadTargetPage(void);
 void ClearWebViewCacheAndReload(void);
 void ExecuteJavaScript(const wchar_t* js);
 static BOOL IsWebViewReady(void);
-static BOOL IsWindowShownForJs(HWND hwnd);
+static BOOL IsWindowActuallyVisible(HWND hwnd);
 static void UpdateJsVisibilityState(HWND hwnd);
+static void StartVisibilityTimer(HWND hwnd);
+static void StopVisibilityTimer(HWND hwnd);
 
 // WebView2 Callbacks
 HRESULT STDMETHODCALLTYPE EnvCompletedHandler_QueryInterface(
@@ -505,28 +509,103 @@ static BOOL IsWebViewReady(void) {
     return InterlockedCompareExchange(&g_isInitialized, TRUE, TRUE) == TRUE && g_webView != NULL;
 }
 
-static BOOL IsWindowShownForJs(HWND hwnd) {
+// Data structure for occlusion check enumeration
+typedef struct {
+    HWND targetHwnd;
+    HRGN visibleRgn;
+} OcclusionCheckData;
+
+// Callback for EnumWindows - subtracts each window above target from visible region
+static BOOL CALLBACK OcclusionEnumProc(HWND hwnd, LPARAM lParam) {
+    OcclusionCheckData* data = (OcclusionCheckData*)lParam;
+
+    // Stop when we reach our own window (windows below us don't occlude us)
+    if (hwnd == data->targetHwnd) {
+        return FALSE;
+    }
+
+    // Skip invisible or minimized windows
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) {
+        return TRUE;
+    }
+
+    // Skip windows with no area
+    RECT windowRect;
+    if (!GetWindowRect(hwnd, &windowRect)) {
+        return TRUE;
+    }
+    if (windowRect.right <= windowRect.left || windowRect.bottom <= windowRect.top) {
+        return TRUE;
+    }
+
+    // Subtract this window's rect from our visible region
+    HRGN windowRgn = CreateRectRgnIndirect(&windowRect);
+    if (windowRgn) {
+        CombineRgn(data->visibleRgn, data->visibleRgn, windowRgn, RGN_DIFF);
+        DeleteObject(windowRgn);
+    }
+
+    return TRUE;
+}
+
+// Check if ANY part of the window is visible (not fully covered by other windows)
+static BOOL IsWindowActuallyVisible(HWND hwnd) {
     if (!hwnd) return FALSE;
-    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return FALSE;
-    return GetForegroundWindow() == hwnd;
+    if (!IsWindowVisible(hwnd)) return FALSE;
+    if (IsIconic(hwnd)) return FALSE;
+
+    RECT ourRect;
+    if (!GetWindowRect(hwnd, &ourRect)) return FALSE;
+
+    // Create a region representing our window
+    HRGN visibleRgn = CreateRectRgnIndirect(&ourRect);
+    if (!visibleRgn) return FALSE;
+
+    OcclusionCheckData data;
+    data.targetHwnd = hwnd;
+    data.visibleRgn = visibleRgn;
+
+    // EnumWindows enumerates top-level windows in z-order (top to bottom)
+    // We subtract each window above us until we reach our own window
+    EnumWindows(OcclusionEnumProc, (LPARAM)&data);
+
+    // Check if any part of our window is still visible
+    RECT boundingBox;
+    int rgnType = GetRgnBox(visibleRgn, &boundingBox);
+    DeleteObject(visibleRgn);
+
+    // NULLREGION means our window is completely covered
+    return (rgnType != NULLREGION);
+}
+
+static void StartVisibilityTimer(HWND hwnd) {
+    if (g_config.onHideJs[0] != L'\0' || g_config.onShowJs[0] != L'\0') {
+        SetTimer(hwnd, ID_TIMER_VISIBILITY_CHECK, VISIBILITY_CHECK_INTERVAL_MS, NULL);
+        DebugPrint(L"[INFO] Started visibility check timer\n");
+    }
+}
+
+static void StopVisibilityTimer(HWND hwnd) {
+    KillTimer(hwnd, ID_TIMER_VISIBILITY_CHECK);
+    DebugPrint(L"[INFO] Stopped visibility check timer\n");
 }
 
 static void UpdateJsVisibilityState(HWND hwnd) {
     if (!IsWebViewReady()) return;
 
-    JsVisibility newState = IsWindowShownForJs(hwnd) ? JS_VISIBILITY_SHOWN : JS_VISIBILITY_HIDDEN;
+    JsVisibility newState = IsWindowActuallyVisible(hwnd) ? JS_VISIBILITY_SHOWN : JS_VISIBILITY_HIDDEN;
     if (newState == g_jsVisibility) return;
 
     g_jsVisibility = newState;
     if (newState == JS_VISIBILITY_SHOWN) {
         if (g_config.onShowJs[0] != L'\0') {
             ExecuteJavaScript(g_config.onShowJs);
-            DebugPrint(L"[INFO] Executed onShowJs (window active/visible)\n");
+            DebugPrint(L"[INFO] Executed onShowJs (window visible)\n");
         }
     } else {
         if (g_config.onHideJs[0] != L'\0') {
             ExecuteJavaScript(g_config.onHideJs);
-            DebugPrint(L"[INFO] Executed onHideJs (window inactive/hidden)\n");
+            DebugPrint(L"[INFO] Executed onHideJs (window fully covered/hidden)\n");
         }
     }
 }
@@ -570,7 +649,7 @@ void ShowMainWindow(void) {
 
     RECT workArea;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
-    
+
     int workWidth = workArea.right - workArea.left;
     int workHeight = workArea.bottom - workArea.top;
 
@@ -583,13 +662,15 @@ void ShowMainWindow(void) {
                  SWP_SHOWWINDOW | SWP_FRAMECHANGED);
     ShowWindow(g_hwnd, SW_RESTORE);
     SetForegroundWindow(g_hwnd);
-    
+
     if (g_webViewController) {
         RECT bounds;
         GetClientRect(g_hwnd, &bounds);
         g_webViewController->lpVtbl->put_Bounds(g_webViewController, bounds);
     }
 
+    // Start polling for visibility changes while window is shown
+    StartVisibilityTimer(g_hwnd);
     UpdateJsVisibilityState(g_hwnd);
 
     DebugPrint(L"[INFO] Main window shown at %dx%d, size %dx%d\n", x, y, windowWidth, windowHeight);
@@ -597,6 +678,9 @@ void ShowMainWindow(void) {
 
 void HideMainWindow(void) {
 	if (!g_hwnd) return;
+
+    // Stop visibility polling when window is hidden
+    StopVisibilityTimer(g_hwnd);
 
     ShowWindow(g_hwnd, SW_HIDE);
     UpdateJsVisibilityState(g_hwnd);
@@ -810,13 +894,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 }
             } else if (wParam == ID_TIMER_INITIAL_HIDE_JS) {
                 KillTimer(hwnd, ID_TIMER_INITIAL_HIDE_JS);
+                // Start visibility polling after initial JS sync
+                StartVisibilityTimer(hwnd);
+                UpdateJsVisibilityState(hwnd);
+            } else if (wParam == ID_TIMER_VISIBILITY_CHECK) {
+                // Periodic check for window occlusion
                 UpdateJsVisibilityState(hwnd);
             }
             return 0;
-
-        case WM_ACTIVATE:
-            UpdateJsVisibilityState(hwnd);
-            break;
             
         case WM_SYSCOMMAND:
             if ((wParam & 0xFFF0) == SC_MINIMIZE) {
