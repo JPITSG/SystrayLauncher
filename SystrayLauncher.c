@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <math.h>
@@ -13,15 +14,38 @@
 #define WINDOW_SIZE_PERCENTAGE 0.9
 #define RESOLUTION_CHANGE_DEBOUNCE_MS 1000
 #define CONFIG_FILENAME L"config.ini"
-#define APP_NAME L"NextcloudLauncher"
-#define MUTEX_NAME L"NextcloudLauncher_SingleInstance_Mutex_9F8A7B6C"
+#define APP_NAME L"SystrayLauncher"
+#define MUTEX_NAME L"SystrayLauncher_SingleInstance_Mutex_9F8A7B6C"
 #define TRAY_ICON_ID 100
 #define WM_TRAYICON (WM_APP + 1)
 #define IDI_TRAYICON 101  // Resource ID for embedded icon
 #define ID_TRAY_MENU_REFRESH 1
 #define ID_TRAY_MENU_CLEAR_CACHE 2
 #define ID_TRAY_MENU_OPEN 3
+#define ID_TRAY_MENU_CONFIGURE 5
 #define ID_TRAY_MENU_EXIT 4
+
+// Registry settings
+#define REG_COMPANY L"JPIT"
+#define REG_APPNAME L"SystrayLauncher"
+#define REG_KEY_PATH L"SOFTWARE\\JPIT\\SystrayLauncher"
+#define REG_VALUE_URL L"URL"
+#define REG_VALUE_TITLE L"WindowTitle"
+#define REG_VALUE_ONHIDEJS L"OnHideJS"
+#define REG_VALUE_ONSHOWJS L"OnShowJS"
+#define REG_VALUE_CONFIGURED L"Configured"
+
+// Dialog control IDs
+#define IDC_EDIT_URL 1001
+#define IDC_EDIT_TITLE 1002
+#define IDC_EDIT_ONHIDEJS 1003
+#define IDC_EDIT_ONSHOWJS 1004
+#define IDC_STATIC_URL 1005
+#define IDC_STATIC_TITLE 1006
+#define IDC_STATIC_ONHIDEJS 1007
+#define IDC_STATIC_ONSHOWJS 1008
+#define IDOK_BTN 1
+#define IDCANCEL_BTN 2
 #define ID_TIMER_INITIAL_HIDE_JS 2
 #define INITIAL_HIDE_JS_DELAY_MS 2000
 #define ID_TIMER_VISIBILITY_CHECK 3
@@ -82,6 +106,15 @@ static BOOL IsWindowActuallyVisible(HWND hwnd);
 static void UpdateJsVisibilityState(HWND hwnd);
 static void StartVisibilityTimer(HWND hwnd);
 static void StopVisibilityTimer(HWND hwnd);
+
+// Registry and config dialog functions
+static BOOL LoadConfigFromRegistry(Configuration* config);
+static BOOL SaveConfigToRegistry(const Configuration* config);
+static BOOL IsFirstLaunch(void);
+static void MarkAsConfigured(void);
+static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
+static BOOL ShowConfigDialog(HWND hwndParent);
+static void ApplyConfiguration(void);
 
 // WebView2 Callbacks
 HRESULT STDMETHODCALLTYPE EnvCompletedHandler_QueryInterface(
@@ -155,7 +188,7 @@ typedef struct {
 // Configuration functions
 void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     wcscpy_s(config->url, 2048, L"https://www.google.com/");
-    wcscpy_s(config->windowTitle, 256, L"Nextcloud Launcher");
+    wcscpy_s(config->windowTitle, 256, L"Systray Launcher");
     config->onHideJs[0] = L'\0';
     config->onShowJs[0] = L'\0';
 
@@ -225,16 +258,392 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
 }
 
 void CreateDefaultIni(const wchar_t* iniPath) {
-    const wchar_t* content = L"# NextcloudLauncher Configuration File\n"
+    const wchar_t* content = L"# SystrayLauncher Configuration File\n"
                              L"# Lines starting with # or ; are comments\n\n"
                              L"url=https://www.google.com/\n\n"
-                             L"windowtitle=Nextcloud Launcher\n";
+                             L"windowtitle=Systray Launcher\n";
     FILE* file = NULL;
     _wfopen_s(&file, iniPath, L"w, ccs=UTF-8");
     if (file) {
         fputws(content, file);
         fclose(file);
     }
+}
+
+// Registry functions
+static BOOL LoadConfigFromRegistry(Configuration* config) {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey);
+    if (result != ERROR_SUCCESS) {
+        return FALSE;
+    }
+
+    DWORD dataSize;
+    DWORD dataType;
+
+    // Load URL
+    dataSize = sizeof(config->url);
+    if (RegQueryValueExW(hKey, REG_VALUE_URL, NULL, &dataType, (LPBYTE)config->url, &dataSize) != ERROR_SUCCESS) {
+        wcscpy_s(config->url, 2048, L"https://www.google.com/");
+    }
+
+    // Load Window Title
+    dataSize = sizeof(config->windowTitle);
+    if (RegQueryValueExW(hKey, REG_VALUE_TITLE, NULL, &dataType, (LPBYTE)config->windowTitle, &dataSize) != ERROR_SUCCESS) {
+        wcscpy_s(config->windowTitle, 256, L"Systray Launcher");
+    }
+
+    // Load OnHideJS
+    dataSize = sizeof(config->onHideJs);
+    if (RegQueryValueExW(hKey, REG_VALUE_ONHIDEJS, NULL, &dataType, (LPBYTE)config->onHideJs, &dataSize) != ERROR_SUCCESS) {
+        config->onHideJs[0] = L'\0';
+    }
+
+    // Load OnShowJS
+    dataSize = sizeof(config->onShowJs);
+    if (RegQueryValueExW(hKey, REG_VALUE_ONSHOWJS, NULL, &dataType, (LPBYTE)config->onShowJs, &dataSize) != ERROR_SUCCESS) {
+        config->onShowJs[0] = L'\0';
+    }
+
+    RegCloseKey(hKey);
+    return TRUE;
+}
+
+static BOOL SaveConfigToRegistry(const Configuration* config) {
+    HKEY hKey;
+    DWORD disposition;
+    LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL,
+                                   REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, &disposition);
+    if (result != ERROR_SUCCESS) {
+        return FALSE;
+    }
+
+    // Save URL
+    RegSetValueExW(hKey, REG_VALUE_URL, 0, REG_SZ,
+                   (const BYTE*)config->url, (DWORD)((wcslen(config->url) + 1) * sizeof(wchar_t)));
+
+    // Save Window Title
+    RegSetValueExW(hKey, REG_VALUE_TITLE, 0, REG_SZ,
+                   (const BYTE*)config->windowTitle, (DWORD)((wcslen(config->windowTitle) + 1) * sizeof(wchar_t)));
+
+    // Save OnHideJS
+    RegSetValueExW(hKey, REG_VALUE_ONHIDEJS, 0, REG_SZ,
+                   (const BYTE*)config->onHideJs, (DWORD)((wcslen(config->onHideJs) + 1) * sizeof(wchar_t)));
+
+    // Save OnShowJS
+    RegSetValueExW(hKey, REG_VALUE_ONSHOWJS, 0, REG_SZ,
+                   (const BYTE*)config->onShowJs, (DWORD)((wcslen(config->onShowJs) + 1) * sizeof(wchar_t)));
+
+    RegCloseKey(hKey);
+    return TRUE;
+}
+
+static BOOL IsFirstLaunch(void) {
+    HKEY hKey;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, KEY_READ, &hKey);
+    if (result != ERROR_SUCCESS) {
+        return TRUE;  // Key doesn't exist = first launch
+    }
+
+    DWORD configured = 0;
+    DWORD dataSize = sizeof(configured);
+    result = RegQueryValueExW(hKey, REG_VALUE_CONFIGURED, NULL, NULL, (LPBYTE)&configured, &dataSize);
+    RegCloseKey(hKey);
+
+    return (result != ERROR_SUCCESS || configured == 0);
+}
+
+static void MarkAsConfigured(void) {
+    HKEY hKey;
+    DWORD disposition;
+    LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL,
+                                   REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, &disposition);
+    if (result == ERROR_SUCCESS) {
+        DWORD configured = 1;
+        RegSetValueExW(hKey, REG_VALUE_CONFIGURED, 0, REG_DWORD, (const BYTE*)&configured, sizeof(configured));
+        RegCloseKey(hKey);
+    }
+}
+
+static void ApplyConfiguration(void) {
+    // Update initial URL
+    wcscpy_s(g_initialUrl, 2048, g_config.url);
+
+    // Update window title
+    if (g_hwnd) {
+        SetWindowTextW(g_hwnd, g_config.windowTitle);
+    }
+
+    // Update tray icon tooltip
+    if (g_nid.hWnd) {
+        wcscpy_s(g_nid.szTip, sizeof(g_nid.szTip)/sizeof(wchar_t), g_config.windowTitle);
+        Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    }
+
+    // Navigate to the new URL only if the main window is visible
+    if (g_webView && g_hwnd && IsWindowVisible(g_hwnd)) {
+        g_webView->lpVtbl->Navigate(g_webView, g_config.url);
+    }
+}
+
+// Configuration dialog procedure
+static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
+    static Configuration* pTempConfig = NULL;
+
+    switch (message) {
+        case WM_INITDIALOG: {
+            pTempConfig = (Configuration*)lParam;
+            if (!pTempConfig) return FALSE;
+
+            // Set edit control text
+            SetDlgItemTextW(hDlg, IDC_EDIT_URL, pTempConfig->url);
+            SetDlgItemTextW(hDlg, IDC_EDIT_TITLE, pTempConfig->windowTitle);
+            SetDlgItemTextW(hDlg, IDC_EDIT_ONHIDEJS, pTempConfig->onHideJs);
+            SetDlgItemTextW(hDlg, IDC_EDIT_ONSHOWJS, pTempConfig->onShowJs);
+
+            // Center dialog on screen
+            RECT rcDlg, rcScreen;
+            GetWindowRect(hDlg, &rcDlg);
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &rcScreen, 0);
+            int x = rcScreen.left + ((rcScreen.right - rcScreen.left) - (rcDlg.right - rcDlg.left)) / 2;
+            int y = rcScreen.top + ((rcScreen.bottom - rcScreen.top) - (rcDlg.bottom - rcDlg.top)) / 2;
+            SetWindowPos(hDlg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+
+            return TRUE;
+        }
+
+        case WM_COMMAND:
+            switch (LOWORD(wParam)) {
+                case IDOK: {
+                    if (!pTempConfig) {
+                        EndDialog(hDlg, IDCANCEL);
+                        return TRUE;
+                    }
+
+                    // Get values from edit controls
+                    GetDlgItemTextW(hDlg, IDC_EDIT_URL, pTempConfig->url, 2048);
+                    GetDlgItemTextW(hDlg, IDC_EDIT_TITLE, pTempConfig->windowTitle, 256);
+                    GetDlgItemTextW(hDlg, IDC_EDIT_ONHIDEJS, pTempConfig->onHideJs, 4096);
+                    GetDlgItemTextW(hDlg, IDC_EDIT_ONSHOWJS, pTempConfig->onShowJs, 4096);
+
+                    // Trim whitespace from URL
+                    wchar_t* p = pTempConfig->url;
+                    while (*p && iswspace(*p)) p++;
+                    if (p != pTempConfig->url) {
+                        wmemmove(pTempConfig->url, p, wcslen(p) + 1);
+                    }
+                    size_t len = wcslen(pTempConfig->url);
+                    while (len > 0 && iswspace(pTempConfig->url[len - 1])) {
+                        pTempConfig->url[--len] = L'\0';
+                    }
+
+                    // Validate URL is not empty
+                    if (pTempConfig->url[0] == L'\0') {
+                        MessageBoxW(hDlg, L"URL cannot be empty.", L"Validation Error", MB_OK | MB_ICONWARNING);
+                        SetFocus(GetDlgItem(hDlg, IDC_EDIT_URL));
+                        return TRUE;
+                    }
+
+                    EndDialog(hDlg, IDOK);
+                    return TRUE;
+                }
+
+                case IDCANCEL:
+                    EndDialog(hDlg, IDCANCEL);
+                    return TRUE;
+            }
+            break;
+
+        case WM_CLOSE:
+            EndDialog(hDlg, IDCANCEL);
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// Helper to add a control to dialog template
+static BYTE* AddDialogControl(BYTE* ptr, WORD ctrlId, WORD classAtom, DWORD style,
+                               short posX, short posY, short width, short height,
+                               const wchar_t* text) {
+    // Align to DWORD
+    ptr = (BYTE*)(((ULONG_PTR)ptr + 3) & ~3);
+
+    DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)ptr;
+    item->style = style;
+    item->dwExtendedStyle = 0;
+    item->x = posX;
+    item->y = posY;
+    item->cx = width;
+    item->cy = height;
+    item->id = ctrlId;
+    ptr += sizeof(DLGITEMTEMPLATE);
+
+    // Class (atom)
+    *(WORD*)ptr = 0xFFFF;
+    ptr += sizeof(WORD);
+    *(WORD*)ptr = classAtom;
+    ptr += sizeof(WORD);
+
+    // Text
+    size_t textLen = wcslen(text) + 1;
+    memcpy(ptr, text, textLen * sizeof(wchar_t));
+    ptr += textLen * sizeof(wchar_t);
+
+    // Creation data (none)
+    *(WORD*)ptr = 0;
+    ptr += sizeof(WORD);
+
+    return ptr;
+}
+
+// Create and show configuration dialog
+static BOOL ShowConfigDialog(HWND hwndParent) {
+    // Create a copy of current config to edit
+    Configuration tempConfig;
+    memcpy(&tempConfig, &g_config, sizeof(Configuration));
+
+    // Dialog dimensions (in dialog units)
+    const short DLG_WIDTH = 320;
+    const short MARGIN_X = 8;
+    const short MARGIN_Y = 8;
+    const short LABEL_H = 10;
+    const short LABEL_GAP = 2;
+    const short EDIT_H = 14;
+    const short MULTILINE_H = 36;
+    const short SPACING = 6;
+    const short BTN_W = 50;
+    const short BTN_H = 14;
+
+    // Calculate dialog height based on contents
+    // 2 single-line fields + 2 multiline fields + buttons
+    const short DLG_HEIGHT = MARGIN_Y
+        + (LABEL_H + LABEL_GAP + EDIT_H + SPACING)      // Window Title
+        + (LABEL_H + LABEL_GAP + EDIT_H + SPACING)      // URL
+        + (LABEL_H + LABEL_GAP + MULTILINE_H + SPACING) // OnHideJS
+        + (LABEL_H + LABEL_GAP + MULTILINE_H)           // OnShowJS (no spacing after)
+        + SPACING + BTN_H + MARGIN_Y;                   // Buttons + bottom margin
+
+    short editW = DLG_WIDTH - (2 * MARGIN_X);
+    short yPos = MARGIN_Y;
+
+    // Allocate buffer for dialog template (generous size)
+    size_t templateSize = 4096;
+    BYTE* templateBuffer = (BYTE*)calloc(1, templateSize);
+    if (!templateBuffer) return FALSE;
+
+    BYTE* ptr = templateBuffer;
+
+    // DLGTEMPLATE
+    DLGTEMPLATE* dlgTemplate = (DLGTEMPLATE*)ptr;
+    dlgTemplate->style = DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT;
+    dlgTemplate->dwExtendedStyle = 0;
+    dlgTemplate->cdit = 10;  // 4 labels + 4 edits + 2 buttons
+    dlgTemplate->x = 0;
+    dlgTemplate->y = 0;
+    dlgTemplate->cx = DLG_WIDTH;
+    dlgTemplate->cy = DLG_HEIGHT;
+    ptr += sizeof(DLGTEMPLATE);
+
+    // Menu (none)
+    *(WORD*)ptr = 0;
+    ptr += sizeof(WORD);
+
+    // Class (default)
+    *(WORD*)ptr = 0;
+    ptr += sizeof(WORD);
+
+    // Title
+    const wchar_t* title = L"Configuration";
+    size_t titleLen = wcslen(title) + 1;
+    memcpy(ptr, title, titleLen * sizeof(wchar_t));
+    ptr += titleLen * sizeof(wchar_t);
+
+    // Font size
+    *(WORD*)ptr = 8;
+    ptr += sizeof(WORD);
+
+    // Font name
+    const wchar_t* fontName = L"Segoe UI";
+    size_t fontLen = wcslen(fontName) + 1;
+    memcpy(ptr, fontName, fontLen * sizeof(wchar_t));
+    ptr += fontLen * sizeof(wchar_t);
+
+    // Window Title label
+    ptr = AddDialogControl(ptr, IDC_STATIC_TITLE, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                           MARGIN_X, yPos, editW, LABEL_H, L"Window Title:");
+    yPos += LABEL_H + LABEL_GAP;
+
+    // Window Title edit
+    ptr = AddDialogControl(ptr, IDC_EDIT_TITLE, 0x0081,
+                           WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+                           MARGIN_X, yPos, editW, EDIT_H, L"");
+    yPos += EDIT_H + SPACING;
+
+    // URL label
+    ptr = AddDialogControl(ptr, IDC_STATIC_URL, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                           MARGIN_X, yPos, editW, LABEL_H, L"URL:");
+    yPos += LABEL_H + LABEL_GAP;
+
+    // URL edit
+    ptr = AddDialogControl(ptr, IDC_EDIT_URL, 0x0081,
+                           WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+                           MARGIN_X, yPos, editW, EDIT_H, L"");
+    yPos += EDIT_H + SPACING;
+
+    // OnHideJS label
+    ptr = AddDialogControl(ptr, IDC_STATIC_ONHIDEJS, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                           MARGIN_X, yPos, editW, LABEL_H, L"JavaScript on Hide (window fully covered):");
+    yPos += LABEL_H + LABEL_GAP;
+
+    // OnHideJS edit (multiline)
+    ptr = AddDialogControl(ptr, IDC_EDIT_ONHIDEJS, 0x0081,
+                           WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL,
+                           MARGIN_X, yPos, editW, MULTILINE_H, L"");
+    yPos += MULTILINE_H + SPACING;
+
+    // OnShowJS label
+    ptr = AddDialogControl(ptr, IDC_STATIC_ONSHOWJS, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                           MARGIN_X, yPos, editW, LABEL_H, L"JavaScript on Show (window becomes visible):");
+    yPos += LABEL_H + LABEL_GAP;
+
+    // OnShowJS edit (multiline)
+    ptr = AddDialogControl(ptr, IDC_EDIT_ONSHOWJS, 0x0081,
+                           WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL,
+                           MARGIN_X, yPos, editW, MULTILINE_H, L"");
+    yPos += MULTILINE_H + SPACING;
+
+    // OK button - position based on calculated yPos
+    short btnY = yPos;
+    short okX = DLG_WIDTH - MARGIN_X - BTN_W - 4 - BTN_W - 4;
+    ptr = AddDialogControl(ptr, IDOK, 0x0080,
+                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                           okX, btnY, BTN_W, BTN_H, L"OK");
+
+    // Cancel button
+    short cancelX = DLG_WIDTH - MARGIN_X - BTN_W - 4;
+    ptr = AddDialogControl(ptr, IDCANCEL, 0x0080,
+                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                           cancelX, btnY, BTN_W, BTN_H, L"Cancel");
+
+    INT_PTR result = DialogBoxIndirectParamW(g_hInstance, (DLGTEMPLATE*)templateBuffer,
+                                              hwndParent, ConfigDialogProc, (LPARAM)&tempConfig);
+    free(templateBuffer);
+
+    if (result == IDOK) {
+        // Copy temp config to global config
+        memcpy(&g_config, &tempConfig, sizeof(Configuration));
+
+        // Save to registry
+        SaveConfigToRegistry(&g_config);
+        MarkAsConfigured();
+
+        // Apply the new configuration
+        ApplyConfiguration();
+
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 // Function to enable spell checking via settings
@@ -828,15 +1237,16 @@ void ClearWebViewCacheAndReload(void) {
 void ShowContextMenu(HWND hwnd) {
     POINT pt;
     GetCursorPos(&pt);
-    
+
     HMENU hMenu = CreatePopupMenu();
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_REFRESH, L"Refresh");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_CLEAR_CACHE, L"Refresh + Clear Cache");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_OPEN, L"Open");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_CONFIGURE, L"Configure");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_EXIT, L"Exit");
-    
+
     SetForegroundWindow(hwnd);
     TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
     DestroyMenu(hMenu);
@@ -936,6 +1346,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 case ID_TRAY_MENU_OPEN:
                     ShowMainWindow();
                     return 0;
+                case ID_TRAY_MENU_CONFIGURE:
+                    ShowConfigDialog(hwnd);
+                    return 0;
                 case ID_TRAY_MENU_EXIT:
                     // Clean up tray icon resources before exit
                     if (g_nid.hIcon) {
@@ -976,7 +1389,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Single instance check
     g_hMutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        MessageBoxW(NULL, L"NextcloudLauncher is already running.\n\nCheck your system tray for the application icon.",
+        MessageBoxW(NULL, L"SystrayLauncher is already running.\n\nCheck your system tray for the application icon.",
                     L"Already Running", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
@@ -994,20 +1407,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     PathRemoveFileSpecW(exePath);
     wcscpy_s(g_iniPath, MAX_PATH, exePath);
     PathAppendW(g_iniPath, CONFIG_FILENAME);
-    
-    LoadConfiguration(g_iniPath, &g_config);
+
+    // Check if this is the first launch
+    BOOL isFirstLaunch = IsFirstLaunch();
+
+    // Try to load config from registry first
+    if (!LoadConfigFromRegistry(&g_config)) {
+        // Fallback to INI file (for migration or first launch)
+        LoadConfiguration(g_iniPath, &g_config);
+    }
     wcscpy_s(g_initialUrl, 2048, g_config.url);
-    
+
+    // On first launch, show configuration dialog
+    if (isFirstLaunch) {
+        // Show dialog before creating main window
+        // Create a temporary invisible parent for the dialog
+        if (!ShowConfigDialog(NULL)) {
+            // User cancelled on first launch - exit
+            CoUninitialize();
+            if (g_hMutex) {
+                ReleaseMutex(g_hMutex);
+                CloseHandle(g_hMutex);
+            }
+            return 0;
+        }
+        // Update initial URL after config dialog
+        wcscpy_s(g_initialUrl, 2048, g_config.url);
+    }
+
     // Register invisible owner window class (prevents taskbar appearance)
     WNDCLASSEXW ownerWc = {0};
     ownerWc.cbSize = sizeof(ownerWc);
     ownerWc.lpfnWndProc = DefWindowProcW;
     ownerWc.hInstance = hInstance;
-    ownerWc.lpszClassName = L"NextcloudLauncherOwner";
+    ownerWc.lpszClassName = L"SystrayLauncherOwner";
     RegisterClassExW(&ownerWc);
-    
+
     // Create invisible owner window
-    g_hwndOwner = CreateWindowExW(0, L"NextcloudLauncherOwner", L"",
+    g_hwndOwner = CreateWindowExW(0, L"SystrayLauncherOwner", L"",
                                   WS_POPUP, 0, 0, 0, 0,
                                   NULL, NULL, hInstance, NULL);
     
@@ -1017,7 +1454,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = L"NextcloudLauncherClass";
+    wc.lpszClassName = L"SystrayLauncherClass";
     
     // Load embedded icon for the application window
     wc.hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_TRAYICON));
@@ -1033,7 +1470,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     
     // Create main window with invisible owner (prevents taskbar appearance)
-    g_hwnd = CreateWindowExW(0, L"NextcloudLauncherClass", g_config.windowTitle,
+    g_hwnd = CreateWindowExW(0, L"SystrayLauncherClass", g_config.windowTitle,
                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                             1024, 768, g_hwndOwner, NULL, hInstance, NULL);
     if (!g_hwnd) {

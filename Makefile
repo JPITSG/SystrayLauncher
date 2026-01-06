@@ -1,11 +1,11 @@
-# NextcloudLauncher Makefile
+# SystrayLauncher Makefile
 # Cross-compile for Windows using MinGW-w64
 
 CC = x86_64-w64-mingw32-gcc
 WINDRES = x86_64-w64-mingw32-windres
 
-TARGET = NextcloudLauncher.exe
-SOURCES = NextcloudLauncher.c
+TARGET = SystrayLauncher.exe
+SOURCES = SystrayLauncher.c
 RESOURCES = resource.rc
 
 OBJ = main.o resource.o
