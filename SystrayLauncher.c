@@ -83,6 +83,7 @@ static float g_lastDpiY = 0.0f;
 static volatile LONG g_isInitialized = FALSE;
 static HINSTANCE g_hInstance;
 static JsVisibility g_jsVisibility = JS_VISIBILITY_UNKNOWN;
+static wchar_t g_webView2Version[128] = L"Unknown";
 
 // Forward declarations
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
@@ -706,10 +707,17 @@ ULONG STDMETHODCALLTYPE EnvCompletedHandler_Release(
 HRESULT STDMETHODCALLTYPE EnvCompletedHandler_Invoke(
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler* This,
     HRESULT result, ICoreWebView2Environment* environment) {
-    
+
     if (FAILED(result)) {
         MessageBoxW(NULL, L"WebView2 environment creation failed", L"Error", MB_OK | MB_ICONERROR);
         return result;
+    }
+
+    // Get WebView2 browser version string
+    LPWSTR versionString = NULL;
+    if (SUCCEEDED(environment->lpVtbl->get_BrowserVersionString(environment, &versionString)) && versionString) {
+        wcscpy_s(g_webView2Version, 128, versionString);
+        CoTaskMemFree(versionString);
     }
 
     EnvCompletedHandler* handler = (EnvCompletedHandler*)This;
@@ -1238,7 +1246,13 @@ void ShowContextMenu(HWND hwnd) {
     POINT pt;
     GetCursorPos(&pt);
 
+    // Build version string for menu
+    wchar_t versionLabel[160];
+    swprintf_s(versionLabel, 160, L"WebView2: %s", g_webView2Version);
+
     HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, versionLabel);
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_REFRESH, L"Refresh");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_CLEAR_CACHE, L"Refresh + Clear Cache");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
@@ -1338,9 +1352,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_COMMAND:
             switch (wParam) {
                 case ID_TRAY_MENU_REFRESH:
+                    ShowMainWindow();
                     ReloadTargetPage();
                     return 0;
                 case ID_TRAY_MENU_CLEAR_CACHE:
+                    ShowMainWindow();
                     ClearWebViewCacheAndReload();
                     return 0;
                 case ID_TRAY_MENU_OPEN:
