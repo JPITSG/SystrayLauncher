@@ -34,6 +34,25 @@ Settings available in the Configure dialog:
 | JavaScript on Hide | JS executed when window is fully covered or hidden |
 | JavaScript on Show | JS executed when window becomes visible |
 
+## Icon Customization
+
+The application uses a single icon file (`icon.ico`) that appears in multiple locations:
+
+| Location | Description |
+|----------|-------------|
+| System Tray | Small icon in the notification area (16x16 or 32x32 depending on DPI) |
+| Window Title Bar | Icon shown in the top-left corner of the main window |
+| Taskbar | Icon displayed when the window is visible |
+| Alt-Tab Switcher | Icon shown when cycling through windows |
+
+### Replacing the Icon
+
+1. Replace `icon.svg` with your own SVG file
+2. Run `make icon` to generate `icon.ico` (requires ImageMagick)
+3. Rebuild with `make`
+
+This generates a multi-resolution `.ico` containing 16x16, 24x24, 32x32, 48x48, and 256x256 sizes, covering all DPI scaling levels. The icon is embedded into the executable at compile time via `resource.rc`.
+
 ## Requirements
 
 - Windows 10/11
