@@ -24,7 +24,7 @@ CFLAGS = -mwindows -isystem $(SDK_INCLUDE) -I.
 LDFLAGS = -mwindows
 LIBS = $(SDK_LIB) -lole32 -lshell32 -lshlwapi -luuid -luser32 -lgdi32 -lcomctl32
 
-.PHONY: all clean deps check-deps dist icon
+.PHONY: all clean deps check-deps icon
 
 all: check-deps $(TARGET)
 
@@ -33,7 +33,11 @@ $(TARGET): $(OBJ)
 	$(CC) -o $@ $(OBJ) $(LDFLAGS) $(LIBS)
 	@rm -f $(OBJ)
 	@cp $(SDK_DLL) .
+	@mkdir -p release
+	@cp $(TARGET) release/
+	@cp $(SDK_DLL) release/
 	@echo "Build complete: $(TARGET) + WebView2Loader.dll"
+	@echo "Release binaries copied to release/"
 
 main.o: $(SOURCES)
 	@echo "Compiling $(SOURCES)..."
@@ -72,16 +76,8 @@ check-deps:
 		exit 1; \
 	fi
 
-# Create distribution folder with exe and required DLL
-dist: all
-	@echo "Creating distribution..."
-	mkdir -p dist
-	cp $(TARGET) dist/
-	cp $(SDK_DLL) dist/
-	@echo "Distribution ready in dist/"
-
 clean:
 	rm -f $(OBJ) $(TARGET) WebView2Loader.dll
 
 clean-all: clean
-	rm -rf $(SDK_DIR) webview2.nupkg dist
+	rm -rf $(SDK_DIR) webview2.nupkg release

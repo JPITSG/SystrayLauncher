@@ -13,7 +13,8 @@ Thumbs.db
 *.o
 *.exe
 *.dll
+!release/*.exe
+!release/*.dll
 webview2_sdk/
 webview2.nupkg
-dist/
 icon.*
