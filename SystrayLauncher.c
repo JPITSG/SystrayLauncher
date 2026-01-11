@@ -1352,11 +1352,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_COMMAND:
             switch (wParam) {
                 case ID_TRAY_MENU_REFRESH:
-                    ShowMainWindow();
+                    // If window is already restored and visible, don't reposition it
+                    if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd) && IsWindowActuallyVisible(g_hwnd)) {
+                        SetForegroundWindow(g_hwnd);
+                    } else {
+                        ShowMainWindow();
+                    }
                     ReloadTargetPage();
                     return 0;
                 case ID_TRAY_MENU_CLEAR_CACHE:
-                    ShowMainWindow();
+                    // If window is already restored and visible, don't reposition it
+                    if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd) && IsWindowActuallyVisible(g_hwnd)) {
+                        SetForegroundWindow(g_hwnd);
+                    } else {
+                        ShowMainWindow();
+                    }
                     ClearWebViewCacheAndReload();
                     return 0;
                 case ID_TRAY_MENU_OPEN:
