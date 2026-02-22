@@ -39,6 +39,8 @@
 #define INITIAL_HIDE_JS_DELAY_MS 2000
 #define ID_TIMER_VISIBILITY_CHECK 3
 #define VISIBILITY_CHECK_INTERVAL_MS 250
+#define ID_TIMER_CFG_SHOW_FALLBACK 4
+#define CFG_SHOW_FALLBACK_DELAY_MS 350
 
 typedef struct {
     wchar_t url[2048];
@@ -505,6 +507,14 @@ static void webview_cfg_execute_script(const wchar_t* script) {
     handler->lpVtbl->Release((ICoreWebView2ExecuteScriptCompletedHandler*)handler);
 }
 
+static void cfg_sync_controller_bounds(void) {
+    if (!g_cfgController || !g_cfgHwnd) return;
+    RECT bounds;
+    GetClientRect(g_cfgHwnd, &bounds);
+    g_cfgController->lpVtbl->put_Bounds(g_cfgController, bounds);
+    g_cfgController->lpVtbl->put_IsVisible(g_cfgController, TRUE);
+}
+
 static void webview_push_init_config(void) {
     wchar_t eUrl[4096], eTitle[512], eHide[8192], eShow[8192];
     json_escape_wstring(g_config.url, eUrl, 4096);
@@ -597,6 +607,7 @@ static HRESULT STDMETHODCALLTYPE CfgCtrlCompleted_Invoke(
     RECT bounds;
     GetClientRect(g_cfgHwnd, &bounds);
     controller->lpVtbl->put_Bounds(controller, bounds);
+    controller->lpVtbl->put_IsVisible(controller, TRUE);
 
     ICoreWebView2 *webview = NULL;
     controller->lpVtbl->get_CoreWebView2(controller, &webview);
@@ -718,9 +729,11 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                 flags |= SWP_NOACTIVATE;
             } else {
                 flags |= SWP_SHOWWINDOW;
+                KillTimer(g_cfgHwnd, ID_TIMER_CFG_SHOW_FALLBACK);
             }
             SetWindowPos(g_cfgHwnd, NULL, 0, 0, windowW, newWindowH, flags);
             g_cfgWindowShown = TRUE;
+            cfg_sync_controller_bounds();
         }
     }
 
@@ -732,15 +745,25 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
 static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_SIZE:
-            if (g_cfgController) {
-                RECT bounds;
-                GetClientRect(hwnd, &bounds);
-                g_cfgController->lpVtbl->put_Bounds(g_cfgController, bounds);
-            }
+            cfg_sync_controller_bounds();
             return 0;
+
+        case WM_TIMER:
+            if (wParam == ID_TIMER_CFG_SHOW_FALLBACK) {
+                KillTimer(hwnd, ID_TIMER_CFG_SHOW_FALLBACK);
+                if (!g_cfgWindowShown) {
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    UpdateWindow(hwnd);
+                    g_cfgWindowShown = TRUE;
+                    cfg_sync_controller_bounds();
+                }
+                return 0;
+            }
+            break;
 
         case WM_CLOSE:
             g_cfgWindowShown = FALSE;
+            KillTimer(hwnd, ID_TIMER_CFG_SHOW_FALLBACK);
             if (g_cfgController) {
                 g_cfgController->lpVtbl->Close(g_cfgController);
                 g_cfgController->lpVtbl->Release(g_cfgController);
@@ -760,6 +783,7 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_DESTROY:
             g_cfgHwnd = NULL;
             g_cfgWindowShown = FALSE;
+            KillTimer(hwnd, ID_TIMER_CFG_SHOW_FALLBACK);
             return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -809,6 +833,7 @@ static void ShowConfigWebViewDialog(void) {
 
     if (!g_cfgHwnd) return;
     g_cfgWindowShown = FALSE;
+    SetTimer(g_cfgHwnd, ID_TIMER_CFG_SHOW_FALLBACK, CFG_SHOW_FALLBACK_DELAY_MS, NULL);
 
     // Build user data folder path
     WCHAR userDataFolder[MAX_PATH];
