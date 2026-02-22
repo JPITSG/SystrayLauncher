@@ -10,6 +10,7 @@
 
 // WebView2 headers required from SDK
 #include "WebView2.h"
+#include "resource.h"
 
 #define WINDOW_SIZE_PERCENTAGE 0.9
 #define RESOLUTION_CHANGE_DEBOUNCE_MS 1000
@@ -18,7 +19,6 @@
 #define MUTEX_NAME L"SystrayLauncher_SingleInstance_Mutex_9F8A7B6C"
 #define TRAY_ICON_ID 100
 #define WM_TRAYICON (WM_APP + 1)
-#define IDI_TRAYICON 101  // Resource ID for embedded icon
 #define ID_TRAY_MENU_REFRESH 1
 #define ID_TRAY_MENU_CLEAR_CACHE 2
 #define ID_TRAY_MENU_OPEN 3
@@ -35,17 +35,6 @@
 #define REG_VALUE_ONSHOWJS L"OnShowJS"
 #define REG_VALUE_CONFIGURED L"Configured"
 
-// Dialog control IDs
-#define IDC_EDIT_URL 1001
-#define IDC_EDIT_TITLE 1002
-#define IDC_EDIT_ONHIDEJS 1003
-#define IDC_EDIT_ONSHOWJS 1004
-#define IDC_STATIC_URL 1005
-#define IDC_STATIC_TITLE 1006
-#define IDC_STATIC_ONHIDEJS 1007
-#define IDC_STATIC_ONSHOWJS 1008
-#define IDOK_BTN 1
-#define IDCANCEL_BTN 2
 #define ID_TIMER_INITIAL_HIDE_JS 2
 #define INITIAL_HIDE_JS_DELAY_MS 2000
 #define ID_TIMER_VISIBILITY_CHECK 3
@@ -85,6 +74,20 @@ static HINSTANCE g_hInstance;
 static JsVisibility g_jsVisibility = JS_VISIBILITY_UNKNOWN;
 static wchar_t g_webView2Version[128] = L"Unknown";
 
+// Config dialog WebView2 globals
+static HWND g_cfgHwnd = NULL;
+static ICoreWebView2Environment* g_cfgEnv = NULL;
+static ICoreWebView2Controller* g_cfgController = NULL;
+static ICoreWebView2* g_cfgWebView = NULL;
+static BOOL g_cfgSaved = FALSE;
+
+// Dynamic WebView2 loading
+static WCHAR g_extractedDllPath[MAX_PATH] = {0};
+typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
+    LPCWSTR, LPCWSTR, void*,
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
+static PFN_CreateCoreWebView2EnvironmentWithOptions fnCreateEnvironment = NULL;
+
 // Forward declarations
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 void LoadConfiguration(const wchar_t* iniPath, Configuration* config);
@@ -113,9 +116,9 @@ static BOOL LoadConfigFromRegistry(Configuration* config);
 static BOOL SaveConfigToRegistry(const Configuration* config);
 static BOOL IsFirstLaunch(void);
 static void MarkAsConfigured(void);
-static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
-static BOOL ShowConfigDialog(HWND hwndParent);
 static void ApplyConfiguration(void);
+static BOOL load_webview2_loader(void);
+static void ShowConfigWebViewDialog(void);
 
 // WebView2 Callbacks
 HRESULT STDMETHODCALLTYPE EnvCompletedHandler_QueryInterface(
@@ -387,264 +390,445 @@ static void ApplyConfiguration(void) {
     }
 }
 
-// Configuration dialog procedure
-static INT_PTR CALLBACK ConfigDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
-    static Configuration* pTempConfig = NULL;
-
-    switch (message) {
-        case WM_INITDIALOG: {
-            pTempConfig = (Configuration*)lParam;
-            if (!pTempConfig) return FALSE;
-
-            // Set edit control text
-            SetDlgItemTextW(hDlg, IDC_EDIT_URL, pTempConfig->url);
-            SetDlgItemTextW(hDlg, IDC_EDIT_TITLE, pTempConfig->windowTitle);
-            SetDlgItemTextW(hDlg, IDC_EDIT_ONHIDEJS, pTempConfig->onHideJs);
-            SetDlgItemTextW(hDlg, IDC_EDIT_ONSHOWJS, pTempConfig->onShowJs);
-
-            // Center dialog on screen
-            RECT rcDlg, rcScreen;
-            GetWindowRect(hDlg, &rcDlg);
-            SystemParametersInfoW(SPI_GETWORKAREA, 0, &rcScreen, 0);
-            int x = rcScreen.left + ((rcScreen.right - rcScreen.left) - (rcDlg.right - rcDlg.left)) / 2;
-            int y = rcScreen.top + ((rcScreen.bottom - rcScreen.top) - (rcDlg.bottom - rcDlg.top)) / 2;
-            SetWindowPos(hDlg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-
-            return TRUE;
-        }
-
-        case WM_COMMAND:
-            switch (LOWORD(wParam)) {
-                case IDOK: {
-                    if (!pTempConfig) {
-                        EndDialog(hDlg, IDCANCEL);
-                        return TRUE;
+// Dynamic WebView2 loader extraction
+static BOOL load_webview2_loader(void) {
+    HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(IDR_WEBVIEW2_DLL), RT_RCDATA);
+    if (hRes) {
+        HGLOBAL hData = LoadResource(NULL, hRes);
+        DWORD dllSize = SizeofResource(NULL, hRes);
+        const void *dllBytes = LockResource(hData);
+        if (dllBytes && dllSize > 0) {
+            WCHAR tempDir[MAX_PATH];
+            DWORD tempLen = GetTempPathW(MAX_PATH, tempDir);
+            if (tempLen > 0 && tempLen < MAX_PATH - 30) {
+                swprintf(g_extractedDllPath, MAX_PATH, L"%sWebView2Loader.dll", tempDir);
+                HANDLE hFile = CreateFileW(g_extractedDllPath, GENERIC_WRITE, 0, NULL,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    DWORD written = 0;
+                    WriteFile(hFile, dllBytes, dllSize, &written, NULL);
+                    CloseHandle(hFile);
+                    if (written == dllSize) {
+                        HMODULE hMod = LoadLibraryW(g_extractedDllPath);
+                        if (hMod) {
+                            fnCreateEnvironment = (PFN_CreateCoreWebView2EnvironmentWithOptions)
+                                GetProcAddress(hMod, "CreateCoreWebView2EnvironmentWithOptions");
+                            if (fnCreateEnvironment) return TRUE;
+                        }
                     }
-
-                    // Get values from edit controls
-                    GetDlgItemTextW(hDlg, IDC_EDIT_URL, pTempConfig->url, 2048);
-                    GetDlgItemTextW(hDlg, IDC_EDIT_TITLE, pTempConfig->windowTitle, 256);
-                    GetDlgItemTextW(hDlg, IDC_EDIT_ONHIDEJS, pTempConfig->onHideJs, 4096);
-                    GetDlgItemTextW(hDlg, IDC_EDIT_ONSHOWJS, pTempConfig->onShowJs, 4096);
-
-                    // Trim whitespace from URL
-                    wchar_t* p = pTempConfig->url;
-                    while (*p && iswspace(*p)) p++;
-                    if (p != pTempConfig->url) {
-                        wmemmove(pTempConfig->url, p, wcslen(p) + 1);
-                    }
-                    size_t len = wcslen(pTempConfig->url);
-                    while (len > 0 && iswspace(pTempConfig->url[len - 1])) {
-                        pTempConfig->url[--len] = L'\0';
-                    }
-
-                    // Validate URL is not empty
-                    if (pTempConfig->url[0] == L'\0') {
-                        MessageBoxW(hDlg, L"URL cannot be empty.", L"Validation Error", MB_OK | MB_ICONWARNING);
-                        SetFocus(GetDlgItem(hDlg, IDC_EDIT_URL));
-                        return TRUE;
-                    }
-
-                    EndDialog(hDlg, IDOK);
-                    return TRUE;
                 }
-
-                case IDCANCEL:
-                    EndDialog(hDlg, IDCANCEL);
-                    return TRUE;
             }
-            break;
-
-        case WM_CLOSE:
-            EndDialog(hDlg, IDCANCEL);
-            return TRUE;
+        }
     }
     return FALSE;
 }
 
-// Helper to add a control to dialog template
-static BYTE* AddDialogControl(BYTE* ptr, WORD ctrlId, WORD classAtom, DWORD style,
-                               short posX, short posY, short width, short height,
-                               const wchar_t* text) {
-    // Align to DWORD
-    ptr = (BYTE*)(((ULONG_PTR)ptr + 3) & ~3);
-
-    DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)ptr;
-    item->style = style;
-    item->dwExtendedStyle = 0;
-    item->x = posX;
-    item->y = posY;
-    item->cx = width;
-    item->cy = height;
-    item->id = ctrlId;
-    ptr += sizeof(DLGITEMTEMPLATE);
-
-    // Class (atom)
-    *(WORD*)ptr = 0xFFFF;
-    ptr += sizeof(WORD);
-    *(WORD*)ptr = classAtom;
-    ptr += sizeof(WORD);
-
-    // Text
-    size_t textLen = wcslen(text) + 1;
-    memcpy(ptr, text, textLen * sizeof(wchar_t));
-    ptr += textLen * sizeof(wchar_t);
-
-    // Creation data (none)
-    *(WORD*)ptr = 0;
-    ptr += sizeof(WORD);
-
-    return ptr;
+// JSON helpers
+static BOOL json_get_string(const char *json, const char *key, char *out, size_t outLen) {
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(json, search);
+    if (!p) return FALSE;
+    p += strlen(search);
+    while (*p == ' ' || *p == ':') p++;
+    if (*p != '"') return FALSE;
+    p++;
+    size_t i = 0;
+    while (*p && i < outLen - 1) {
+        if (*p == '"') break;
+        if (*p == '\\' && *(p + 1)) {
+            p++;
+            switch (*p) {
+                case '"':  out[i++] = '"';  break;
+                case '\\': out[i++] = '\\'; break;
+                case 'n':  out[i++] = '\n'; break;
+                case 'r':  out[i++] = '\r'; break;
+                case 't':  out[i++] = '\t'; break;
+                default:   out[i++] = *p;   break;
+            }
+        } else {
+            out[i++] = *p;
+        }
+        p++;
+    }
+    out[i] = '\0';
+    return TRUE;
 }
 
-// Create and show configuration dialog
-static BOOL ShowConfigDialog(HWND hwndParent) {
-    // Create a copy of current config to edit
-    Configuration tempConfig;
-    memcpy(&tempConfig, &g_config, sizeof(Configuration));
+static void json_escape_wstring(const wchar_t *in, wchar_t *out, size_t outLen) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j < outLen - 2; i++) {
+        wchar_t c = in[i];
+        if (c == L'"' || c == L'\\') {
+            if (j + 2 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = c;
+        } else if (c == L'\n') {
+            if (j + 2 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = L'n';
+        } else if (c == L'\r') {
+            if (j + 2 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = L'r';
+        } else if (c == L'\t') {
+            if (j + 2 >= outLen) break;
+            out[j++] = L'\\';
+            out[j++] = L't';
+        } else {
+            out[j++] = c;
+        }
+    }
+    out[j] = L'\0';
+}
 
-    // Dialog dimensions (in dialog units)
-    const short DLG_WIDTH = 320;
-    const short MARGIN_X = 8;
-    const short MARGIN_Y = 8;
-    const short LABEL_H = 10;
-    const short LABEL_GAP = 2;
-    const short EDIT_H = 14;
-    const short MULTILINE_H = 36;
-    const short SPACING = 6;
-    const short BTN_W = 50;
-    const short BTN_H = 14;
+// Config dialog WebView2 helpers
+static void webview_cfg_execute_script(const wchar_t* script) {
+    if (!g_cfgWebView || !script) return;
 
-    // Calculate dialog height based on contents
-    // 2 single-line fields + 2 multiline fields + buttons
-    const short DLG_HEIGHT = MARGIN_Y
-        + (LABEL_H + LABEL_GAP + EDIT_H + SPACING)      // Window Title
-        + (LABEL_H + LABEL_GAP + EDIT_H + SPACING)      // URL
-        + (LABEL_H + LABEL_GAP + MULTILINE_H + SPACING) // OnHideJS
-        + (LABEL_H + LABEL_GAP + MULTILINE_H)           // OnShowJS (no spacing after)
-        + SPACING + BTN_H + MARGIN_Y;                   // Buttons + bottom margin
+    ExecuteScriptCompletedHandler* handler =
+        (ExecuteScriptCompletedHandler*)calloc(1, sizeof(ExecuteScriptCompletedHandler));
+    if (!handler) return;
 
-    short editW = DLG_WIDTH - (2 * MARGIN_X);
-    short yPos = MARGIN_Y;
+    static ICoreWebView2ExecuteScriptCompletedHandlerVtbl vtbl = {
+        ExecuteScriptCompletedHandler_QueryInterface,
+        ExecuteScriptCompletedHandler_AddRef,
+        ExecuteScriptCompletedHandler_Release,
+        ExecuteScriptCompletedHandler_Invoke
+    };
+    handler->lpVtbl = &vtbl;
+    handler->refCount = 1;
 
-    // Allocate buffer for dialog template (generous size)
-    size_t templateSize = 4096;
-    BYTE* templateBuffer = (BYTE*)calloc(1, templateSize);
-    if (!templateBuffer) return FALSE;
+    g_cfgWebView->lpVtbl->ExecuteScript(g_cfgWebView, script,
+        (ICoreWebView2ExecuteScriptCompletedHandler*)handler);
+    handler->lpVtbl->Release((ICoreWebView2ExecuteScriptCompletedHandler*)handler);
+}
 
-    BYTE* ptr = templateBuffer;
+static void webview_push_init_config(void) {
+    wchar_t eUrl[4096], eTitle[512], eHide[8192], eShow[8192];
+    json_escape_wstring(g_config.url, eUrl, 4096);
+    json_escape_wstring(g_config.windowTitle, eTitle, 512);
+    json_escape_wstring(g_config.onHideJs, eHide, 8192);
+    json_escape_wstring(g_config.onShowJs, eShow, 8192);
 
-    // DLGTEMPLATE
-    DLGTEMPLATE* dlgTemplate = (DLGTEMPLATE*)ptr;
-    dlgTemplate->style = DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT;
-    dlgTemplate->dwExtendedStyle = 0;
-    dlgTemplate->cdit = 10;  // 4 labels + 4 edits + 2 buttons
-    dlgTemplate->x = 0;
-    dlgTemplate->y = 0;
-    dlgTemplate->cx = DLG_WIDTH;
-    dlgTemplate->cy = DLG_HEIGHT;
-    ptr += sizeof(DLGTEMPLATE);
+    wchar_t script[16384];
+    swprintf(script, 16384,
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\"}})",
+        eUrl, eTitle, eHide, eShow);
+    webview_cfg_execute_script(script);
+}
 
-    // Menu (none)
-    *(WORD*)ptr = 0;
-    ptr += sizeof(WORD);
+// Minimal COM handler struct for config dialog (shared by all cfg handlers)
+typedef struct {
+    void* lpVtbl;
+    LONG refCount;
+} CfgHandler;
 
-    // Class (default)
-    *(WORD*)ptr = 0;
-    ptr += sizeof(WORD);
+// Config dialog COM handlers — simplified pattern
+static HRESULT STDMETHODCALLTYPE CfgHandler_QueryInterface(
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *This, REFIID riid, void **ppv) {
+    (void)riid;
+    *ppv = This;
+    ((CfgHandler*)This)->refCount++;
+    return S_OK;
+}
+static ULONG STDMETHODCALLTYPE CfgHandler_AddRef(
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *This) {
+    return ++((CfgHandler*)This)->refCount;
+}
+static ULONG STDMETHODCALLTYPE CfgHandler_Release(
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *This) {
+    ULONG rc = --((CfgHandler*)This)->refCount;
+    if (rc == 0) free(This);
+    return rc;
+}
 
-    // Title
-    const wchar_t* title = L"Configuration";
-    size_t titleLen = wcslen(title) + 1;
-    memcpy(ptr, title, titleLen * sizeof(wchar_t));
-    ptr += titleLen * sizeof(wchar_t);
+static HRESULT STDMETHODCALLTYPE CfgCtrlCompleted_Invoke(
+    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*, HRESULT, ICoreWebView2Controller*);
+static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
+    ICoreWebView2WebMessageReceivedEventHandler*, ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs*);
 
-    // Font size
-    *(WORD*)ptr = 8;
-    ptr += sizeof(WORD);
+static HRESULT STDMETHODCALLTYPE CfgEnvCompleted_Invoke(
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *This,
+    HRESULT result, ICoreWebView2Environment *env) {
+    (void)This;
+    if (FAILED(result) || !env) return result;
+    g_cfgEnv = env;
+    env->lpVtbl->AddRef(env);
 
-    // Font name
-    const wchar_t* fontName = L"Segoe UI";
-    size_t fontLen = wcslen(fontName) + 1;
-    memcpy(ptr, fontName, fontLen * sizeof(wchar_t));
-    ptr += fontLen * sizeof(wchar_t);
+    static ICoreWebView2CreateCoreWebView2ControllerCompletedHandlerVtbl ctrlVtbl = {0};
+    static BOOL init = FALSE;
+    if (!init) {
+        ctrlVtbl.QueryInterface = (HRESULT (STDMETHODCALLTYPE*)(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*, REFIID, void**))CfgHandler_QueryInterface;
+        ctrlVtbl.AddRef = (ULONG (STDMETHODCALLTYPE*)(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*))CfgHandler_AddRef;
+        ctrlVtbl.Release = (ULONG (STDMETHODCALLTYPE*)(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*))CfgHandler_Release;
+        ctrlVtbl.Invoke = CfgCtrlCompleted_Invoke;
+        init = TRUE;
+    }
 
-    // Window Title label
-    ptr = AddDialogControl(ptr, IDC_STATIC_TITLE, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                           MARGIN_X, yPos, editW, LABEL_H, L"Window Title:");
-    yPos += LABEL_H + LABEL_GAP;
+    CfgHandler *handler = (CfgHandler*)malloc(sizeof(CfgHandler));
+    handler->lpVtbl = &ctrlVtbl;
+    handler->refCount = 1;
 
-    // Window Title edit
-    ptr = AddDialogControl(ptr, IDC_EDIT_TITLE, 0x0081,
-                           WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                           MARGIN_X, yPos, editW, EDIT_H, L"");
-    yPos += EDIT_H + SPACING;
+    env->lpVtbl->CreateCoreWebView2Controller(env, g_cfgHwnd,
+        (ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*)handler);
+    ((ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*)handler)->lpVtbl->Release(
+        (ICoreWebView2CreateCoreWebView2ControllerCompletedHandler*)handler);
+    return S_OK;
+}
 
-    // URL label
-    ptr = AddDialogControl(ptr, IDC_STATIC_URL, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                           MARGIN_X, yPos, editW, LABEL_H, L"URL:");
-    yPos += LABEL_H + LABEL_GAP;
+static ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerVtbl g_cfgEnvVtbl = {
+    CfgHandler_QueryInterface,
+    CfgHandler_AddRef,
+    CfgHandler_Release,
+    CfgEnvCompleted_Invoke
+};
 
-    // URL edit
-    ptr = AddDialogControl(ptr, IDC_EDIT_URL, 0x0081,
-                           WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                           MARGIN_X, yPos, editW, EDIT_H, L"");
-    yPos += EDIT_H + SPACING;
+static HRESULT STDMETHODCALLTYPE CfgCtrlCompleted_Invoke(
+    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *This,
+    HRESULT result, ICoreWebView2Controller *controller) {
+    (void)This;
+    if (FAILED(result) || !controller) return result;
 
-    // OnHideJS label
-    ptr = AddDialogControl(ptr, IDC_STATIC_ONHIDEJS, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                           MARGIN_X, yPos, editW, LABEL_H, L"JavaScript on Hide (window fully covered):");
-    yPos += LABEL_H + LABEL_GAP;
+    g_cfgController = controller;
+    controller->lpVtbl->AddRef(controller);
 
-    // OnHideJS edit (multiline)
-    ptr = AddDialogControl(ptr, IDC_EDIT_ONHIDEJS, 0x0081,
-                           WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL,
-                           MARGIN_X, yPos, editW, MULTILINE_H, L"");
-    yPos += MULTILINE_H + SPACING;
+    RECT bounds;
+    GetClientRect(g_cfgHwnd, &bounds);
+    controller->lpVtbl->put_Bounds(controller, bounds);
 
-    // OnShowJS label
-    ptr = AddDialogControl(ptr, IDC_STATIC_ONSHOWJS, 0x0082, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                           MARGIN_X, yPos, editW, LABEL_H, L"JavaScript on Show (window becomes visible):");
-    yPos += LABEL_H + LABEL_GAP;
+    ICoreWebView2 *webview = NULL;
+    controller->lpVtbl->get_CoreWebView2(controller, &webview);
+    if (!webview) return E_FAIL;
+    g_cfgWebView = webview;
 
-    // OnShowJS edit (multiline)
-    ptr = AddDialogControl(ptr, IDC_EDIT_ONSHOWJS, 0x0081,
-                           WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL,
-                           MARGIN_X, yPos, editW, MULTILINE_H, L"");
-    yPos += MULTILINE_H + SPACING;
+    ICoreWebView2Settings *settings = NULL;
+    webview->lpVtbl->get_Settings(webview, &settings);
+    if (settings) {
+        settings->lpVtbl->put_AreDefaultContextMenusEnabled(settings, FALSE);
+        settings->lpVtbl->put_AreDevToolsEnabled(settings, FALSE);
+        settings->lpVtbl->put_IsStatusBarEnabled(settings, FALSE);
+        settings->lpVtbl->put_IsZoomControlEnabled(settings, FALSE);
+        settings->lpVtbl->Release(settings);
+    }
 
-    // OK button - position based on calculated yPos
-    short btnY = yPos;
-    short okX = DLG_WIDTH - MARGIN_X - BTN_W - 4 - BTN_W - 4;
-    ptr = AddDialogControl(ptr, IDOK, 0x0080,
-                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                           okX, btnY, BTN_W, BTN_H, L"OK");
+    // Register message handler
+    static ICoreWebView2WebMessageReceivedEventHandlerVtbl msgVtbl = {0};
+    static BOOL msgInit = FALSE;
+    if (!msgInit) {
+        msgVtbl.QueryInterface = (HRESULT (STDMETHODCALLTYPE*)(ICoreWebView2WebMessageReceivedEventHandler*, REFIID, void**))CfgHandler_QueryInterface;
+        msgVtbl.AddRef = (ULONG (STDMETHODCALLTYPE*)(ICoreWebView2WebMessageReceivedEventHandler*))CfgHandler_AddRef;
+        msgVtbl.Release = (ULONG (STDMETHODCALLTYPE*)(ICoreWebView2WebMessageReceivedEventHandler*))CfgHandler_Release;
+        msgVtbl.Invoke = CfgMsgReceived_Invoke;
+        msgInit = TRUE;
+    }
 
-    // Cancel button
-    short cancelX = DLG_WIDTH - MARGIN_X - BTN_W - 4;
-    ptr = AddDialogControl(ptr, IDCANCEL, 0x0080,
-                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                           cancelX, btnY, BTN_W, BTN_H, L"Cancel");
+    CfgHandler *msgHandler = (CfgHandler*)malloc(sizeof(CfgHandler));
+    msgHandler->lpVtbl = &msgVtbl;
+    msgHandler->refCount = 1;
 
-    INT_PTR result = DialogBoxIndirectParamW(g_hInstance, (DLGTEMPLATE*)templateBuffer,
-                                              hwndParent, ConfigDialogProc, (LPARAM)&tempConfig);
-    free(templateBuffer);
+    EventRegistrationToken token;
+    webview->lpVtbl->add_WebMessageReceived(webview, (ICoreWebView2WebMessageReceivedEventHandler*)msgHandler, &token);
+    ((ICoreWebView2WebMessageReceivedEventHandler*)msgHandler)->lpVtbl->Release(
+        (ICoreWebView2WebMessageReceivedEventHandler*)msgHandler);
 
-    if (result == IDOK) {
-        // Copy temp config to global config
-        memcpy(&g_config, &tempConfig, sizeof(Configuration));
+    // Load embedded HTML from resources
+    HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(IDR_HTML_UI), RT_RCDATA);
+    if (hRes) {
+        HGLOBAL hData = LoadResource(NULL, hRes);
+        if (hData) {
+            DWORD htmlSize = SizeofResource(NULL, hRes);
+            const char *htmlUtf8 = (const char *)LockResource(hData);
+            if (htmlUtf8 && htmlSize > 0) {
+                int wLen = MultiByteToWideChar(CP_UTF8, 0, htmlUtf8, (int)htmlSize, NULL, 0);
+                wchar_t *wHtml = malloc((wLen + 1) * sizeof(wchar_t));
+                MultiByteToWideChar(CP_UTF8, 0, htmlUtf8, (int)htmlSize, wHtml, wLen);
+                wHtml[wLen] = L'\0';
+                webview->lpVtbl->NavigateToString(webview, wHtml);
+                free(wHtml);
+            }
+        }
+    }
 
-        // Save to registry
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
+    ICoreWebView2WebMessageReceivedEventHandler *This,
+    ICoreWebView2 *sender,
+    ICoreWebView2WebMessageReceivedEventArgs *args) {
+    (void)This; (void)sender;
+
+    LPWSTR wMsg = NULL;
+    args->lpVtbl->TryGetWebMessageAsString(args, &wMsg);
+    if (!wMsg) return S_OK;
+
+    int len = WideCharToMultiByte(CP_UTF8, 0, wMsg, -1, NULL, 0, NULL, NULL);
+    char *msg = malloc(len);
+    WideCharToMultiByte(CP_UTF8, 0, wMsg, -1, msg, len, NULL, NULL);
+    CoTaskMemFree(wMsg);
+
+    char action[64] = {0};
+    json_get_string(msg, "action", action, sizeof(action));
+
+    if (strcmp(action, "getInit") == 0) {
+        webview_push_init_config();
+    } else if (strcmp(action, "saveSettings") == 0) {
+        char url[4096] = {0}, title[512] = {0}, hideJs[8192] = {0}, showJs[8192] = {0};
+        json_get_string(msg, "url", url, sizeof(url));
+        json_get_string(msg, "windowTitle", title, sizeof(title));
+        json_get_string(msg, "onHideJs", hideJs, sizeof(hideJs));
+        json_get_string(msg, "onShowJs", showJs, sizeof(showJs));
+
+        MultiByteToWideChar(CP_UTF8, 0, url, -1, g_config.url, 2048);
+        MultiByteToWideChar(CP_UTF8, 0, title, -1, g_config.windowTitle, 256);
+        MultiByteToWideChar(CP_UTF8, 0, hideJs, -1, g_config.onHideJs, 4096);
+        MultiByteToWideChar(CP_UTF8, 0, showJs, -1, g_config.onShowJs, 4096);
+
         SaveConfigToRegistry(&g_config);
         MarkAsConfigured();
-
-        // Apply the new configuration
         ApplyConfiguration();
-
-        return TRUE;
+        g_cfgSaved = TRUE;
+        PostMessage(g_cfgHwnd, WM_CLOSE, 0, 0);
+    } else if (strcmp(action, "close") == 0) {
+        PostMessage(g_cfgHwnd, WM_CLOSE, 0, 0);
+    } else if (strcmp(action, "resize") == 0) {
+        char hStr[32] = {0};
+        json_get_string(msg, "height", hStr, sizeof(hStr));
+        int contentHeight = atoi(hStr);
+        if (contentHeight <= 0) {
+            // Try parsing as bare number (not quoted)
+            const char *hp = strstr(msg, "\"height\"");
+            if (hp) {
+                hp += 8;
+                while (*hp == ' ' || *hp == ':') hp++;
+                contentHeight = atoi(hp);
+            }
+        }
+        if (contentHeight > 0 && g_cfgHwnd) {
+            RECT clientRect = {0}, windowRect = {0};
+            GetClientRect(g_cfgHwnd, &clientRect);
+            GetWindowRect(g_cfgHwnd, &windowRect);
+            int chromeH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
+            int newWindowH = contentHeight + chromeH;
+            int windowW = windowRect.right - windowRect.left;
+            SetWindowPos(g_cfgHwnd, NULL, 0, 0, windowW, newWindowH,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
 
-    return FALSE;
+    free(msg);
+    return S_OK;
+}
+
+// Config dialog window procedure
+static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_SIZE:
+            if (g_cfgController) {
+                RECT bounds;
+                GetClientRect(hwnd, &bounds);
+                g_cfgController->lpVtbl->put_Bounds(g_cfgController, bounds);
+            }
+            return 0;
+
+        case WM_CLOSE:
+            if (g_cfgController) {
+                g_cfgController->lpVtbl->Close(g_cfgController);
+                g_cfgController->lpVtbl->Release(g_cfgController);
+                g_cfgController = NULL;
+            }
+            if (g_cfgWebView) {
+                g_cfgWebView->lpVtbl->Release(g_cfgWebView);
+                g_cfgWebView = NULL;
+            }
+            if (g_cfgEnv) {
+                g_cfgEnv->lpVtbl->Release(g_cfgEnv);
+                g_cfgEnv = NULL;
+            }
+            DestroyWindow(hwnd);
+            return 0;
+
+        case WM_DESTROY:
+            g_cfgHwnd = NULL;
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowConfigWebViewDialog(void) {
+    if (g_cfgHwnd != NULL) {
+        SetForegroundWindow(g_cfgHwnd);
+        return;
+    }
+
+    if (!fnCreateEnvironment && !load_webview2_loader()) {
+        MessageBoxW(NULL,
+            L"Failed to load WebView2.\n\n"
+            L"Please ensure the Microsoft Edge WebView2 Runtime is installed.\n"
+            L"Download from: https://developer.microsoft.com/en-us/microsoft-edge/webview2/",
+            L"SystrayLauncher", MB_ICONERROR | MB_OK);
+        return;
+    }
+
+    // Register window class (once)
+    static BOOL classRegistered = FALSE;
+    if (!classRegistered) {
+        WNDCLASSEXW wc = {0};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = CfgWndProc;
+        wc.hInstance = g_hInstance;
+        wc.hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_TRAYICON));
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"SystrayLauncherCfgWnd";
+        wc.hIconSm = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_TRAYICON));
+        RegisterClassExW(&wc);
+        classRegistered = TRUE;
+    }
+
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int width = 480, height = 380;
+    int posX = (screenW - width) / 2;
+    int posY = (screenH - height) / 2;
+
+    g_cfgHwnd = CreateWindowExW(0, L"SystrayLauncherCfgWnd", L"Configuration",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        posX, posY, width, height,
+        NULL, NULL, g_hInstance, NULL);
+
+    if (!g_cfgHwnd) return;
+
+    ShowWindow(g_cfgHwnd, SW_SHOW);
+    UpdateWindow(g_cfgHwnd);
+
+    // Build user data folder path
+    WCHAR userDataFolder[MAX_PATH];
+    DWORD tempLen = GetTempPathW(MAX_PATH, userDataFolder);
+    if (tempLen > 0 && tempLen < MAX_PATH - 30) {
+        wcscat(userDataFolder, L"SystrayLauncher.WebView2");
+    } else {
+        wcscpy(userDataFolder, L"");
+    }
+
+    CfgHandler *envHandler = (CfgHandler*)malloc(sizeof(CfgHandler));
+    envHandler->lpVtbl = &g_cfgEnvVtbl;
+    envHandler->refCount = 1;
+
+    HRESULT hr = fnCreateEnvironment(NULL, userDataFolder[0] ? userDataFolder : NULL, NULL,
+        (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
+    ((ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler)->lpVtbl->Release(
+        (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
+
+    if (FAILED(hr)) {
+        MessageBoxW(NULL,
+            L"Failed to initialize WebView2.\n\n"
+            L"Please ensure the Microsoft Edge WebView2 Runtime is installed.",
+            L"SystrayLauncher", MB_ICONERROR | MB_OK);
+        DestroyWindow(g_cfgHwnd);
+        g_cfgHwnd = NULL;
+    }
 }
 
 // Function to enable spell checking via settings
@@ -1289,7 +1473,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             envHandler->hwnd = hwnd;
             envHandler->userDataPath = _wcsdup(userDataPath);
             
-            CreateCoreWebView2EnvironmentWithOptions(NULL, userDataPath, NULL,
+            fnCreateEnvironment(NULL, userDataPath, NULL,
                 (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
             envHandler->lpVtbl->Release((ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
             return 0;
@@ -1373,7 +1557,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     ShowMainWindow();
                     return 0;
                 case ID_TRAY_MENU_CONFIGURE:
-                    ShowConfigDialog(hwnd);
+                    g_cfgSaved = FALSE;
+                    ShowConfigWebViewDialog();
                     return 0;
                 case ID_TRAY_MENU_EXIT:
                     // Clean up tray icon resources before exit
@@ -1426,7 +1611,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBoxW(NULL, L"COM initialization failed", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
-    
+
+    if (!load_webview2_loader()) {
+        MessageBoxW(NULL,
+            L"Failed to load WebView2.\n\n"
+            L"Please ensure the Microsoft Edge WebView2 Runtime is installed.\n"
+            L"Download from: https://developer.microsoft.com/en-us/microsoft-edge/webview2/",
+            L"Error", MB_ICONERROR | MB_OK);
+        CoUninitialize();
+        if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); }
+        return 1;
+    }
+
     // Get exe directory
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
@@ -1446,9 +1642,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // On first launch, show configuration dialog
     if (isFirstLaunch) {
-        // Show dialog before creating main window
-        // Create a temporary invisible parent for the dialog
-        if (!ShowConfigDialog(NULL)) {
+        g_cfgSaved = FALSE;
+        ShowConfigWebViewDialog();
+        // Nested message loop — runs until config dialog is closed
+        MSG cfgMsg;
+        while (g_cfgHwnd && GetMessage(&cfgMsg, NULL, 0, 0)) {
+            TranslateMessage(&cfgMsg);
+            DispatchMessage(&cfgMsg);
+        }
+        if (!g_cfgSaved) {
             // User cancelled on first launch - exit
             CoUninitialize();
             if (g_hMutex) {
@@ -1457,7 +1659,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
             return 0;
         }
-        // Update initial URL after config dialog
         wcscpy_s(g_initialUrl, 2048, g_config.url);
     }
 

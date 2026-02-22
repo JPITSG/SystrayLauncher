@@ -4,7 +4,8 @@
 CC = x86_64-w64-mingw32-gcc
 WINDRES = x86_64-w64-mingw32-windres
 
-TARGET = SystrayLauncher.exe
+RELEASE_DIR = release
+TARGET = $(RELEASE_DIR)/SystrayLauncher.exe
 SOURCES = SystrayLauncher.c
 RESOURCES = resource.rc
 
@@ -14,50 +15,36 @@ OBJ = main.o resource.o
 SDK_DIR = webview2_sdk
 SDK_URL = https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2
 SDK_INCLUDE = $(SDK_DIR)/build/native/include
-SDK_DLL = $(SDK_DIR)/build/native/x64/WebView2Loader.dll
-SDK_LIB = $(SDK_DIR)/build/native/x64/WebView2Loader.dll.lib
-
-# Icon sizes for system tray (16=100% DPI, 24=150%, 32=200%, 48=large, 256=hi-res)
-ICON_SIZES = 16 24 32 48 256
 
 CFLAGS = -mwindows -isystem $(SDK_INCLUDE) -I.
 LDFLAGS = -mwindows
-LIBS = $(SDK_LIB) -lole32 -lshell32 -lshlwapi -luuid -luser32 -lgdi32 -lcomctl32
+LIBS = -lole32 -lshell32 -lshlwapi -luuid -luser32 -lgdi32 -lcomctl32
 
-.PHONY: all clean deps check-deps icon
+.PHONY: all clean deps check-deps
 
 all: check-deps $(TARGET)
 
-$(TARGET): $(OBJ)
+$(TARGET): $(OBJ) | $(RELEASE_DIR)
 	@echo "Linking executable..."
 	$(CC) -o $@ $(OBJ) $(LDFLAGS) $(LIBS)
 	@rm -f $(OBJ)
-	@cp $(SDK_DLL) .
-	@mkdir -p release
-	@cp $(TARGET) release/
-	@cp $(SDK_DLL) release/
-	@echo "Build complete: $(TARGET) + WebView2Loader.dll"
-	@echo "Release binaries copied to release/"
+	@echo "Build complete: $(TARGET)"
+
+$(RELEASE_DIR):
+	@mkdir -p $(RELEASE_DIR)
 
 main.o: $(SOURCES)
 	@echo "Compiling $(SOURCES)..."
 	$(CC) -c $< -o $@ $(CFLAGS)
 
-resource.o: $(RESOURCES) icon.ico
+resource.o: $(RESOURCES) resource.h assets/icon.ico assets/dist/index.html assets/WebView2Loader.dll
 	@echo "Compiling resources..."
 	$(WINDRES) $< -o $@
 
-# Generate multi-sized icon.ico from icon.svg using ImageMagick
-icon:
-	@if [ -f "icon.svg" ]; then \
-		echo "Generating icon.ico from icon.svg..."; \
-		convert -background transparent icon.svg \
-			$(foreach size,$(ICON_SIZES),\( -clone 0 -resize $(size)x$(size) \)) \
-			-delete 0 -alpha on icon.ico; \
-		echo "Created icon.ico with sizes: $(ICON_SIZES)"; \
-	else \
-		echo "No icon.svg found, skipping icon generation."; \
-	fi
+# Build frontend assets
+assets/dist/index.html: $(wildcard assets/src/**/*.tsx assets/src/**/*.ts assets/src/**/*.css assets/index.html)
+	@echo "Building frontend assets..."
+	cd assets && npm install && npm run build
 
 # Download and extract WebView2 SDK
 deps: webview2.nupkg
@@ -71,13 +58,17 @@ webview2.nupkg:
 
 # Check if dependencies exist before building
 check-deps:
-	@if [ ! -f "$(SDK_LIB)" ] || [ ! -d "$(SDK_INCLUDE)" ]; then \
+	@if [ ! -d "$(SDK_INCLUDE)" ]; then \
 		echo "Error: WebView2 SDK not found. Run 'make deps' first."; \
 		exit 1; \
 	fi
 
 clean:
-	rm -f $(OBJ) $(TARGET) WebView2Loader.dll
+	rm -f $(OBJ) $(TARGET)
+	rm -rf assets/dist assets/node_modules
 
-clean-all: clean
-	rm -rf $(SDK_DIR) webview2.nupkg release
+clean-release:
+	rm -rf $(RELEASE_DIR)
+
+clean-all: clean clean-release
+	rm -rf $(SDK_DIR) webview2.nupkg

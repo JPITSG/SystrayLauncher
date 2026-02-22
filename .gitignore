@@ -13,8 +13,9 @@ Thumbs.db
 *.o
 *.exe
 *.dll
+!assets/WebView2Loader.dll
 !release/*.exe
-!release/*.dll
 webview2_sdk/
 webview2.nupkg
-icon.*
+assets/node_modules/
+assets/dist/

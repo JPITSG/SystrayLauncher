@@ -1,3 +1,4 @@
-#include <windows.h>
-#define IDI_TRAYICON 101
-IDI_TRAYICON ICON "icon.ico"
+#include "resource.h"
+IDI_TRAYICON     ICON   "assets/icon.ico"
+IDR_HTML_UI      RCDATA "assets/dist/index.html"
+IDR_WEBVIEW2_DLL RCDATA "assets/WebView2Loader.dll"
