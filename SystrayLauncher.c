@@ -80,6 +80,7 @@ static ICoreWebView2Environment* g_cfgEnv = NULL;
 static ICoreWebView2Controller* g_cfgController = NULL;
 static ICoreWebView2* g_cfgWebView = NULL;
 static BOOL g_cfgSaved = FALSE;
+static BOOL g_cfgWindowShown = FALSE;
 
 // Dynamic WebView2 loading
 static WCHAR g_extractedDllPath[MAX_PATH] = {0};
@@ -712,8 +713,14 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             int chromeH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
             int newWindowH = contentHeight + chromeH;
             int windowW = windowRect.right - windowRect.left;
-            SetWindowPos(g_cfgHwnd, NULL, 0, 0, windowW, newWindowH,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            UINT flags = SWP_NOMOVE | SWP_NOZORDER;
+            if (g_cfgWindowShown) {
+                flags |= SWP_NOACTIVATE;
+            } else {
+                flags |= SWP_SHOWWINDOW;
+            }
+            SetWindowPos(g_cfgHwnd, NULL, 0, 0, windowW, newWindowH, flags);
+            g_cfgWindowShown = TRUE;
         }
     }
 
@@ -733,6 +740,7 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return 0;
 
         case WM_CLOSE:
+            g_cfgWindowShown = FALSE;
             if (g_cfgController) {
                 g_cfgController->lpVtbl->Close(g_cfgController);
                 g_cfgController->lpVtbl->Release(g_cfgController);
@@ -751,6 +759,7 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         case WM_DESTROY:
             g_cfgHwnd = NULL;
+            g_cfgWindowShown = FALSE;
             return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -799,9 +808,7 @@ static void ShowConfigWebViewDialog(void) {
         NULL, NULL, g_hInstance, NULL);
 
     if (!g_cfgHwnd) return;
-
-    ShowWindow(g_cfgHwnd, SW_SHOW);
-    UpdateWindow(g_cfgHwnd);
+    g_cfgWindowShown = FALSE;
 
     // Build user data folder path
     WCHAR userDataFolder[MAX_PATH];

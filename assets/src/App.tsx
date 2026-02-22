@@ -13,19 +13,24 @@ export default function App() {
 
   useEffect(() => {
     const el = rootRef.current;
-    if (!el) return;
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        reportHeight(Math.ceil(entry.contentRect.height));
-      }
-    });
+    if (!el || !initData) return;
+
+    const report = () => reportHeight(Math.ceil(el.scrollHeight));
+    const rafId = requestAnimationFrame(report);
+
+    const observer = new ResizeObserver(report);
     observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
+    return () => {
+      cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
+  }, [initData]);
+
+  if (!initData) return null;
 
   return (
     <div ref={rootRef}>
-      {initData && <ConfigView config={initData.config} />}
+      <ConfigView config={initData.config} />
     </div>
   );
 }
