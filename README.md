@@ -74,4 +74,4 @@ make
 
 ## License
 
-MIT
+[MIT](LICENSE)
