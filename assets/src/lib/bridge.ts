@@ -3,6 +3,7 @@ export interface ConfigData {
   windowTitle: string;
   onHideJs: string;
   onShowJs: string;
+  sleepWhenInactive: boolean;
 }
 
 export interface InitData {
@@ -34,6 +35,7 @@ export function saveSettings(config: ConfigData) {
       windowTitle: config.windowTitle,
       onHideJs: config.onHideJs,
       onShowJs: config.onShowJs,
+      sleepWhenInactive: config.sleepWhenInactive,
     })
   );
 }

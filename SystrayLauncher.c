@@ -33,6 +33,7 @@
 #define REG_VALUE_TITLE L"WindowTitle"
 #define REG_VALUE_ONHIDEJS L"OnHideJS"
 #define REG_VALUE_ONSHOWJS L"OnShowJS"
+#define REG_VALUE_SLEEP L"SleepWhenInactive"
 #define REG_VALUE_CONFIGURED L"Configured"
 
 #define ID_TIMER_INITIAL_HIDE_JS 2
@@ -41,12 +42,17 @@
 #define VISIBILITY_CHECK_INTERVAL_MS 250
 #define ID_TIMER_CFG_SHOW_FALLBACK 4
 #define CFG_SHOW_FALLBACK_DELAY_MS 350
+#define ID_TIMER_WEBVIEW_PREWARM 5
+#define WEBVIEW_PREWARM_MS 60000
+#define ID_TIMER_WEBVIEW_PRELOAD 6
+#define WEBVIEW_PRELOAD_SETTLE_MS 1500
 
 typedef struct {
     wchar_t url[2048];
     wchar_t windowTitle[256];
     wchar_t onHideJs[4096];
     wchar_t onShowJs[4096];
+    BOOL sleepWhenInactive;
 } Configuration;
 
 typedef enum {
@@ -72,6 +78,14 @@ static int g_lastScreenHeight = 0;
 static float g_lastDpiX = 0.0f;
 static float g_lastDpiY = 0.0f;
 static volatile LONG g_isInitialized = FALSE;
+static volatile LONG g_webViewDesiredActive = FALSE;
+static volatile LONG g_webViewDesiredVisible = FALSE;
+static volatile LONG g_webViewPrewarmActive = FALSE;
+static volatile LONG g_webViewSuspendPending = FALSE;
+static volatile LONG g_webViewSuspended = FALSE;
+static volatile LONG g_resetUrlOnNextShow = FALSE;
+static volatile LONG g_sleepWhenInactive = FALSE;
+static volatile LONG g_initialPreloadComplete = FALSE;
 static HINSTANCE g_hInstance;
 static JsVisibility g_jsVisibility = JS_VISIBILITY_UNKNOWN;
 static wchar_t g_webView2Version[128] = L"Unknown";
@@ -113,6 +127,15 @@ static BOOL IsWindowActuallyVisible(HWND hwnd);
 static void UpdateJsVisibilityState(HWND hwnd);
 static void StartVisibilityTimer(HWND hwnd);
 static void StopVisibilityTimer(HWND hwnd);
+static void ActivateMainWebView(void);
+static void DeactivateMainWebView(void);
+static void ResumeMainWebViewRuntime(void);
+static void SetMainWebViewControllerVisible(BOOL visible);
+static void PrewarmMainWebView(void);
+static void ResetTargetPageIfNeeded(void);
+static void OnMainNavigationCompleted(void);
+static void RegisterMainNavigationCompletedHandler(ICoreWebView2* webview2);
+static void GetTargetWindowRect(int* x, int* y, int* w, int* h);
 
 // Registry and config dialog functions
 static BOOL LoadConfigFromRegistry(Configuration* config);
@@ -192,12 +215,47 @@ typedef struct {
     LONG refCount;
 } ExecuteScriptCompletedHandler;
 
+// WebView suspend completion handler
+HRESULT STDMETHODCALLTYPE TrySuspendCompletedHandler_QueryInterface(
+    ICoreWebView2TrySuspendCompletedHandler* This,
+    REFIID riid, void** ppvObject);
+ULONG STDMETHODCALLTYPE TrySuspendCompletedHandler_AddRef(
+    ICoreWebView2TrySuspendCompletedHandler* This);
+ULONG STDMETHODCALLTYPE TrySuspendCompletedHandler_Release(
+    ICoreWebView2TrySuspendCompletedHandler* This);
+HRESULT STDMETHODCALLTYPE TrySuspendCompletedHandler_Invoke(
+    ICoreWebView2TrySuspendCompletedHandler* This,
+    HRESULT errorCode, BOOL result);
+
+typedef struct {
+    ICoreWebView2TrySuspendCompletedHandlerVtbl* lpVtbl;
+    LONG refCount;
+} TrySuspendCompletedHandler;
+
+// Navigation completed handler (settles the initial preload / sleep state)
+HRESULT STDMETHODCALLTYPE NavCompletedHandler_QueryInterface(
+    ICoreWebView2NavigationCompletedEventHandler* This,
+    REFIID riid, void** ppvObject);
+ULONG STDMETHODCALLTYPE NavCompletedHandler_AddRef(
+    ICoreWebView2NavigationCompletedEventHandler* This);
+ULONG STDMETHODCALLTYPE NavCompletedHandler_Release(
+    ICoreWebView2NavigationCompletedEventHandler* This);
+HRESULT STDMETHODCALLTYPE NavCompletedHandler_Invoke(
+    ICoreWebView2NavigationCompletedEventHandler* This,
+    ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args);
+
+typedef struct {
+    ICoreWebView2NavigationCompletedEventHandlerVtbl* lpVtbl;
+    LONG refCount;
+} NavCompletedHandler;
+
 // Configuration functions
 void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     wcscpy_s(config->url, 2048, L"https://www.google.com/");
     wcscpy_s(config->windowTitle, 256, L"Systray Launcher");
     config->onHideJs[0] = L'\0';
     config->onShowJs[0] = L'\0';
+    config->sleepWhenInactive = FALSE;
 
     if (!PathFileExistsW(iniPath)) {
         CreateDefaultIni(iniPath);
@@ -261,6 +319,9 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
         wcscpy_s(config->onHideJs, 4096, value);
     } else if (wcscmp(key, L"onshowjs") == 0) {
         wcscpy_s(config->onShowJs, 4096, value);
+    } else if (wcscmp(key, L"sleepwheninactive") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->sleepWhenInactive = (c == L'1' || c == L't' || c == L'y');
     }
 }
 
@@ -312,6 +373,15 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         config->onShowJs[0] = L'\0';
     }
 
+    // Load SleepWhenInactive (default disabled)
+    DWORD sleepVal = 0;
+    dataSize = sizeof(sleepVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_SLEEP, NULL, &dataType, (LPBYTE)&sleepVal, &dataSize) == ERROR_SUCCESS) {
+        config->sleepWhenInactive = (sleepVal != 0);
+    } else {
+        config->sleepWhenInactive = FALSE;
+    }
+
     RegCloseKey(hKey);
     return TRUE;
 }
@@ -340,6 +410,11 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     // Save OnShowJS
     RegSetValueExW(hKey, REG_VALUE_ONSHOWJS, 0, REG_SZ,
                    (const BYTE*)config->onShowJs, (DWORD)((wcslen(config->onShowJs) + 1) * sizeof(wchar_t)));
+
+    // Save SleepWhenInactive
+    DWORD sleepVal = config->sleepWhenInactive ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_SLEEP, 0, REG_DWORD,
+                   (const BYTE*)&sleepVal, sizeof(sleepVal));
 
     RegCloseKey(hKey);
     return TRUE;
@@ -376,6 +451,9 @@ static void ApplyConfiguration(void) {
     // Update initial URL
     wcscpy_s(g_initialUrl, 2048, g_config.url);
 
+    // Sync the "sleep when inactive" setting
+    InterlockedExchange(&g_sleepWhenInactive, g_config.sleepWhenInactive ? TRUE : FALSE);
+
     // Update window title
     if (g_hwnd) {
         SetWindowTextW(g_hwnd, g_config.windowTitle);
@@ -390,6 +468,17 @@ static void ApplyConfiguration(void) {
     // Navigate to the new URL only if the main window is visible
     if (g_webView && g_hwnd && IsWindowVisible(g_hwnd)) {
         g_webView->lpVtbl->Navigate(g_webView, g_config.url);
+    }
+
+    // Re-apply the correct active/sleep state for the (possibly changed)
+    // setting: disabling sleep while hidden wakes the runtime back up;
+    // enabling it suspends the already-loaded page.
+    if (g_hwnd && IsWebViewReady()) {
+        if (IsWindowActuallyVisible(g_hwnd)) {
+            ActivateMainWebView();
+        } else {
+            DeactivateMainWebView();
+        }
     }
 }
 
@@ -458,6 +547,20 @@ static BOOL json_get_string(const char *json, const char *key, char *out, size_t
     return TRUE;
 }
 
+static BOOL json_get_bool(const char *json, const char *key, BOOL defVal) {
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(json, search);
+    if (!p) return defVal;
+    p += strlen(search);
+    while (*p == ' ' || *p == ':') p++;
+    if (strncmp(p, "true", 4) == 0) return TRUE;
+    if (strncmp(p, "false", 5) == 0) return FALSE;
+    if (*p == '1') return TRUE;
+    if (*p == '0') return FALSE;
+    return defVal;
+}
+
 static void json_escape_wstring(const wchar_t *in, wchar_t *out, size_t outLen) {
     size_t j = 0;
     for (size_t i = 0; in[i] && j < outLen - 2; i++) {
@@ -524,8 +627,8 @@ static void webview_push_init_config(void) {
 
     wchar_t script[16384];
     swprintf(script, 16384,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\"}})",
-        eUrl, eTitle, eHide, eShow);
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s}})",
+        eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false");
     webview_cfg_execute_script(script);
 }
 
@@ -696,6 +799,7 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         MultiByteToWideChar(CP_UTF8, 0, title, -1, g_config.windowTitle, 256);
         MultiByteToWideChar(CP_UTF8, 0, hideJs, -1, g_config.onHideJs, 4096);
         MultiByteToWideChar(CP_UTF8, 0, showJs, -1, g_config.onShowJs, 4096);
+        g_config.sleepWhenInactive = json_get_bool(msg, "sleepWhenInactive", FALSE);
 
         SaveConfigToRegistry(&g_config);
         MarkAsConfigured();
@@ -1009,17 +1113,44 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
     if (webview2) {
         g_webView = webview2;
         
+        BOOL initiallyVisible = IsWindowActuallyVisible(hwnd);
+
+        // Pre-size the (still hidden) window to the size it will have when
+        // shown, so the preload lays out and renders at the final dimensions
+        // and the first open needs no reflow.
+        if (!initiallyVisible) {
+            int wx, wy, ww, wh;
+            GetTargetWindowRect(&wx, &wy, &ww, &wh);
+            SetWindowPos(hwnd, NULL, wx, wy, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
         RECT bounds;
         GetClientRect(hwnd, &bounds);
         controller->lpVtbl->put_Bounds(controller, bounds);
+
+        // Requirement (c): keep the WebView rendering (IsVisible = TRUE) during
+        // the preload even though the host window stays hidden. This is the
+        // documented way to keep a WebView "warm" — the page loads and renders
+        // off-screen so it is ready to display instantly. We only turn
+        // rendering off (IsVisible = FALSE) at the moment we suspend for sleep.
         controller->lpVtbl->put_IsVisible(controller, TRUE);
-        
+
+        // Settle the sleep state only once the initial navigation finishes so
+        // we never suspend a half-loaded page (see OnMainNavigationCompleted).
+        RegisterMainNavigationCompletedHandler(webview2);
+
         webview2->lpVtbl->Navigate(webview2, g_initialUrl);
-        
+
         // Set spell check languages to en-US and pl-PL
         SetSpellCheckLanguages(webview2, L"en-US,pl-PL");
 
         InterlockedExchange(&g_isInitialized, TRUE);
+        InterlockedExchange(&g_webViewDesiredVisible, TRUE);
+        ResumeMainWebViewRuntime();
+
+        if (initiallyVisible && InterlockedExchange(&g_resetUrlOnNextShow, FALSE) == TRUE) {
+            ResetTargetPageIfNeeded();
+        }
 
         // Schedule initial JS sync after WebView is ready.
         if (g_config.onHideJs[0] != L'\0' || g_config.onShowJs[0] != L'\0') {
@@ -1111,6 +1242,125 @@ HRESULT STDMETHODCALLTYPE ExecuteScriptCompletedHandler_Invoke(
     return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE TrySuspendCompletedHandler_QueryInterface(
+    ICoreWebView2TrySuspendCompletedHandler* This,
+    REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2TrySuspendCompletedHandler)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE TrySuspendCompletedHandler_AddRef(
+    ICoreWebView2TrySuspendCompletedHandler* This) {
+    TrySuspendCompletedHandler* handler = (TrySuspendCompletedHandler*)This;
+    return InterlockedIncrement(&handler->refCount);
+}
+
+ULONG STDMETHODCALLTYPE TrySuspendCompletedHandler_Release(
+    ICoreWebView2TrySuspendCompletedHandler* This) {
+    TrySuspendCompletedHandler* handler = (TrySuspendCompletedHandler*)This;
+    ULONG refCount = InterlockedDecrement(&handler->refCount);
+    if (refCount == 0) {
+        free(handler);
+    }
+    return refCount;
+}
+
+HRESULT STDMETHODCALLTYPE TrySuspendCompletedHandler_Invoke(
+    ICoreWebView2TrySuspendCompletedHandler* This,
+    HRESULT errorCode, BOOL result) {
+    (void)This;
+    InterlockedExchange(&g_webViewSuspendPending, FALSE);
+
+    if (SUCCEEDED(errorCode) && result) {
+        InterlockedExchange(&g_webViewSuspended, TRUE);
+        DebugPrint(L"[INFO] WebView2 suspend request completed\n");
+    } else {
+        InterlockedExchange(&g_webViewSuspended, FALSE);
+        DebugPrint(L"[WARNING] WebView2 suspend request failed. HRESULT: 0x%08X, result: %d\n",
+                   errorCode, result);
+    }
+
+    if (InterlockedCompareExchange(&g_webViewDesiredActive, TRUE, TRUE) == TRUE) {
+        BOOL desiredVisible =
+            InterlockedCompareExchange(&g_webViewDesiredVisible, TRUE, TRUE) == TRUE;
+        ResumeMainWebViewRuntime();
+        SetMainWebViewControllerVisible(desiredVisible);
+    }
+
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE NavCompletedHandler_QueryInterface(
+    ICoreWebView2NavigationCompletedEventHandler* This,
+    REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2NavigationCompletedEventHandler)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE NavCompletedHandler_AddRef(
+    ICoreWebView2NavigationCompletedEventHandler* This) {
+    NavCompletedHandler* handler = (NavCompletedHandler*)This;
+    return InterlockedIncrement(&handler->refCount);
+}
+
+ULONG STDMETHODCALLTYPE NavCompletedHandler_Release(
+    ICoreWebView2NavigationCompletedEventHandler* This) {
+    NavCompletedHandler* handler = (NavCompletedHandler*)This;
+    ULONG refCount = InterlockedDecrement(&handler->refCount);
+    if (refCount == 0) {
+        free(handler);
+    }
+    return refCount;
+}
+
+HRESULT STDMETHODCALLTYPE NavCompletedHandler_Invoke(
+    ICoreWebView2NavigationCompletedEventHandler* This,
+    ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) {
+    (void)This;
+    (void)sender;
+    (void)args;
+    OnMainNavigationCompleted();
+    return S_OK;
+}
+
+static void RegisterMainNavigationCompletedHandler(ICoreWebView2* webview2) {
+    if (!webview2) return;
+
+    NavCompletedHandler* handler =
+        (NavCompletedHandler*)calloc(1, sizeof(NavCompletedHandler));
+    if (!handler) return;
+
+    static ICoreWebView2NavigationCompletedEventHandlerVtbl navVtbl = {
+        NavCompletedHandler_QueryInterface,
+        NavCompletedHandler_AddRef,
+        NavCompletedHandler_Release,
+        NavCompletedHandler_Invoke
+    };
+    handler->lpVtbl = &navVtbl;
+    handler->refCount = 1;
+
+    EventRegistrationToken token;
+    HRESULT hr = webview2->lpVtbl->add_NavigationCompleted(
+        webview2, (ICoreWebView2NavigationCompletedEventHandler*)handler, &token);
+    if (FAILED(hr)) {
+        DebugPrint(L"[WARNING] add_NavigationCompleted failed. HRESULT: 0x%08X\n", hr);
+    }
+
+    handler->lpVtbl->Release((ICoreWebView2NavigationCompletedEventHandler*)handler);
+}
+
 // Helper to execute JavaScript in WebView2
 void ExecuteJavaScript(const wchar_t* js) {
     if (!g_webView || !js || js[0] == L'\0') return;
@@ -1140,6 +1390,182 @@ void ExecuteJavaScript(const wchar_t* js) {
 
 static BOOL IsWebViewReady(void) {
     return InterlockedCompareExchange(&g_isInitialized, TRUE, TRUE) == TRUE && g_webView != NULL;
+}
+
+static ICoreWebView2_3* QueryMainWebView3(void) {
+    if (!g_webView) return NULL;
+
+    ICoreWebView2_3* webView3 = NULL;
+    HRESULT hr = g_webView->lpVtbl->QueryInterface(
+        g_webView, &IID_ICoreWebView2_3, (void**)&webView3);
+    if (FAILED(hr) || !webView3) {
+        DebugPrint(L"[WARNING] WebView2 suspend/resume API is not available. HRESULT: 0x%08X\n", hr);
+        return NULL;
+    }
+
+    return webView3;
+}
+
+static void SyncMainWebViewBounds(void) {
+    if (!g_webViewController || !g_hwnd) return;
+
+    RECT bounds;
+    GetClientRect(g_hwnd, &bounds);
+    g_webViewController->lpVtbl->put_Bounds(g_webViewController, bounds);
+}
+
+static void SetMainWebViewControllerVisible(BOOL visible) {
+    if (!g_webViewController) return;
+
+    if (visible) {
+        SyncMainWebViewBounds();
+    }
+    g_webViewController->lpVtbl->put_IsVisible(g_webViewController, visible);
+}
+
+static void ResumeMainWebViewRuntime(void) {
+    LONG previousDesired = InterlockedExchange(&g_webViewDesiredActive, TRUE);
+    if (!IsWebViewReady() || !g_webViewController) return;
+
+    BOOL needsResume =
+        previousDesired == FALSE ||
+        InterlockedCompareExchange(&g_webViewSuspendPending, FALSE, FALSE) == TRUE ||
+        InterlockedCompareExchange(&g_webViewSuspended, FALSE, FALSE) == TRUE;
+
+    if (!needsResume) return;
+
+    ICoreWebView2_3* webView3 = QueryMainWebView3();
+    if (webView3) {
+        HRESULT hr = webView3->lpVtbl->Resume(webView3);
+        if (FAILED(hr)) {
+            DebugPrint(L"[WARNING] WebView2 resume failed. HRESULT: 0x%08X\n", hr);
+        }
+        webView3->lpVtbl->Release(webView3);
+    }
+    InterlockedExchange(&g_webViewSuspendPending, FALSE);
+    InterlockedExchange(&g_webViewSuspended, FALSE);
+}
+
+static void SuspendMainWebViewRuntime(void) {
+    InterlockedExchange(&g_webViewDesiredActive, FALSE);
+    if (!IsWebViewReady() || !g_webViewController) return;
+
+    if (InterlockedCompareExchange(&g_webViewSuspendPending, FALSE, FALSE) == TRUE ||
+        InterlockedCompareExchange(&g_webViewSuspended, FALSE, FALSE) == TRUE) {
+        return;
+    }
+
+    ICoreWebView2_3* webView3 = QueryMainWebView3();
+    if (!webView3) return;
+
+    TrySuspendCompletedHandler* handler =
+        (TrySuspendCompletedHandler*)calloc(1, sizeof(TrySuspendCompletedHandler));
+    if (!handler) {
+        webView3->lpVtbl->Release(webView3);
+        return;
+    }
+
+    static ICoreWebView2TrySuspendCompletedHandlerVtbl suspendVtbl = {
+        TrySuspendCompletedHandler_QueryInterface,
+        TrySuspendCompletedHandler_AddRef,
+        TrySuspendCompletedHandler_Release,
+        TrySuspendCompletedHandler_Invoke
+    };
+
+    handler->lpVtbl = &suspendVtbl;
+    handler->refCount = 1;
+
+    InterlockedExchange(&g_webViewSuspendPending, TRUE);
+    HRESULT hr = webView3->lpVtbl->TrySuspend(
+        webView3, (ICoreWebView2TrySuspendCompletedHandler*)handler);
+    if (FAILED(hr)) {
+        InterlockedExchange(&g_webViewSuspendPending, FALSE);
+        DebugPrint(L"[WARNING] WebView2 TrySuspend call failed. HRESULT: 0x%08X\n", hr);
+    }
+
+    handler->lpVtbl->Release((ICoreWebView2TrySuspendCompletedHandler*)handler);
+    webView3->lpVtbl->Release(webView3);
+}
+
+// Bring the WebView to the foreground state: runtime resumed + rendered, and
+// the controller sized to the now-visible host window.
+static void ActivateMainWebView(void) {
+    InterlockedExchange(&g_webViewPrewarmActive, FALSE);
+    if (g_hwnd) {
+        KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM);
+        KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PRELOAD);
+    }
+
+    InterlockedExchange(&g_webViewDesiredVisible, TRUE);
+    ResumeMainWebViewRuntime();
+    SetMainWebViewControllerVisible(TRUE);
+}
+
+// Move the WebView to the background (host window hidden).
+//
+// When the sleep setting is enabled and the initial preload has finished we
+// stop rendering (IsVisible = FALSE) and suspend the runtime to save CPU.
+// Otherwise — sleeping disabled (the default), or the preload is still in
+// progress — we keep the page warm: rendering stays on so the off-screen page
+// is ready to display instantly. The host window is hidden either way, so
+// nothing is shown to the user.
+static void DeactivateMainWebView(void) {
+    InterlockedExchange(&g_webViewPrewarmActive, FALSE);
+    if (g_hwnd) {
+        KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM);
+    }
+
+    BOOL sleepEnabled = InterlockedCompareExchange(&g_sleepWhenInactive, TRUE, TRUE) == TRUE;
+    BOOL preloaded = InterlockedCompareExchange(&g_initialPreloadComplete, TRUE, TRUE) == TRUE;
+
+    if (sleepEnabled && preloaded) {
+        InterlockedExchange(&g_webViewDesiredVisible, FALSE);
+        SetMainWebViewControllerVisible(FALSE);
+        SuspendMainWebViewRuntime();
+    } else {
+        InterlockedExchange(&g_webViewDesiredVisible, TRUE);
+        ResumeMainWebViewRuntime();
+        SetMainWebViewControllerVisible(TRUE);
+    }
+}
+
+// Pre-emptively wake a suspended WebView when the user hovers the tray icon, so
+// a live, rendered copy of the page is ready before they open the window. Only
+// relevant while the sleep setting is enabled — otherwise nothing is suspended.
+static void PrewarmMainWebView(void) {
+    if (!g_hwnd) return;
+    if (InterlockedCompareExchange(&g_sleepWhenInactive, TRUE, TRUE) != TRUE) return;
+    if (!IsWebViewReady()) return;
+    if (IsWindowActuallyVisible(g_hwnd)) return;
+
+    InterlockedExchange(&g_webViewPrewarmActive, TRUE);
+    InterlockedExchange(&g_webViewDesiredVisible, TRUE);
+    ResumeMainWebViewRuntime();
+    SetMainWebViewControllerVisible(TRUE);  // render warm while the host stays hidden
+
+    SetTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM, WEBVIEW_PREWARM_MS, NULL);
+    DebugPrint(L"[INFO] WebView2 prewarmed (warm render) from tray hover for %d ms\n", WEBVIEW_PREWARM_MS);
+}
+
+// Called when a navigation completes. The first completion marks the initial
+// preload as done, after which it is safe to suspend on hide without cutting a
+// page load short.
+static void OnMainNavigationCompleted(void) {
+    InterlockedExchange(&g_initialPreloadComplete, TRUE);
+
+    if (!g_hwnd) return;
+    if (IsWindowActuallyVisible(g_hwnd)) return;  // shown: stay active
+    if (InterlockedCompareExchange(&g_webViewPrewarmActive, TRUE, TRUE) == TRUE) return;  // hover prewarm in progress
+
+    if (InterlockedCompareExchange(&g_sleepWhenInactive, TRUE, TRUE) == TRUE) {
+        // Let the freshly-loaded page render for a short moment before
+        // suspending, so the suspended snapshot is complete and resumes
+        // instantly when the user opens or hovers.
+        SetTimer(g_hwnd, ID_TIMER_WEBVIEW_PRELOAD, WEBVIEW_PRELOAD_SETTLE_MS, NULL);
+    } else {
+        // Sleep disabled: keep the page warm and running for instant opens.
+        DeactivateMainWebView();
+    }
 }
 
 // Data structure for occlusion check enumeration
@@ -1189,6 +1615,7 @@ static BOOL IsWindowActuallyVisible(HWND hwnd) {
 
     RECT ourRect;
     if (!GetWindowRect(hwnd, &ourRect)) return FALSE;
+    if (!MonitorFromRect(&ourRect, MONITOR_DEFAULTTONULL)) return FALSE;
 
     // Create a region representing our window
     HRGN visibleRgn = CreateRectRgnIndirect(&ourRect);
@@ -1212,10 +1639,8 @@ static BOOL IsWindowActuallyVisible(HWND hwnd) {
 }
 
 static void StartVisibilityTimer(HWND hwnd) {
-    if (g_config.onHideJs[0] != L'\0' || g_config.onShowJs[0] != L'\0') {
-        SetTimer(hwnd, ID_TIMER_VISIBILITY_CHECK, VISIBILITY_CHECK_INTERVAL_MS, NULL);
-        DebugPrint(L"[INFO] Started visibility check timer\n");
-    }
+    SetTimer(hwnd, ID_TIMER_VISIBILITY_CHECK, VISIBILITY_CHECK_INTERVAL_MS, NULL);
+    DebugPrint(L"[INFO] Started visibility check timer\n");
 }
 
 static void StopVisibilityTimer(HWND hwnd) {
@@ -1227,7 +1652,18 @@ static void UpdateJsVisibilityState(HWND hwnd) {
     if (!IsWebViewReady()) return;
 
     JsVisibility newState = IsWindowActuallyVisible(hwnd) ? JS_VISIBILITY_SHOWN : JS_VISIBILITY_HIDDEN;
-    if (newState == g_jsVisibility) return;
+    if (newState == g_jsVisibility) {
+        if (newState == JS_VISIBILITY_SHOWN) {
+            ActivateMainWebView();
+        } else {
+            DeactivateMainWebView();
+        }
+        return;
+    }
+
+    if (newState == JS_VISIBILITY_SHOWN) {
+        ActivateMainWebView();
+    }
 
     g_jsVisibility = newState;
     if (newState == JS_VISIBILITY_SHOWN) {
@@ -1240,6 +1676,7 @@ static void UpdateJsVisibilityState(HWND hwnd) {
             ExecuteJavaScript(g_config.onHideJs);
             DebugPrint(L"[INFO] Executed onHideJs (window fully covered/hidden)\n");
         }
+        DeactivateMainWebView();
     }
 }
 
@@ -1276,10 +1713,28 @@ BOOL HasDisplaySettingsChanged(void) {
     return changed;
 }
 
-// Window management
-void ShowMainWindow(void) {
-    if (!g_hwnd) return;
+static void ResetTargetPageIfNeeded(void) {
+    if (!g_webView || !g_initialUrl[0]) return;
 
+    LPWSTR currentUrl = NULL;
+    HRESULT hr = g_webView->lpVtbl->get_Source(g_webView, &currentUrl);
+    if (SUCCEEDED(hr) && currentUrl) {
+        if (wcscmp(currentUrl, g_initialUrl) != 0) {
+            g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
+            DebugPrint(L"[INFO] Reset URL to initial on show: %s (was: %s)\n", g_initialUrl, currentUrl);
+        } else {
+            DebugPrint(L"[INFO] URL unchanged, skipping navigation on show\n");
+        }
+        CoTaskMemFree(currentUrl);
+        return;
+    }
+
+    g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
+    DebugPrint(L"[INFO] Reset URL to initial on show (couldn't check current): %s\n", g_initialUrl);
+}
+
+// Compute the centered, 90%-of-work-area rectangle used for the main window.
+static void GetTargetWindowRect(int* x, int* y, int* w, int* h) {
     RECT workArea;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
 
@@ -1288,18 +1743,33 @@ void ShowMainWindow(void) {
 
     int windowWidth = (int)(workWidth * WINDOW_SIZE_PERCENTAGE);
     int windowHeight = (int)(workHeight * WINDOW_SIZE_PERCENTAGE);
-    int x = workArea.left + (workWidth - windowWidth) / 2;
-    int y = workArea.top + (workHeight - windowHeight) / 2;
+
+    *w = windowWidth;
+    *h = windowHeight;
+    *x = workArea.left + (workWidth - windowWidth) / 2;
+    *y = workArea.top + (workHeight - windowHeight) / 2;
+}
+
+// Window management
+void ShowMainWindow(void) {
+    if (!g_hwnd) return;
+
+    int x, y, windowWidth, windowHeight;
+    GetTargetWindowRect(&x, &y, &windowWidth, &windowHeight);
 
     SetWindowPos(g_hwnd, HWND_TOP, x, y, windowWidth, windowHeight,
                  SWP_SHOWWINDOW | SWP_FRAMECHANGED);
     ShowWindow(g_hwnd, SW_RESTORE);
     SetForegroundWindow(g_hwnd);
 
-    if (g_webViewController) {
-        RECT bounds;
-        GetClientRect(g_hwnd, &bounds);
-        g_webViewController->lpVtbl->put_Bounds(g_webViewController, bounds);
+    ActivateMainWebView();
+
+    if (InterlockedExchange(&g_resetUrlOnNextShow, FALSE) == TRUE) {
+        if (IsWebViewReady()) {
+            ResetTargetPageIfNeeded();
+        } else {
+            InterlockedExchange(&g_resetUrlOnNextShow, TRUE);
+        }
     }
 
     // Start polling for visibility changes while window is shown
@@ -1317,25 +1787,7 @@ void HideMainWindow(void) {
 
     ShowWindow(g_hwnd, SW_HIDE);
     UpdateJsVisibilityState(g_hwnd);
-
-	if (g_webView && g_initialUrl[0]) {
-		LPWSTR currentUrl = NULL;
-		HRESULT hr = g_webView->lpVtbl->get_Source(g_webView, &currentUrl);
-
-		if (SUCCEEDED(hr) && currentUrl) {
-			if (wcscmp(currentUrl, g_initialUrl) != 0) {
-				g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
-				DebugPrint(L"[INFO] Reset URL to initial on hide: %s (was: %s)\n", g_initialUrl, currentUrl);
-			} else {
-				DebugPrint(L"[INFO] URL unchanged, skipping navigation on hide\n");
-			}
-			CoTaskMemFree(currentUrl);
-		} else {
-			// Fallback: navigate anyway if we couldn't get current URL
-			g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
-			DebugPrint(L"[INFO] Reset URL to initial on hide (couldn't check current): %s\n", g_initialUrl);
-		}
-	}
+    InterlockedExchange(&g_resetUrlOnNextShow, TRUE);
 
     DebugPrint(L"[INFO] Main window hidden\n");
 }
@@ -1511,10 +1963,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
             
         case WM_SIZE:
-            if (g_webViewController && wParam != SIZE_MINIMIZED && IsWindowVisible(hwnd)) {
-                RECT bounds;
-                GetClientRect(hwnd, &bounds);
-                g_webViewController->lpVtbl->put_Bounds(g_webViewController, bounds);
+            if (wParam == SIZE_MINIMIZED) {
+                DeactivateMainWebView();
+            } else if (IsWindowVisible(hwnd)) {
+                ActivateMainWebView();
             }
             return 0;
             
@@ -1540,6 +1992,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             } else if (wParam == ID_TIMER_VISIBILITY_CHECK) {
                 // Periodic check for window occlusion
                 UpdateJsVisibilityState(hwnd);
+            } else if (wParam == ID_TIMER_WEBVIEW_PREWARM) {
+                KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
+                InterlockedExchange(&g_webViewPrewarmActive, FALSE);
+                if (IsWindowActuallyVisible(hwnd)) {
+                    ActivateMainWebView();
+                } else {
+                    DeactivateMainWebView();
+                }
+            } else if (wParam == ID_TIMER_WEBVIEW_PRELOAD) {
+                KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
+                // Initial preload has settled: suspend now if still hidden and
+                // not being kept warm by a tray-hover prewarm.
+                if (!IsWindowActuallyVisible(hwnd) &&
+                    InterlockedCompareExchange(&g_webViewPrewarmActive, TRUE, TRUE) != TRUE) {
+                    DeactivateMainWebView();
+                }
             }
             return 0;
             
@@ -1555,11 +2023,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
             
         case WM_DESTROY:
+            KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
+            KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
             PostQuitMessage(0);
             return 0;
             
         case WM_TRAYICON:
             switch (lParam) {
+                case WM_MOUSEMOVE: PrewarmMainWebView(); break;
                 case WM_LBUTTONDBLCLK: ShowMainWindow(); break;
                 case WM_RBUTTONUP: ShowContextMenu(hwnd); break;
             }
@@ -1671,6 +2142,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LoadConfiguration(g_iniPath, &g_config);
     }
     wcscpy_s(g_initialUrl, 2048, g_config.url);
+    InterlockedExchange(&g_sleepWhenInactive, g_config.sleepWhenInactive ? TRUE : FALSE);
 
     // On first launch, show configuration dialog
     if (isFirstLaunch) {

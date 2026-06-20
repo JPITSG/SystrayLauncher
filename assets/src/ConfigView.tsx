@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { type ConfigData, saveSettings, closeDialog } from "./lib/bridge";
 import { Button } from "./components/ui/button";
+import { Checkbox } from "./components/ui/checkbox";
 import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
 import { Textarea } from "./components/ui/textarea";
@@ -14,6 +15,9 @@ export default function ConfigView({ config }: Props) {
   const [url, setUrl] = useState(config.url);
   const [onHideJs, setOnHideJs] = useState(config.onHideJs);
   const [onShowJs, setOnShowJs] = useState(config.onShowJs);
+  const [sleepWhenInactive, setSleepWhenInactive] = useState(
+    config.sleepWhenInactive ?? false
+  );
   const [urlError, setUrlError] = useState("");
 
   function handleSave() {
@@ -28,6 +32,7 @@ export default function ConfigView({ config }: Props) {
       windowTitle,
       onHideJs,
       onShowJs,
+      sleepWhenInactive,
     });
   }
 
@@ -80,6 +85,24 @@ export default function ConfigView({ config }: Props) {
           value={onShowJs}
           onChange={(e) => setOnShowJs(e.target.value)}
         />
+      </div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="sleepWhenInactive"
+          className="mt-0.5"
+          checked={sleepWhenInactive}
+          onChange={(e) => setSleepWhenInactive(e.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="sleepWhenInactive" className="cursor-pointer">
+            Sleep web container when inactive
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Suspends the page to save CPU while the window is hidden. The page is
+            still preloaded at startup and wakes when you hover the tray icon.
+          </p>
+        </div>
       </div>
 
       <div className="flex justify-end gap-2 pt-1">

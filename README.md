@@ -8,6 +8,8 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 - **WebView2 Browser** - Uses Microsoft Edge WebView2 for modern web compatibility
 - **Configurable** - Set custom URL, window title, and JavaScript hooks via GUI
 - **JavaScript Hooks** - Execute custom JavaScript when the window is shown or hidden (useful for pausing/resuming web app activity)
+- **Preloaded on Startup** - The page is loaded into the WebView at launch so it is ready the moment you open the window
+- **Optional CPU Saving** - Opt-in "sleep when inactive" suspends the web container while hidden to save CPU on laptops, and pre-emptively wakes it when you hover the tray icon
 - **Registry Storage** - Settings persist in Windows Registry (`HKCU\SOFTWARE\JPIT\SystrayLauncher`)
 - **Single Instance** - Only one instance can run at a time
 - **First-Launch Setup** - Configuration dialog appears automatically on first run
@@ -33,6 +35,7 @@ Settings available in the Configure dialog:
 | URL | The web page to load |
 | JavaScript on Hide | JS executed when window is fully covered or hidden |
 | JavaScript on Show | JS executed when window becomes visible |
+| Sleep web container when inactive | When enabled, suspends the WebView to save CPU while the window is hidden, and pre-emptively wakes it on tray-icon hover. The page is always preloaded at startup regardless of this setting. Disabled by default. |
 
 ## Icon Customization
 
