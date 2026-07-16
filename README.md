@@ -51,7 +51,7 @@ regardless of Windows or Edge language settings (tracked in
 SystrayLauncher works around this: at startup — before the browser process
 launches — it writes the configured languages into its private WebView2
 profile (`spellcheck.dictionaries` and `intl.accept_languages` in
-`%LOCALAPPDATA%\SystrayLauncher\WebView2Data\Default\Preferences`). The app is
+`%LOCALAPPDATA%\SystrayLauncher\WebView2Data\EBWebView\Default\Preferences`). The app is
 single-instance and owns that profile exclusively, so the edit is safe. If you
 change the languages while the app is running, it offers to restart the
 embedded web view (the languages are only read at browser startup); answering

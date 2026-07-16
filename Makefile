@@ -18,7 +18,7 @@ SDK_INCLUDE = $(SDK_DIR)/build/native/include
 
 CFLAGS = -mwindows -isystem $(SDK_INCLUDE) -I.
 LDFLAGS = -mwindows
-LIBS = -lole32 -lshell32 -lshlwapi -luuid -luser32 -lgdi32 -lcomctl32
+LIBS = -lole32 -lshell32 -lshlwapi -luuid -luser32 -lgdi32 -lcomctl32 -ldwmapi
 
 .PHONY: all clean deps check-deps
 

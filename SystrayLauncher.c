@@ -1,3 +1,9 @@
+// WebView2 needs Windows 10; declare that so Vista+ APIs (GetTickCount64,
+// DWM attributes) are visible in the headers.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+
 #include <windows.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -5,8 +11,13 @@
 #include <wchar.h>
 #include <shlobj.h>
 #include <shlwapi.h>
+#include <dwmapi.h>
 #include <math.h>
 #include <assert.h>
+
+#ifndef DWMWA_CLOAKED
+#define DWMWA_CLOAKED 14
+#endif
 
 // WebView2 headers required from SDK
 #include "WebView2.h"
@@ -50,6 +61,25 @@
 #define WEBVIEW_PRELOAD_SETTLE_MS 1500
 #define ID_TIMER_WEBVIEW_RECREATE 7
 #define WEBVIEW_RECREATE_FALLBACK_MS 10000
+#define ID_TIMER_POWER_RESUME 8
+#define POWER_RESUME_KICK_DELAY_MS 2000
+#define POWER_RESUME_SETTLE_MS 5000
+
+// After a suspend-resume failure the resume is retried on every activation
+// tick (4x/s); if it keeps failing this long the runtime is torn down and
+// rebuilt instead.
+#define RESUME_FAILURE_RECREATE_THRESHOLD 12
+
+// Rate limit for automatic WebView rebuilds after unexpected browser-process
+// deaths, so a crash-looping runtime cannot spin rebuilds forever. A manual
+// tray Refresh/Open resets the limiter.
+#define REBUILD_BURST_WINDOW_MS (5 * 60 * 1000)
+#define REBUILD_BURST_MAX 5
+
+// The config dialog is normally shown by its first resize message; the
+// fallback timer keeps waiting while WebView2 is still initializing and
+// gives up (with an error) after this many 350 ms ticks.
+#define CFG_SHOW_FALLBACK_MAX_TRIES 20
 
 // Posted to the main window after the config dialog saves changed spell-check
 // languages (asks the user to restart the WebView), and when the browser
@@ -103,6 +133,10 @@ static volatile LONG g_sleepWhenInactive = FALSE;
 static volatile LONG g_openNewWindowsExternally = FALSE;
 static volatile LONG g_initialPreloadComplete = FALSE;
 static volatile LONG g_webViewRecreatePending = FALSE;
+static volatile LONG g_webViewCreatePending = FALSE;
+static volatile LONG g_resumeFailureCount = 0;
+static ULONGLONG g_rebuildBurstStartTick = 0;
+static LONG g_rebuildBurstCount = 0;
 static EventRegistrationToken g_browserExitedToken;
 static BOOL g_browserExitedRegistered = FALSE;
 static HINSTANCE g_hInstance;
@@ -116,6 +150,7 @@ static ICoreWebView2Controller* g_cfgController = NULL;
 static ICoreWebView2* g_cfgWebView = NULL;
 static BOOL g_cfgSaved = FALSE;
 static BOOL g_cfgWindowShown = FALSE;
+static int g_cfgShowFallbackTries = 0;
 
 // Dynamic WebView2 loading
 static WCHAR g_extractedDllPath[MAX_PATH] = {0};
@@ -143,6 +178,12 @@ static void GetMainUserDataFolder(wchar_t path[MAX_PATH]);
 static void CreateMainWebViewEnvironment(HWND hwnd);
 static void BeginMainWebViewRecreate(void);
 static void FinishMainWebViewRecreate(HWND hwnd);
+static void HandleUnexpectedBrowserExit(HWND hwnd);
+static void RebuildMainWebViewIfDead(void);
+static void KickWebViewAfterPowerResume(HWND hwnd);
+static void RegisterBrowserExitedOnCurrentEnv(void);
+static void UnregisterBrowserExitedFromCurrentEnv(void);
+static void RegisterMainProcessFailedHandler(ICoreWebView2* webview2);
 void ReloadTargetPage(void);
 void ClearWebViewCacheAndReload(void);
 void ExecuteJavaScript(const wchar_t* js);
@@ -728,11 +769,30 @@ static HRESULT STDMETHODCALLTYPE CfgCtrlCompleted_Invoke(
 static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
     ICoreWebView2WebMessageReceivedEventHandler*, ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs*);
 
+// A silent environment/controller failure used to leave the fallback timer
+// to show a window with nothing inside it - the "blank config modal". Fail
+// loudly and take the window down instead.
+static void CfgReportInitFailureAndClose(HRESULT hr) {
+    if (g_cfgHwnd) {
+        KillTimer(g_cfgHwnd, ID_TIMER_CFG_SHOW_FALLBACK);
+        PostMessage(g_cfgHwnd, WM_CLOSE, 0, 0);
+    }
+    wchar_t msg[256];
+    swprintf_s(msg, 256,
+        L"The configuration window could not initialize WebView2 (0x%08X).\n\n"
+        L"Please check the Microsoft Edge WebView2 Runtime installation.",
+        (unsigned)hr);
+    MessageBoxW(NULL, msg, APP_NAME, MB_ICONERROR | MB_OK);
+}
+
 static HRESULT STDMETHODCALLTYPE CfgEnvCompleted_Invoke(
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *This,
     HRESULT result, ICoreWebView2Environment *env) {
     (void)This;
-    if (FAILED(result) || !env) return result;
+    if (FAILED(result) || !env) {
+        CfgReportInitFailureAndClose(FAILED(result) ? result : E_POINTER);
+        return S_OK;
+    }
     g_cfgEnv = env;
     env->lpVtbl->AddRef(env);
 
@@ -768,7 +828,10 @@ static HRESULT STDMETHODCALLTYPE CfgCtrlCompleted_Invoke(
     ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *This,
     HRESULT result, ICoreWebView2Controller *controller) {
     (void)This;
-    if (FAILED(result) || !controller) return result;
+    if (FAILED(result) || !controller) {
+        CfgReportInitFailureAndClose(FAILED(result) ? result : E_POINTER);
+        return S_OK;
+    }
 
     g_cfgController = controller;
     controller->lpVtbl->AddRef(controller);
@@ -780,7 +843,10 @@ static HRESULT STDMETHODCALLTYPE CfgCtrlCompleted_Invoke(
 
     ICoreWebView2 *webview = NULL;
     controller->lpVtbl->get_CoreWebView2(controller, &webview);
-    if (!webview) return E_FAIL;
+    if (!webview) {
+        CfgReportInitFailureAndClose(E_FAIL);
+        return E_FAIL;
+    }
     g_cfgWebView = webview;
 
     ICoreWebView2Settings *settings = NULL;
@@ -938,13 +1004,25 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         case WM_TIMER:
             if (wParam == ID_TIMER_CFG_SHOW_FALLBACK) {
-                KillTimer(hwnd, ID_TIMER_CFG_SHOW_FALLBACK);
-                if (!g_cfgWindowShown) {
+                if (g_cfgWindowShown) {
+                    KillTimer(hwnd, ID_TIMER_CFG_SHOW_FALLBACK);
+                    return 0;
+                }
+                if (g_cfgController) {
+                    // Content exists but the resize message never came:
+                    // show the window at its default size.
+                    KillTimer(hwnd, ID_TIMER_CFG_SHOW_FALLBACK);
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     UpdateWindow(hwnd);
                     g_cfgWindowShown = TRUE;
                     cfg_sync_controller_bounds();
+                } else if (++g_cfgShowFallbackTries >= CFG_SHOW_FALLBACK_MAX_TRIES) {
+                    // WebView2 creation neither completed nor reported
+                    // failure; never present an empty window.
+                    KillTimer(hwnd, ID_TIMER_CFG_SHOW_FALLBACK);
+                    CfgReportInitFailureAndClose(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
                 }
+                // Otherwise keep waiting: the periodic timer fires again.
                 return 0;
             }
             break;
@@ -1021,6 +1099,7 @@ static void ShowConfigWebViewDialog(void) {
 
     if (!g_cfgHwnd) return;
     g_cfgWindowShown = FALSE;
+    g_cfgShowFallbackTries = 0;
     SetTimer(g_cfgHwnd, ID_TIMER_CFG_SHOW_FALLBACK, CFG_SHOW_FALLBACK_DELAY_MS, NULL);
 
     // Build user data folder path
@@ -1315,6 +1394,10 @@ static void PatchSpellcheckPreferences(void) {
 
     wchar_t prefsDir[MAX_PATH];
     GetMainUserDataFolder(prefsDir);
+    // The runtime nests the actual browser profile in an "EBWebView"
+    // subfolder of the user data folder, so the Preferences file lives at
+    // <UDF>\EBWebView\Default\Preferences - not directly under the UDF.
+    PathAppendW(prefsDir, L"EBWebView");
     PathAppendW(prefsDir, L"Default");
     wchar_t prefsPath[MAX_PATH];
     wcscpy_s(prefsPath, MAX_PATH, prefsDir);
@@ -1426,8 +1509,13 @@ static void CreateMainWebViewEnvironment(HWND hwnd) {
     GetMainUserDataFolder(userDataPath);
     SHCreateDirectoryExW(NULL, userDataPath, NULL);
 
+    InterlockedExchange(&g_webViewCreatePending, TRUE);
+
     EnvCompletedHandler* envHandler = (EnvCompletedHandler*)calloc(1, sizeof(EnvCompletedHandler));
-    if (!envHandler) return;
+    if (!envHandler) {
+        InterlockedExchange(&g_webViewCreatePending, FALSE);
+        return;
+    }
 
     static ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerVtbl envVtbl = {
         EnvCompletedHandler_QueryInterface,
@@ -1440,9 +1528,13 @@ static void CreateMainWebViewEnvironment(HWND hwnd) {
     envHandler->hwnd = hwnd;
     envHandler->userDataPath = _wcsdup(userDataPath);
 
-    fnCreateEnvironment(NULL, userDataPath, NULL,
+    HRESULT hr = fnCreateEnvironment(NULL, userDataPath, NULL,
         (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
     envHandler->lpVtbl->Release((ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
+    if (FAILED(hr)) {
+        InterlockedExchange(&g_webViewCreatePending, FALSE);
+        DebugPrint(L"[WARNING] CreateCoreWebView2Environment call failed. HRESULT: 0x%08X\n", hr);
+    }
 }
 
 typedef struct {
@@ -1485,6 +1577,53 @@ static HRESULT STDMETHODCALLTYPE BrowserExitedHandler_Invoke(
     return S_OK;
 }
 
+// The BrowserProcessExited event stays registered for the whole lifetime of
+// each environment: it drives both the deliberate rebuild (spell-check
+// change) and recovery from a browser process that died on its own - the
+// latter used to leave a permanently blank container.
+static void RegisterBrowserExitedOnCurrentEnv(void) {
+    if (!g_webViewEnv || g_browserExitedRegistered) return;
+
+    ICoreWebView2Environment5* env5 = NULL;
+    if (FAILED(g_webViewEnv->lpVtbl->QueryInterface(g_webViewEnv,
+            &IID_ICoreWebView2Environment5, (void**)&env5)) || !env5) {
+        DebugPrint(L"[WARNING] BrowserProcessExited event not supported by this runtime\n");
+        return;
+    }
+
+    BrowserExitedHandler* handler =
+        (BrowserExitedHandler*)calloc(1, sizeof(BrowserExitedHandler));
+    if (handler) {
+        static ICoreWebView2BrowserProcessExitedEventHandlerVtbl exitVtbl = {
+            BrowserExitedHandler_QueryInterface,
+            BrowserExitedHandler_AddRef,
+            BrowserExitedHandler_Release,
+            BrowserExitedHandler_Invoke
+        };
+        handler->lpVtbl = &exitVtbl;
+        handler->refCount = 1;
+        if (SUCCEEDED(env5->lpVtbl->add_BrowserProcessExited(env5,
+                (ICoreWebView2BrowserProcessExitedEventHandler*)handler,
+                &g_browserExitedToken))) {
+            g_browserExitedRegistered = TRUE;
+        }
+        handler->lpVtbl->Release((ICoreWebView2BrowserProcessExitedEventHandler*)handler);
+    }
+    env5->lpVtbl->Release(env5);
+}
+
+static void UnregisterBrowserExitedFromCurrentEnv(void) {
+    if (!g_webViewEnv || !g_browserExitedRegistered) return;
+
+    ICoreWebView2Environment5* env5 = NULL;
+    if (SUCCEEDED(g_webViewEnv->lpVtbl->QueryInterface(g_webViewEnv,
+            &IID_ICoreWebView2Environment5, (void**)&env5)) && env5) {
+        env5->lpVtbl->remove_BrowserProcessExited(env5, g_browserExitedToken);
+        env5->lpVtbl->Release(env5);
+    }
+    g_browserExitedRegistered = FALSE;
+}
+
 // Tear down the main WebView so its browser process exits; the Preferences
 // patch and the rebuild happen in FinishMainWebViewRecreate once the
 // BrowserProcessExited event fires (the file is only flushed - and unlocked
@@ -1502,33 +1641,8 @@ static void BeginMainWebViewRecreate(void) {
 
     InterlockedExchange(&g_webViewRecreatePending, TRUE);
 
-    g_browserExitedRegistered = FALSE;
-    if (g_webViewEnv) {
-        ICoreWebView2Environment5* env5 = NULL;
-        if (SUCCEEDED(g_webViewEnv->lpVtbl->QueryInterface(g_webViewEnv,
-                &IID_ICoreWebView2Environment5, (void**)&env5)) && env5) {
-            BrowserExitedHandler* handler =
-                (BrowserExitedHandler*)calloc(1, sizeof(BrowserExitedHandler));
-            if (handler) {
-                static ICoreWebView2BrowserProcessExitedEventHandlerVtbl exitVtbl = {
-                    BrowserExitedHandler_QueryInterface,
-                    BrowserExitedHandler_AddRef,
-                    BrowserExitedHandler_Release,
-                    BrowserExitedHandler_Invoke
-                };
-                handler->lpVtbl = &exitVtbl;
-                handler->refCount = 1;
-                if (SUCCEEDED(env5->lpVtbl->add_BrowserProcessExited(env5,
-                        (ICoreWebView2BrowserProcessExitedEventHandler*)handler,
-                        &g_browserExitedToken))) {
-                    g_browserExitedRegistered = TRUE;
-                }
-                handler->lpVtbl->Release((ICoreWebView2BrowserProcessExitedEventHandler*)handler);
-            }
-            env5->lpVtbl->Release(env5);
-        }
-    }
-
+    // BrowserProcessExited is already registered on the environment (done
+    // when the environment was created); its handler will post the rebuild.
     SetTimer(g_hwnd, ID_TIMER_WEBVIEW_RECREATE, WEBVIEW_RECREATE_FALLBACK_MS, NULL);
 
     KillTimer(g_hwnd, ID_TIMER_INITIAL_HIDE_JS);
@@ -1559,15 +1673,7 @@ static void FinishMainWebViewRecreate(HWND hwnd) {
     KillTimer(hwnd, ID_TIMER_WEBVIEW_RECREATE);
 
     if (g_webViewEnv) {
-        if (g_browserExitedRegistered) {
-            ICoreWebView2Environment5* env5 = NULL;
-            if (SUCCEEDED(g_webViewEnv->lpVtbl->QueryInterface(g_webViewEnv,
-                    &IID_ICoreWebView2Environment5, (void**)&env5)) && env5) {
-                env5->lpVtbl->remove_BrowserProcessExited(env5, g_browserExitedToken);
-                env5->lpVtbl->Release(env5);
-            }
-            g_browserExitedRegistered = FALSE;
-        }
+        UnregisterBrowserExitedFromCurrentEnv();
         g_webViewEnv->lpVtbl->Release(g_webViewEnv);
         g_webViewEnv = NULL;
     }
@@ -1575,6 +1681,71 @@ static void FinishMainWebViewRecreate(HWND hwnd) {
     DebugPrint(L"[INFO] Rebuilding main WebView with updated spell-check languages\n");
     PatchSpellcheckPreferences();
     CreateMainWebViewEnvironment(hwnd);
+}
+
+// The browser process died without the app asking for it (crash, kill, out
+// of memory, runtime servicing) or stopped honoring resume requests. Drop
+// every stale COM object and build a fresh WebView.
+static void HandleUnexpectedBrowserExit(HWND hwnd) {
+    if (InterlockedCompareExchange(&g_webViewCreatePending, TRUE, TRUE) == TRUE) return;
+
+    DebugPrint(L"[WARNING] WebView2 browser gone or unresponsive; rebuilding\n");
+
+    KillTimer(hwnd, ID_TIMER_INITIAL_HIDE_JS);
+    KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
+    KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
+    KillTimer(hwnd, ID_TIMER_WEBVIEW_RECREATE);
+
+    InterlockedExchange(&g_isInitialized, FALSE);
+    InterlockedExchange(&g_initialPreloadComplete, FALSE);
+    InterlockedExchange(&g_webViewSuspendPending, FALSE);
+    InterlockedExchange(&g_webViewSuspended, FALSE);
+    InterlockedExchange(&g_webViewPrewarmActive, FALSE);
+    InterlockedExchange(&g_resumeFailureCount, 0);
+    g_jsVisibility = JS_VISIBILITY_UNKNOWN;
+
+    if (g_webView) {
+        g_webView->lpVtbl->Release(g_webView);
+        g_webView = NULL;
+    }
+    if (g_webViewController) {
+        g_webViewController->lpVtbl->Close(g_webViewController);
+        g_webViewController->lpVtbl->Release(g_webViewController);
+        g_webViewController = NULL;
+    }
+    if (g_webViewEnv) {
+        UnregisterBrowserExitedFromCurrentEnv();
+        g_webViewEnv->lpVtbl->Release(g_webViewEnv);
+        g_webViewEnv = NULL;
+    }
+
+    ULONGLONG now = GetTickCount64();
+    if (g_rebuildBurstStartTick == 0 ||
+        now - g_rebuildBurstStartTick > REBUILD_BURST_WINDOW_MS) {
+        g_rebuildBurstStartTick = now;
+        g_rebuildBurstCount = 0;
+    }
+    if (++g_rebuildBurstCount > REBUILD_BURST_MAX) {
+        DebugPrint(L"[WARNING] Too many WebView rebuilds; waiting for a manual Refresh/Open\n");
+        return;
+    }
+
+    PatchSpellcheckPreferences();
+    CreateMainWebViewEnvironment(hwnd);
+}
+
+// Recovery entry point for the tray actions: if the WebView is gone (rebuild
+// limiter tripped, or creation failed earlier) a Refresh/Open builds it anew.
+static void RebuildMainWebViewIfDead(void) {
+    if (g_webView || g_webViewController || g_webViewEnv) return;
+    if (!g_hwnd) return;
+    if (InterlockedCompareExchange(&g_webViewCreatePending, TRUE, TRUE) == TRUE) return;
+    if (InterlockedCompareExchange(&g_webViewRecreatePending, TRUE, TRUE) == TRUE) return;
+
+    g_rebuildBurstCount = 0;
+    DebugPrint(L"[INFO] Rebuilding missing WebView from tray action\n");
+    PatchSpellcheckPreferences();
+    CreateMainWebViewEnvironment(g_hwnd);
 }
 
 // WebView2 Handler Implementations
@@ -1613,6 +1784,7 @@ HRESULT STDMETHODCALLTYPE EnvCompletedHandler_Invoke(
     HRESULT result, ICoreWebView2Environment* environment) {
 
     if (FAILED(result)) {
+        InterlockedExchange(&g_webViewCreatePending, FALSE);
         MessageBoxW(NULL, L"WebView2 environment creation failed", L"Error", MB_OK | MB_ICONERROR);
         return result;
     }
@@ -1624,13 +1796,15 @@ HRESULT STDMETHODCALLTYPE EnvCompletedHandler_Invoke(
         CoTaskMemFree(versionString);
     }
 
-    // Keep the environment for the BrowserProcessExited event used when
-    // rebuilding the WebView after a spell-check language change.
+    // Keep the environment for the BrowserProcessExited event (deliberate
+    // rebuilds and crash recovery both depend on it).
     if (g_webViewEnv) {
+        UnregisterBrowserExitedFromCurrentEnv();
         g_webViewEnv->lpVtbl->Release(g_webViewEnv);
     }
     g_webViewEnv = environment;
     environment->lpVtbl->AddRef(environment);
+    RegisterBrowserExitedOnCurrentEnv();
 
     EnvCompletedHandler* handler = (EnvCompletedHandler*)This;
     HWND hwnd = handler->hwnd;
@@ -1688,7 +1862,9 @@ ULONG STDMETHODCALLTYPE ControllerCompletedHandler_Release(
 HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
     ICoreWebView2CreateCoreWebView2ControllerCompletedHandler* This,
     HRESULT result, ICoreWebView2Controller* controller) {
-    
+
+    InterlockedExchange(&g_webViewCreatePending, FALSE);
+
     if (FAILED(result)) {
         MessageBoxW(NULL, L"WebView2 controller creation failed", L"Error", MB_OK | MB_ICONERROR);
         return result;
@@ -1731,9 +1907,11 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
         // we never suspend a half-loaded page (see OnMainNavigationCompleted).
         RegisterMainNavigationCompletedHandler(webview2);
         RegisterMainNewWindowRequestedHandler(webview2);
+        RegisterMainProcessFailedHandler(webview2);
 
         webview2->lpVtbl->Navigate(webview2, g_initialUrl);
 
+        InterlockedExchange(&g_resumeFailureCount, 0);
         InterlockedExchange(&g_isInitialized, TRUE);
         InterlockedExchange(&g_webViewDesiredVisible, TRUE);
         ResumeMainWebViewRuntime();
@@ -2036,6 +2214,104 @@ static void RegisterMainNewWindowRequestedHandler(ICoreWebView2* webview2) {
     handler->lpVtbl->Release((ICoreWebView2NewWindowRequestedEventHandler*)handler);
 }
 
+// Process failures (crashed/killed renderer, dead browser process, hung
+// page) previously went unnoticed, leaving the container permanently blank.
+// Renderer-level failures are repaired in place with a reload; a dead
+// browser process triggers a full rebuild of the WebView.
+typedef struct {
+    ICoreWebView2ProcessFailedEventHandlerVtbl* lpVtbl;
+    LONG refCount;
+} ProcessFailedHandler;
+
+static HRESULT STDMETHODCALLTYPE ProcessFailedHandler_QueryInterface(
+    ICoreWebView2ProcessFailedEventHandler* This,
+    REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2ProcessFailedEventHandler)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE ProcessFailedHandler_AddRef(
+    ICoreWebView2ProcessFailedEventHandler* This) {
+    return InterlockedIncrement(&((ProcessFailedHandler*)This)->refCount);
+}
+
+static ULONG STDMETHODCALLTYPE ProcessFailedHandler_Release(
+    ICoreWebView2ProcessFailedEventHandler* This) {
+    ULONG refCount = InterlockedDecrement(&((ProcessFailedHandler*)This)->refCount);
+    if (refCount == 0) free(This);
+    return refCount;
+}
+
+static HRESULT STDMETHODCALLTYPE ProcessFailedHandler_Invoke(
+    ICoreWebView2ProcessFailedEventHandler* This,
+    ICoreWebView2* sender, ICoreWebView2ProcessFailedEventArgs* args) {
+    (void)This; (void)sender;
+
+    COREWEBVIEW2_PROCESS_FAILED_KIND kind =
+        COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED;
+    if (args) args->lpVtbl->get_ProcessFailedKind(args, &kind);
+    DebugPrint(L"[WARNING] WebView2 process failure, kind=%d\n", (int)kind);
+
+    switch (kind) {
+        case COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED:
+            // Everything behind the controller is gone; rebuild from scratch
+            // (the BrowserProcessExited event posts the same message, the
+            // handler dedupes).
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_WEBVIEW_RECREATE, 0, 0);
+            break;
+
+        case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED:
+        case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE:
+            // The browser process is fine; only the page died. Reload it in
+            // place, falling back to a fresh navigation.
+            if (g_webView) {
+                ResumeMainWebViewRuntime();
+                if (FAILED(g_webView->lpVtbl->Reload(g_webView))) {
+                    ReloadTargetPage();
+                }
+            }
+            break;
+
+        default:
+            // GPU/utility/frame processes are restarted by the runtime.
+            break;
+    }
+
+    return S_OK;
+}
+
+static void RegisterMainProcessFailedHandler(ICoreWebView2* webview2) {
+    if (!webview2) return;
+
+    ProcessFailedHandler* handler =
+        (ProcessFailedHandler*)calloc(1, sizeof(ProcessFailedHandler));
+    if (!handler) return;
+
+    static ICoreWebView2ProcessFailedEventHandlerVtbl failVtbl = {
+        ProcessFailedHandler_QueryInterface,
+        ProcessFailedHandler_AddRef,
+        ProcessFailedHandler_Release,
+        ProcessFailedHandler_Invoke
+    };
+    handler->lpVtbl = &failVtbl;
+    handler->refCount = 1;
+
+    EventRegistrationToken token;
+    HRESULT hr = webview2->lpVtbl->add_ProcessFailed(
+        webview2, (ICoreWebView2ProcessFailedEventHandler*)handler, &token);
+    if (FAILED(hr)) {
+        DebugPrint(L"[WARNING] add_ProcessFailed failed. HRESULT: 0x%08X\n", hr);
+    }
+
+    handler->lpVtbl->Release((ICoreWebView2ProcessFailedEventHandler*)handler);
+}
+
 // Helper to execute JavaScript in WebView2
 void ExecuteJavaScript(const wchar_t* js) {
     if (!g_webView || !js || js[0] == L'\0') return;
@@ -2110,15 +2386,28 @@ static void ResumeMainWebViewRuntime(void) {
     if (!needsResume) return;
 
     ICoreWebView2_3* webView3 = QueryMainWebView3();
-    if (webView3) {
-        HRESULT hr = webView3->lpVtbl->Resume(webView3);
-        if (FAILED(hr)) {
-            DebugPrint(L"[WARNING] WebView2 resume failed. HRESULT: 0x%08X\n", hr);
-        }
-        webView3->lpVtbl->Release(webView3);
+    if (!webView3) return;
+
+    HRESULT hr = webView3->lpVtbl->Resume(webView3);
+    webView3->lpVtbl->Release(webView3);
+
+    if (SUCCEEDED(hr)) {
+        InterlockedExchange(&g_webViewSuspendPending, FALSE);
+        InterlockedExchange(&g_webViewSuspended, FALSE);
+        InterlockedExchange(&g_resumeFailureCount, 0);
+        return;
     }
-    InterlockedExchange(&g_webViewSuspendPending, FALSE);
-    InterlockedExchange(&g_webViewSuspended, FALSE);
+
+    // Keep the suspended flags set so every later activation retries the
+    // resume. A runtime that stays unresumable (seen after the machine comes
+    // back from hibernation) gets torn down and rebuilt instead of leaving a
+    // frozen, white page on screen.
+    DebugPrint(L"[WARNING] WebView2 resume failed. HRESULT: 0x%08X\n", hr);
+    LONG failures = InterlockedIncrement(&g_resumeFailureCount);
+    if (failures >= RESUME_FAILURE_RECREATE_THRESHOLD && g_hwnd) {
+        InterlockedExchange(&g_resumeFailureCount, 0);
+        PostMessageW(g_hwnd, WM_APP_WEBVIEW_RECREATE, 0, 0);
+    }
 }
 
 static void SuspendMainWebViewRuntime(void) {
@@ -2222,6 +2511,29 @@ static void PrewarmMainWebView(void) {
     DebugPrint(L"[INFO] WebView2 prewarmed (warm render) from tray hover for %d ms\n", WEBVIEW_PREWARM_MS);
 }
 
+// After the machine resumes from sleep/hibernate the GPU-side composition
+// surfaces backing the WebView can be gone; a page that was suspended (or
+// merely hidden) across the power transition then presents as a permanently
+// white container. Force the runtime to rebuild its visuals: wake the page,
+// re-assert the bounds, drop and re-add the visual tree, and let the normal
+// visibility logic settle the sleep state again a few seconds later.
+static void KickWebViewAfterPowerResume(HWND hwnd) {
+    if (!IsWebViewReady() || !g_webViewController) return;
+
+    DebugPrint(L"[INFO] System resumed; refreshing WebView2 composition\n");
+    InterlockedExchange(&g_webViewPrewarmActive, TRUE);
+    InterlockedExchange(&g_webViewDesiredVisible, TRUE);
+    ResumeMainWebViewRuntime();
+    SyncMainWebViewBounds();
+    g_webViewController->lpVtbl->put_IsVisible(g_webViewController, FALSE);
+    g_webViewController->lpVtbl->put_IsVisible(g_webViewController, TRUE);
+    g_webViewController->lpVtbl->NotifyParentWindowPositionChanged(g_webViewController);
+
+    // Reuse the prewarm settle path: when this fires the WebView is
+    // activated or put back to sleep according to the actual visibility.
+    SetTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM, POWER_RESUME_SETTLE_MS, NULL);
+}
+
 // Called when a navigation completes. The first completion marks the initial
 // preload as done, after which it is safe to suspend on hide without cutting a
 // page load short.
@@ -2260,6 +2572,16 @@ static BOOL CALLBACK OcclusionEnumProc(HWND hwnd, LPARAM lParam) {
 
     // Skip invisible or minimized windows
     if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) {
+        return TRUE;
+    }
+
+    // Skip DWM-cloaked windows: suspended UWP apps, the lock-screen host and
+    // ghost ApplicationFrameHost shells report IsWindowVisible=TRUE while
+    // drawing nothing. Counting them as occluders makes the app believe the
+    // window is covered and suspend a WebView the user is looking at.
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked,
+                                        sizeof(cloaked))) && cloaked != 0) {
         return TRUE;
     }
 
@@ -2428,6 +2750,8 @@ static void GetTargetWindowRect(int* x, int* y, int* w, int* h) {
 // Window management
 void ShowMainWindow(void) {
     if (!g_hwnd) return;
+
+    RebuildMainWebViewIfDead();
 
     int x, y, windowWidth, windowHeight;
     GetTargetWindowRect(&x, &y, &windowWidth, &windowHeight);
@@ -2667,8 +2991,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 // BrowserProcessExited never arrived; rebuild anyway.
                 DebugPrint(L"[WARNING] Browser exit event not received; rebuilding WebView after timeout\n");
                 FinishMainWebViewRecreate(hwnd);
+            } else if (wParam == ID_TIMER_POWER_RESUME) {
+                KillTimer(hwnd, ID_TIMER_POWER_RESUME);
+                KickWebViewAfterPowerResume(hwnd);
             }
             return 0;
+
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+                // Give the graphics stack a moment to come back up, then
+                // repair the WebView composition (see KickWebViewAfterPowerResume).
+                SetTimer(hwnd, ID_TIMER_POWER_RESUME, POWER_RESUME_KICK_DELAY_MS, NULL);
+            }
+            return TRUE;
             
         case WM_SYSCOMMAND:
             if ((wParam & 0xFFF0) == SC_MINIMIZE) {
@@ -2684,6 +3019,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_DESTROY:
             KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
             KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
+            KillTimer(hwnd, ID_TIMER_POWER_RESUME);
             PostQuitMessage(0);
             return 0;
             
@@ -2700,7 +3036,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
 
         case WM_APP_WEBVIEW_RECREATE:
-            FinishMainWebViewRecreate(hwnd);
+            if (InterlockedCompareExchange(&g_webViewRecreatePending, TRUE, TRUE) == TRUE) {
+                // Deliberate rebuild (spell-check change): the browser was
+                // asked to exit and now has.
+                FinishMainWebViewRecreate(hwnd);
+            } else {
+                // Unsolicited: the browser process died or stopped resuming.
+                HandleUnexpectedBrowserExit(hwnd);
+            }
             return 0;
 
         case WM_TRAYICON:
@@ -2714,6 +3057,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_COMMAND:
             switch (wParam) {
                 case ID_TRAY_MENU_REFRESH:
+                    RebuildMainWebViewIfDead();
                     // If window is already restored and visible, don't reposition it
                     if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd) && IsWindowActuallyVisible(g_hwnd)) {
                         SetForegroundWindow(g_hwnd);
@@ -2723,6 +3067,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     ReloadTargetPage();
                     return 0;
                 case ID_TRAY_MENU_CLEAR_CACHE:
+                    RebuildMainWebViewIfDead();
                     // If window is already restored and visible, don't reposition it
                     if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd) && IsWindowActuallyVisible(g_hwnd)) {
                         SetForegroundWindow(g_hwnd);
@@ -2914,7 +3259,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Cleanup
     if (g_webView) g_webView->lpVtbl->Release(g_webView);
     if (g_webViewController) g_webViewController->lpVtbl->Release(g_webViewController);
-    if (g_webViewEnv) g_webViewEnv->lpVtbl->Release(g_webViewEnv);
+    if (g_webViewEnv) {
+        UnregisterBrowserExitedFromCurrentEnv();
+        g_webViewEnv->lpVtbl->Release(g_webViewEnv);
+    }
     
     // Clean up tray icon and its resources
     if (g_nid.hIcon) {
