@@ -34,6 +34,8 @@
 #define REG_VALUE_ONHIDEJS L"OnHideJS"
 #define REG_VALUE_ONSHOWJS L"OnShowJS"
 #define REG_VALUE_SLEEP L"SleepWhenInactive"
+#define REG_VALUE_SPELLCHECK L"SpellcheckLanguages"
+#define REG_VALUE_NEWWINDOW L"OpenNewWindowsExternally"
 #define REG_VALUE_CONFIGURED L"Configured"
 
 #define ID_TIMER_INITIAL_HIDE_JS 2
@@ -46,6 +48,14 @@
 #define WEBVIEW_PREWARM_MS 60000
 #define ID_TIMER_WEBVIEW_PRELOAD 6
 #define WEBVIEW_PRELOAD_SETTLE_MS 1500
+#define ID_TIMER_WEBVIEW_RECREATE 7
+#define WEBVIEW_RECREATE_FALLBACK_MS 10000
+
+// Posted to the main window after the config dialog saves changed spell-check
+// languages (asks the user to restart the WebView), and when the browser
+// process has exited and the WebView can be rebuilt with the new languages.
+#define WM_APP_SPELLCHECK_CHANGED (WM_APP + 2)
+#define WM_APP_WEBVIEW_RECREATE (WM_APP + 3)
 
 typedef struct {
     wchar_t url[2048];
@@ -53,6 +63,10 @@ typedef struct {
     wchar_t onHideJs[4096];
     wchar_t onShowJs[4096];
     BOOL sleepWhenInactive;
+    BOOL openNewWindowsExternally;
+    // Comma-separated BCP-47 tags (e.g. L"en-US,pl"); empty = don't manage
+    // the WebView2 profile's spell-check settings at all.
+    wchar_t spellcheckLanguages[512];
 } Configuration;
 
 typedef enum {
@@ -67,6 +81,7 @@ static HWND g_hwnd = NULL;
 static HWND g_hwndOwner = NULL;  // Invisible owner window to prevent taskbar appearance
 static ICoreWebView2Controller* g_webViewController = NULL;
 static ICoreWebView2* g_webView = NULL;
+static ICoreWebView2Environment* g_webViewEnv = NULL;
 static NOTIFYICONDATAW g_nid = {0};
 static UINT g_WM_TASKBARCREATED = 0;
 static HANDLE g_hMutex = NULL;
@@ -85,7 +100,11 @@ static volatile LONG g_webViewSuspendPending = FALSE;
 static volatile LONG g_webViewSuspended = FALSE;
 static volatile LONG g_resetUrlOnNextShow = FALSE;
 static volatile LONG g_sleepWhenInactive = FALSE;
+static volatile LONG g_openNewWindowsExternally = FALSE;
 static volatile LONG g_initialPreloadComplete = FALSE;
+static volatile LONG g_webViewRecreatePending = FALSE;
+static EventRegistrationToken g_browserExitedToken;
+static BOOL g_browserExitedRegistered = FALSE;
 static HINSTANCE g_hInstance;
 static JsVisibility g_jsVisibility = JS_VISIBILITY_UNKNOWN;
 static wchar_t g_webView2Version[128] = L"Unknown";
@@ -118,7 +137,12 @@ void RefreshTrayIcon(void);
 void CaptureDisplaySettings(void);
 BOOL HasDisplaySettingsChanged(void);
 void DebugPrint(const wchar_t* format, ...);
-void SetSpellCheckLanguages(ICoreWebView2* webview, const wchar_t* languages);
+static void NormalizeSpellcheckLanguages(const wchar_t* in, wchar_t* out, size_t outLen);
+static void PatchSpellcheckPreferences(void);
+static void GetMainUserDataFolder(wchar_t path[MAX_PATH]);
+static void CreateMainWebViewEnvironment(HWND hwnd);
+static void BeginMainWebViewRecreate(void);
+static void FinishMainWebViewRecreate(HWND hwnd);
 void ReloadTargetPage(void);
 void ClearWebViewCacheAndReload(void);
 void ExecuteJavaScript(const wchar_t* js);
@@ -135,6 +159,7 @@ static void PrewarmMainWebView(void);
 static void ResetTargetPageIfNeeded(void);
 static void OnMainNavigationCompleted(void);
 static void RegisterMainNavigationCompletedHandler(ICoreWebView2* webview2);
+static void RegisterMainNewWindowRequestedHandler(ICoreWebView2* webview2);
 static void GetTargetWindowRect(int* x, int* y, int* w, int* h);
 
 // Registry and config dialog functions
@@ -256,6 +281,8 @@ void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     config->onHideJs[0] = L'\0';
     config->onShowJs[0] = L'\0';
     config->sleepWhenInactive = FALSE;
+    config->openNewWindowsExternally = FALSE;
+    config->spellcheckLanguages[0] = L'\0';
 
     if (!PathFileExistsW(iniPath)) {
         CreateDefaultIni(iniPath);
@@ -322,6 +349,11 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
     } else if (wcscmp(key, L"sleepwheninactive") == 0) {
         wchar_t c = towlower(value[0]);
         config->sleepWhenInactive = (c == L'1' || c == L't' || c == L'y');
+    } else if (wcscmp(key, L"spellchecklanguages") == 0) {
+        wcscpy_s(config->spellcheckLanguages, 512, value);
+    } else if (wcscmp(key, L"opennewwindowsexternally") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->openNewWindowsExternally = (c == L'1' || c == L't' || c == L'y');
     }
 }
 
@@ -382,6 +414,24 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         config->sleepWhenInactive = FALSE;
     }
 
+    // Load OpenNewWindowsExternally (default disabled)
+    DWORD newWinVal = 0;
+    dataSize = sizeof(newWinVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_NEWWINDOW, NULL, &dataType, (LPBYTE)&newWinVal, &dataSize) == ERROR_SUCCESS) {
+        config->openNewWindowsExternally = (newWinVal != 0);
+    } else {
+        config->openNewWindowsExternally = FALSE;
+    }
+
+    // Load SpellcheckLanguages (empty = spell-check settings not managed)
+    dataSize = sizeof(config->spellcheckLanguages);
+    if (RegQueryValueExW(hKey, REG_VALUE_SPELLCHECK, NULL, &dataType, (LPBYTE)config->spellcheckLanguages, &dataSize) != ERROR_SUCCESS) {
+        config->spellcheckLanguages[0] = L'\0';
+    } else {
+        // REG_SZ data is not guaranteed to be null-terminated
+        config->spellcheckLanguages[511] = L'\0';
+    }
+
     RegCloseKey(hKey);
     return TRUE;
 }
@@ -415,6 +465,16 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     DWORD sleepVal = config->sleepWhenInactive ? 1 : 0;
     RegSetValueExW(hKey, REG_VALUE_SLEEP, 0, REG_DWORD,
                    (const BYTE*)&sleepVal, sizeof(sleepVal));
+
+    // Save OpenNewWindowsExternally
+    DWORD newWinVal = config->openNewWindowsExternally ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_NEWWINDOW, 0, REG_DWORD,
+                   (const BYTE*)&newWinVal, sizeof(newWinVal));
+
+    // Save SpellcheckLanguages
+    RegSetValueExW(hKey, REG_VALUE_SPELLCHECK, 0, REG_SZ,
+                   (const BYTE*)config->spellcheckLanguages,
+                   (DWORD)((wcslen(config->spellcheckLanguages) + 1) * sizeof(wchar_t)));
 
     RegCloseKey(hKey);
     return TRUE;
@@ -453,6 +513,10 @@ static void ApplyConfiguration(void) {
 
     // Sync the "sleep when inactive" setting
     InterlockedExchange(&g_sleepWhenInactive, g_config.sleepWhenInactive ? TRUE : FALSE);
+
+    // Sync the new-window handling setting (read live by the handler, so a
+    // toggle applies without restarting the WebView)
+    InterlockedExchange(&g_openNewWindowsExternally, g_config.openNewWindowsExternally ? TRUE : FALSE);
 
     // Update window title
     if (g_hwnd) {
@@ -619,16 +683,18 @@ static void cfg_sync_controller_bounds(void) {
 }
 
 static void webview_push_init_config(void) {
-    wchar_t eUrl[4096], eTitle[512], eHide[8192], eShow[8192];
+    wchar_t eUrl[4096], eTitle[512], eHide[8192], eShow[8192], eSpell[1024];
     json_escape_wstring(g_config.url, eUrl, 4096);
     json_escape_wstring(g_config.windowTitle, eTitle, 512);
     json_escape_wstring(g_config.onHideJs, eHide, 8192);
     json_escape_wstring(g_config.onShowJs, eShow, 8192);
+    json_escape_wstring(g_config.spellcheckLanguages, eSpell, 1024);
 
     wchar_t script[16384];
     swprintf(script, 16384,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s}})",
-        eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false");
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"spellcheckLanguages\":\"%s\",\"openNewWindowsExternally\":%s}})",
+        eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false", eSpell,
+        g_config.openNewWindowsExternally ? L"true" : L"false");
     webview_cfg_execute_script(script);
 }
 
@@ -790,20 +856,38 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         webview_push_init_config();
     } else if (strcmp(action, "saveSettings") == 0) {
         char url[4096] = {0}, title[512] = {0}, hideJs[8192] = {0}, showJs[8192] = {0};
+        char spellLangs[512] = {0};
         json_get_string(msg, "url", url, sizeof(url));
         json_get_string(msg, "windowTitle", title, sizeof(title));
         json_get_string(msg, "onHideJs", hideJs, sizeof(hideJs));
         json_get_string(msg, "onShowJs", showJs, sizeof(showJs));
+        json_get_string(msg, "spellcheckLanguages", spellLangs, sizeof(spellLangs));
+
+        wchar_t prevSpellLangs[512];
+        wcscpy_s(prevSpellLangs, 512, g_config.spellcheckLanguages);
 
         MultiByteToWideChar(CP_UTF8, 0, url, -1, g_config.url, 2048);
         MultiByteToWideChar(CP_UTF8, 0, title, -1, g_config.windowTitle, 256);
         MultiByteToWideChar(CP_UTF8, 0, hideJs, -1, g_config.onHideJs, 4096);
         MultiByteToWideChar(CP_UTF8, 0, showJs, -1, g_config.onShowJs, 4096);
+        wchar_t rawSpellLangs[512] = {0};
+        MultiByteToWideChar(CP_UTF8, 0, spellLangs, -1, rawSpellLangs, 512);
+        NormalizeSpellcheckLanguages(rawSpellLangs, g_config.spellcheckLanguages, 512);
         g_config.sleepWhenInactive = json_get_bool(msg, "sleepWhenInactive", FALSE);
+        g_config.openNewWindowsExternally = json_get_bool(msg, "openNewWindowsExternally", FALSE);
 
         SaveConfigToRegistry(&g_config);
         MarkAsConfigured();
         ApplyConfiguration();
+
+        // Spell-check languages are only read when the browser process
+        // starts, so a change needs the main WebView rebuilt. Prompt on the
+        // main window's thread once this dialog has closed itself.
+        if (wcscmp(prevSpellLangs, g_config.spellcheckLanguages) != 0 &&
+            g_hwnd && g_webViewController) {
+            PostMessageW(g_hwnd, WM_APP_SPELLCHECK_CHANGED, 0, 0);
+        }
+
         g_cfgSaved = TRUE;
         PostMessage(g_cfgHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "close") == 0) {
@@ -967,30 +1051,530 @@ static void ShowConfigWebViewDialog(void) {
     }
 }
 
-// Function to enable spell checking via settings
-void SetSpellCheckLanguages(ICoreWebView2* webview, const wchar_t* languages) {
-    if (!webview || !languages) return;
-    
-    // Get settings
-    ICoreWebView2Settings* settings = NULL;
-    HRESULT hr = webview->lpVtbl->get_Settings(webview, &settings);
-    
-    if (SUCCEEDED(hr) && settings) {
-        // Enable context menus (required for spell check suggestions to appear)
-        hr = settings->lpVtbl->put_AreDefaultContextMenusEnabled(settings, TRUE);
-        if (SUCCEEDED(hr)) {
-            DebugPrint(L"[INFO] Context menus enabled for spell checking\n");
-        } else {
-            DebugPrint(L"[WARNING] Failed to enable context menus. HRESULT: 0x%08X\n", hr);
+// ---------------------------------------------------------------------------
+// Spell checking
+//
+// WebView2 has no public API to pick spell-check languages (tracked in
+// MicrosoftEdge/WebView2Feedback#2040). The engine is fully present though:
+// Chromium reads the dictionary list from the profile's Preferences JSON at
+// browser-process startup. This app owns its user data folder exclusively and
+// is single-instance, so we can safely rewrite those keys while the browser
+// process is not running. The dictionary list must stay a subset of
+// intl.accept_languages or Chromium prunes it on startup, which is why both
+// prefs are written together.
+// ---------------------------------------------------------------------------
+
+// Normalize a comma-separated list of spell-check language tags: trim
+// whitespace, drop tokens with characters other than letters/digits/hyphens
+// (they would be invalid tags and must not reach the JSON patch), dedupe, and
+// fix the usual BCP-47 casing (en-us -> en-US, pt-br -> pt-BR) so the tags
+// match Chromium's dictionary names.
+static void NormalizeSpellcheckLanguages(const wchar_t* in, wchar_t* out, size_t outLen) {
+    size_t o = 0;
+    if (outLen == 0) return;
+    out[0] = L'\0';
+    if (!in) return;
+
+    const wchar_t* p = in;
+    while (*p) {
+        while (*p == L',' || *p == L';' || iswspace(*p)) p++;
+        if (!*p) break;
+
+        wchar_t token[32];
+        size_t t = 0;
+        BOOL valid = TRUE;
+        while (*p && *p != L',' && *p != L';' && !iswspace(*p)) {
+            wchar_t c = (*p == L'_') ? L'-' : *p;
+            if (!iswalnum(c) && c != L'-') valid = FALSE;
+            if (t < 31) token[t++] = c; else valid = FALSE;
+            p++;
         }
-        
-        DebugPrint(L"[INFO] Spell check will use languages configured in Edge (edge://settings/languages)\n");
-        DebugPrint(L"[INFO] Configured languages: %s\n", languages);
-        
-        settings->lpVtbl->Release(settings);
-    } else {
-        DebugPrint(L"[WARNING] Failed to get WebView2 settings. HRESULT: 0x%08X\n", hr);
+        token[t] = L'\0';
+        if (!valid || t == 0) continue;
+
+        // Casing per subtag: primary lowercase, 2-letter region UPPER,
+        // 4-letter script Titlecase.
+        size_t start = 0;
+        for (size_t i = 0; i <= t && valid; i++) {
+            if (token[i] == L'-' || token[i] == L'\0') {
+                size_t len = i - start;
+                if (len == 0) { valid = FALSE; break; }
+                if (start == 0) {
+                    for (size_t j = start; j < i; j++) token[j] = towlower(token[j]);
+                } else if (len == 2) {
+                    for (size_t j = start; j < i; j++) token[j] = towupper(token[j]);
+                } else if (len == 4) {
+                    token[start] = towupper(token[start]);
+                    for (size_t j = start + 1; j < i; j++) token[j] = towlower(token[j]);
+                } else {
+                    for (size_t j = start; j < i; j++) token[j] = towlower(token[j]);
+                }
+                start = i + 1;
+            }
+        }
+        if (!valid) continue;
+
+        // Skip duplicates
+        BOOL dup = FALSE;
+        const wchar_t* q = out;
+        while (*q) {
+            const wchar_t* e = wcschr(q, L',');
+            size_t len = e ? (size_t)(e - q) : wcslen(q);
+            if (len == t && wcsncmp(q, token, t) == 0) { dup = TRUE; break; }
+            q = e ? e + 1 : q + len;
+        }
+        if (dup) continue;
+
+        size_t need = t + (o > 0 ? 1 : 0);
+        if (o + need + 1 > outLen) break;
+        if (o > 0) out[o++] = L',';
+        wmemcpy(out + o, token, t);
+        o += t;
+        out[o] = L'\0';
     }
+}
+
+static void GetMainUserDataFolder(wchar_t path[MAX_PATH]) {
+    path[0] = L'\0';
+    SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, path);
+    PathAppendW(path, APP_NAME L"\\WebView2Data");
+}
+
+// --- Minimal JSON surgery (string- and nesting-aware, never guesses) -------
+
+static const char* json_skip_ws(const char* p, const char* end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    return p;
+}
+
+// p points at the opening quote; returns one past the closing quote.
+static const char* json_skip_string(const char* p, const char* end) {
+    p++;
+    while (p < end) {
+        if (*p == '\\') { p += 2; continue; }
+        if (*p == '"') return p + 1;
+        p++;
+    }
+    return NULL;
+}
+
+// Returns one past the end of the value starting at p (string, object,
+// array, number, bool or null), or NULL if the input is malformed/truncated.
+static const char* json_skip_value(const char* p, const char* end) {
+    p = json_skip_ws(p, end);
+    if (p >= end) return NULL;
+    if (*p == '"') return json_skip_string(p, end);
+    if (*p == '{' || *p == '[') {
+        int depth = 0;
+        while (p < end) {
+            if (*p == '"') {
+                p = json_skip_string(p, end);
+                if (!p) return NULL;
+                continue;
+            }
+            if (*p == '{' || *p == '[') {
+                depth++;
+            } else if (*p == '}' || *p == ']') {
+                depth--;
+                if (depth == 0) return p + 1;
+            }
+            p++;
+        }
+        return NULL;
+    }
+    while (p < end && *p != ',' && *p != '}' && *p != ']' &&
+           *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+        p++;
+    }
+    return p;
+}
+
+// obj points at '{'. Looks up "key" among this object's own members (not in
+// nested objects). Returns the value start and sets *valEnd, or NULL.
+static const char* json_object_find(const char* obj, const char* end,
+                                    const char* key, const char** valEnd) {
+    if (obj >= end || *obj != '{') return NULL;
+    size_t klen = strlen(key);
+    const char* p = obj + 1;
+    for (;;) {
+        p = json_skip_ws(p, end);
+        if (p >= end || *p == '}') return NULL;
+        if (*p != '"') return NULL;
+        const char* ks = p + 1;
+        const char* kq = json_skip_string(p, end);
+        if (!kq) return NULL;
+        const char* ke = kq - 1;
+        p = json_skip_ws(kq, end);
+        if (p >= end || *p != ':') return NULL;
+        const char* vs = json_skip_ws(p + 1, end);
+        const char* ve = json_skip_value(vs, end);
+        if (!ve) return NULL;
+        if ((size_t)(ke - ks) == klen && strncmp(ks, key, klen) == 0) {
+            *valEnd = ve;
+            return vs;
+        }
+        p = json_skip_ws(ve, end);
+        if (p >= end) return NULL;
+        if (*p == ',') { p++; continue; }
+        return NULL;
+    }
+}
+
+// Replace [from,to) in buf with insert; returns a new heap buffer.
+static char* str_splice(const char* buf, size_t len, const char* from,
+                        const char* to, const char* insert, size_t* newLen) {
+    size_t pre = (size_t)(from - buf);
+    size_t post = len - (size_t)(to - buf);
+    size_t ins = strlen(insert);
+    char* result = (char*)malloc(pre + ins + post + 1);
+    if (!result) return NULL;
+    memcpy(result, buf, pre);
+    memcpy(result + pre, insert, ins);
+    memcpy(result + pre + ins, to, post);
+    result[pre + ins + post] = '\0';
+    *newLen = pre + ins + post;
+    return result;
+}
+
+// Ensure root.<parentKey>.<childKey> == valueJson. Returns a new heap buffer
+// (and updates *newLen), or NULL when the document isn't a JSON object we can
+// understand - the caller then leaves the file untouched. New keys are
+// inserted at the end of their object so they win under Chromium's
+// last-key-wins JSON parsing even in pathological duplicate-key files.
+static char* json_set_nested(const char* json, size_t len,
+                             const char* parentKey, const char* childKey,
+                             const char* valueJson, size_t* newLen) {
+    const char* end = json + len;
+    const char* root = json_skip_ws(json, end);
+    if (root >= end || *root != '{') return NULL;
+    const char* rootEnd = json_skip_value(root, end);
+    if (!rootEnd) return NULL;
+
+    char insert[2048];
+    const char* pve = NULL;
+    const char* pv = json_object_find(root, rootEnd, parentKey, &pve);
+    if (pv && *pv == '{') {
+        const char* cve = NULL;
+        const char* cv = json_object_find(pv, pve, childKey, &cve);
+        if (cv) {
+            return str_splice(json, len, cv, cve, valueJson, newLen);
+        }
+        const char* inner = json_skip_ws(pv + 1, pve);
+        BOOL emptyObj = (inner < pve && *inner == '}');
+        snprintf(insert, sizeof(insert), "%s\"%s\":%s",
+                 emptyObj ? "" : ",", childKey, valueJson);
+        return str_splice(json, len, pve - 1, pve - 1, insert, newLen);
+    }
+    if (pv) {
+        // Parent exists but is not an object: replace it wholesale.
+        snprintf(insert, sizeof(insert), "{\"%s\":%s}", childKey, valueJson);
+        return str_splice(json, len, pv, pve, insert, newLen);
+    }
+    const char* innerRoot = json_skip_ws(root + 1, rootEnd);
+    BOOL rootEmpty = (innerRoot < rootEnd && *innerRoot == '}');
+    snprintf(insert, sizeof(insert), "%s\"%s\":{\"%s\":%s}",
+             rootEmpty ? "" : ",", parentKey, childKey, valueJson);
+    return str_splice(json, len, rootEnd - 1, rootEnd - 1, insert, newLen);
+}
+
+// Write the configured spell-check languages into the WebView2 profile's
+// Preferences file. Must only run while the browser process for the main
+// user data folder is not running (app startup, or after BrowserProcessExited).
+static void PatchSpellcheckPreferences(void) {
+    if (g_config.spellcheckLanguages[0] == L'\0') return;
+
+    char langs[512];
+    if (WideCharToMultiByte(CP_UTF8, 0, g_config.spellcheckLanguages, -1,
+                            langs, sizeof(langs), NULL, NULL) <= 0) {
+        return;
+    }
+
+    // "en-US,pl" -> ["en-US","pl"] for spellcheck.dictionaries, and a quoted
+    // string for intl.accept_languages / intl.selected_languages.
+    char dictJson[1200];
+    char acceptJson[600];
+    size_t d = 0;
+    dictJson[d++] = '[';
+    const char* tok = langs;
+    BOOL first = TRUE;
+    while (*tok) {
+        const char* comma = strchr(tok, ',');
+        size_t tlen = comma ? (size_t)(comma - tok) : strlen(tok);
+        if (d + tlen + 4 >= sizeof(dictJson)) break;
+        if (!first) dictJson[d++] = ',';
+        dictJson[d++] = '"';
+        memcpy(dictJson + d, tok, tlen);
+        d += tlen;
+        dictJson[d++] = '"';
+        first = FALSE;
+        tok = comma ? comma + 1 : tok + tlen;
+    }
+    dictJson[d++] = ']';
+    dictJson[d] = '\0';
+    snprintf(acceptJson, sizeof(acceptJson), "\"%s\"", langs);
+
+    wchar_t prefsDir[MAX_PATH];
+    GetMainUserDataFolder(prefsDir);
+    PathAppendW(prefsDir, L"Default");
+    wchar_t prefsPath[MAX_PATH];
+    wcscpy_s(prefsPath, MAX_PATH, prefsDir);
+    PathAppendW(prefsPath, L"Preferences");
+
+    FILE* f = NULL;
+    if (_wfopen_s(&f, prefsPath, L"rb") != 0 || !f) {
+        // Profile doesn't exist yet (first run): seed a minimal Preferences
+        // file; Chromium fills in defaults for everything else.
+        SHCreateDirectoryExW(NULL, prefsDir, NULL);
+        FILE* nf = NULL;
+        if (_wfopen_s(&nf, prefsPath, L"wb") == 0 && nf) {
+            fprintf(nf,
+                "{\"intl\":{\"accept_languages\":%s,\"selected_languages\":%s},"
+                "\"spellcheck\":{\"dictionaries\":%s}}",
+                acceptJson, acceptJson, dictJson);
+            fclose(nf);
+            DebugPrint(L"[INFO] Seeded WebView2 Preferences with spell-check languages: %s\n",
+                       g_config.spellcheckLanguages);
+        }
+        return;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 32 * 1024 * 1024) {
+        fclose(f);
+        return;
+    }
+    char* buf = (char*)malloc((size_t)fsize + 1);
+    if (!buf) {
+        fclose(f);
+        return;
+    }
+    size_t got = fread(buf, 1, (size_t)fsize, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    struct {
+        const char* parent;
+        const char* child;
+        const char* value;
+    } patches[] = {
+        { "spellcheck", "dictionaries", dictJson },
+        { "intl", "accept_languages", acceptJson },
+        { "intl", "selected_languages", acceptJson },
+    };
+
+    char* cur = buf;
+    size_t curLen = got;
+    BOOL ok = TRUE;
+    for (int i = 0; i < 3; i++) {
+        size_t nextLen = 0;
+        char* next = json_set_nested(cur, curLen, patches[i].parent,
+                                     patches[i].child, patches[i].value, &nextLen);
+        if (!next) {
+            ok = FALSE;
+            break;
+        }
+        if (cur != buf) free(cur);
+        cur = next;
+        curLen = nextLen;
+    }
+
+    if (!ok) {
+        DebugPrint(L"[WARNING] Could not parse WebView2 Preferences; spell-check patch skipped\n");
+        if (cur != buf) free(cur);
+        free(buf);
+        return;
+    }
+
+    if (curLen == got && memcmp(cur, buf, got) == 0) {
+        DebugPrint(L"[INFO] Spell-check preferences already up to date\n");
+        free(cur);
+        free(buf);
+        return;
+    }
+
+    // Write to a temp file and swap it in so a crash can't corrupt the profile.
+    wchar_t tmpPath[MAX_PATH];
+    if (swprintf_s(tmpPath, MAX_PATH, L"%s.stl_tmp", prefsPath) > 0) {
+        FILE* wf = NULL;
+        if (_wfopen_s(&wf, tmpPath, L"wb") == 0 && wf) {
+            size_t written = fwrite(cur, 1, curLen, wf);
+            fclose(wf);
+            if (written == curLen &&
+                MoveFileExW(tmpPath, prefsPath, MOVEFILE_REPLACE_EXISTING)) {
+                DebugPrint(L"[INFO] Applied spell-check languages to WebView2 profile: %s\n",
+                           g_config.spellcheckLanguages);
+            } else {
+                DeleteFileW(tmpPath);
+                DebugPrint(L"[WARNING] Failed to update WebView2 Preferences file\n");
+            }
+        }
+    }
+    free(cur);
+    free(buf);
+}
+
+// --- WebView rebuild (applies new spell-check languages without an app
+// restart: Chromium only reads the prefs at browser-process startup) --------
+
+// Create the WebView2 environment for the main window. The controller and
+// WebView are then built by the completion handlers (EnvCompletedHandler et
+// al). Used both from WM_CREATE and when rebuilding after a language change.
+static void CreateMainWebViewEnvironment(HWND hwnd) {
+    wchar_t userDataPath[MAX_PATH];
+    GetMainUserDataFolder(userDataPath);
+    SHCreateDirectoryExW(NULL, userDataPath, NULL);
+
+    EnvCompletedHandler* envHandler = (EnvCompletedHandler*)calloc(1, sizeof(EnvCompletedHandler));
+    if (!envHandler) return;
+
+    static ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerVtbl envVtbl = {
+        EnvCompletedHandler_QueryInterface,
+        EnvCompletedHandler_AddRef,
+        EnvCompletedHandler_Release,
+        EnvCompletedHandler_Invoke
+    };
+    envHandler->lpVtbl = &envVtbl;
+    envHandler->refCount = 1;
+    envHandler->hwnd = hwnd;
+    envHandler->userDataPath = _wcsdup(userDataPath);
+
+    fnCreateEnvironment(NULL, userDataPath, NULL,
+        (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
+    envHandler->lpVtbl->Release((ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
+}
+
+typedef struct {
+    ICoreWebView2BrowserProcessExitedEventHandlerVtbl* lpVtbl;
+    LONG refCount;
+} BrowserExitedHandler;
+
+static HRESULT STDMETHODCALLTYPE BrowserExitedHandler_QueryInterface(
+    ICoreWebView2BrowserProcessExitedEventHandler* This,
+    REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2BrowserProcessExitedEventHandler)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE BrowserExitedHandler_AddRef(
+    ICoreWebView2BrowserProcessExitedEventHandler* This) {
+    return InterlockedIncrement(&((BrowserExitedHandler*)This)->refCount);
+}
+
+static ULONG STDMETHODCALLTYPE BrowserExitedHandler_Release(
+    ICoreWebView2BrowserProcessExitedEventHandler* This) {
+    ULONG refCount = InterlockedDecrement(&((BrowserExitedHandler*)This)->refCount);
+    if (refCount == 0) free(This);
+    return refCount;
+}
+
+static HRESULT STDMETHODCALLTYPE BrowserExitedHandler_Invoke(
+    ICoreWebView2BrowserProcessExitedEventHandler* This,
+    ICoreWebView2Environment* sender,
+    ICoreWebView2BrowserProcessExitedEventArgs* args) {
+    (void)This; (void)sender; (void)args;
+    DebugPrint(L"[INFO] WebView2 browser process exited\n");
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_WEBVIEW_RECREATE, 0, 0);
+    return S_OK;
+}
+
+// Tear down the main WebView so its browser process exits; the Preferences
+// patch and the rebuild happen in FinishMainWebViewRecreate once the
+// BrowserProcessExited event fires (the file is only flushed - and unlocked
+// for our purposes - when that process is gone). A fallback timer covers
+// runtimes where the event can't be observed.
+static void BeginMainWebViewRecreate(void) {
+    if (!g_hwnd) return;
+    if (InterlockedCompareExchange(&g_webViewRecreatePending, TRUE, TRUE) == TRUE) return;
+
+    if (!g_webViewController) {
+        // Nothing is running; the startup path will patch and create as usual.
+        PatchSpellcheckPreferences();
+        return;
+    }
+
+    InterlockedExchange(&g_webViewRecreatePending, TRUE);
+
+    g_browserExitedRegistered = FALSE;
+    if (g_webViewEnv) {
+        ICoreWebView2Environment5* env5 = NULL;
+        if (SUCCEEDED(g_webViewEnv->lpVtbl->QueryInterface(g_webViewEnv,
+                &IID_ICoreWebView2Environment5, (void**)&env5)) && env5) {
+            BrowserExitedHandler* handler =
+                (BrowserExitedHandler*)calloc(1, sizeof(BrowserExitedHandler));
+            if (handler) {
+                static ICoreWebView2BrowserProcessExitedEventHandlerVtbl exitVtbl = {
+                    BrowserExitedHandler_QueryInterface,
+                    BrowserExitedHandler_AddRef,
+                    BrowserExitedHandler_Release,
+                    BrowserExitedHandler_Invoke
+                };
+                handler->lpVtbl = &exitVtbl;
+                handler->refCount = 1;
+                if (SUCCEEDED(env5->lpVtbl->add_BrowserProcessExited(env5,
+                        (ICoreWebView2BrowserProcessExitedEventHandler*)handler,
+                        &g_browserExitedToken))) {
+                    g_browserExitedRegistered = TRUE;
+                }
+                handler->lpVtbl->Release((ICoreWebView2BrowserProcessExitedEventHandler*)handler);
+            }
+            env5->lpVtbl->Release(env5);
+        }
+    }
+
+    SetTimer(g_hwnd, ID_TIMER_WEBVIEW_RECREATE, WEBVIEW_RECREATE_FALLBACK_MS, NULL);
+
+    KillTimer(g_hwnd, ID_TIMER_INITIAL_HIDE_JS);
+    KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM);
+    KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PRELOAD);
+
+    InterlockedExchange(&g_isInitialized, FALSE);
+    InterlockedExchange(&g_initialPreloadComplete, FALSE);
+    InterlockedExchange(&g_webViewSuspendPending, FALSE);
+    InterlockedExchange(&g_webViewSuspended, FALSE);
+    InterlockedExchange(&g_webViewPrewarmActive, FALSE);
+    g_jsVisibility = JS_VISIBILITY_UNKNOWN;
+
+    if (g_webView) {
+        g_webView->lpVtbl->Release(g_webView);
+        g_webView = NULL;
+    }
+    if (g_webViewController) {
+        g_webViewController->lpVtbl->Close(g_webViewController);
+        g_webViewController->lpVtbl->Release(g_webViewController);
+        g_webViewController = NULL;
+    }
+    DebugPrint(L"[INFO] Main WebView closed; waiting for browser process exit\n");
+}
+
+static void FinishMainWebViewRecreate(HWND hwnd) {
+    if (InterlockedExchange(&g_webViewRecreatePending, FALSE) != TRUE) return;
+    KillTimer(hwnd, ID_TIMER_WEBVIEW_RECREATE);
+
+    if (g_webViewEnv) {
+        if (g_browserExitedRegistered) {
+            ICoreWebView2Environment5* env5 = NULL;
+            if (SUCCEEDED(g_webViewEnv->lpVtbl->QueryInterface(g_webViewEnv,
+                    &IID_ICoreWebView2Environment5, (void**)&env5)) && env5) {
+                env5->lpVtbl->remove_BrowserProcessExited(env5, g_browserExitedToken);
+                env5->lpVtbl->Release(env5);
+            }
+            g_browserExitedRegistered = FALSE;
+        }
+        g_webViewEnv->lpVtbl->Release(g_webViewEnv);
+        g_webViewEnv = NULL;
+    }
+
+    DebugPrint(L"[INFO] Rebuilding main WebView with updated spell-check languages\n");
+    PatchSpellcheckPreferences();
+    CreateMainWebViewEnvironment(hwnd);
 }
 
 // WebView2 Handler Implementations
@@ -1039,6 +1623,14 @@ HRESULT STDMETHODCALLTYPE EnvCompletedHandler_Invoke(
         wcscpy_s(g_webView2Version, 128, versionString);
         CoTaskMemFree(versionString);
     }
+
+    // Keep the environment for the BrowserProcessExited event used when
+    // rebuilding the WebView after a spell-check language change.
+    if (g_webViewEnv) {
+        g_webViewEnv->lpVtbl->Release(g_webViewEnv);
+    }
+    g_webViewEnv = environment;
+    environment->lpVtbl->AddRef(environment);
 
     EnvCompletedHandler* handler = (EnvCompletedHandler*)This;
     HWND hwnd = handler->hwnd;
@@ -1138,11 +1730,9 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
         // Settle the sleep state only once the initial navigation finishes so
         // we never suspend a half-loaded page (see OnMainNavigationCompleted).
         RegisterMainNavigationCompletedHandler(webview2);
+        RegisterMainNewWindowRequestedHandler(webview2);
 
         webview2->lpVtbl->Navigate(webview2, g_initialUrl);
-
-        // Set spell check languages to en-US and pl-PL
-        SetSpellCheckLanguages(webview2, L"en-US,pl-PL");
 
         InterlockedExchange(&g_isInitialized, TRUE);
         InterlockedExchange(&g_webViewDesiredVisible, TRUE);
@@ -1359,6 +1949,91 @@ static void RegisterMainNavigationCompletedHandler(ICoreWebView2* webview2) {
     }
 
     handler->lpVtbl->Release((ICoreWebView2NavigationCompletedEventHandler*)handler);
+}
+
+// New-window requests (target="_blank", window.open, "open in new tab"):
+// when the setting is enabled, suppress the default WebView2 popup and hand
+// the URL to the system default browser instead. Only http(s) URLs are passed
+// to the shell so a page cannot make the app launch other schemes. Requests
+// without a usable URL (e.g. about:blank popups that get scripted afterwards)
+// fall through to the default popup, where such flows still work.
+typedef struct {
+    ICoreWebView2NewWindowRequestedEventHandlerVtbl* lpVtbl;
+    LONG refCount;
+} NewWindowHandler;
+
+static HRESULT STDMETHODCALLTYPE NewWindowHandler_QueryInterface(
+    ICoreWebView2NewWindowRequestedEventHandler* This,
+    REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2NewWindowRequestedEventHandler)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE NewWindowHandler_AddRef(
+    ICoreWebView2NewWindowRequestedEventHandler* This) {
+    return InterlockedIncrement(&((NewWindowHandler*)This)->refCount);
+}
+
+static ULONG STDMETHODCALLTYPE NewWindowHandler_Release(
+    ICoreWebView2NewWindowRequestedEventHandler* This) {
+    ULONG refCount = InterlockedDecrement(&((NewWindowHandler*)This)->refCount);
+    if (refCount == 0) free(This);
+    return refCount;
+}
+
+static HRESULT STDMETHODCALLTYPE NewWindowHandler_Invoke(
+    ICoreWebView2NewWindowRequestedEventHandler* This,
+    ICoreWebView2* sender, ICoreWebView2NewWindowRequestedEventArgs* args) {
+    (void)This; (void)sender;
+
+    if (InterlockedCompareExchange(&g_openNewWindowsExternally, TRUE, TRUE) != TRUE) {
+        return S_OK;
+    }
+
+    LPWSTR uri = NULL;
+    if (FAILED(args->lpVtbl->get_Uri(args, &uri)) || !uri) {
+        return S_OK;
+    }
+
+    if (_wcsnicmp(uri, L"https://", 8) == 0 || _wcsnicmp(uri, L"http://", 7) == 0) {
+        args->lpVtbl->put_Handled(args, TRUE);
+        ShellExecuteW(NULL, L"open", uri, NULL, NULL, SW_SHOWNORMAL);
+        DebugPrint(L"[INFO] Opened new-window link in default browser: %s\n", uri);
+    }
+
+    CoTaskMemFree(uri);
+    return S_OK;
+}
+
+static void RegisterMainNewWindowRequestedHandler(ICoreWebView2* webview2) {
+    if (!webview2) return;
+
+    NewWindowHandler* handler = (NewWindowHandler*)calloc(1, sizeof(NewWindowHandler));
+    if (!handler) return;
+
+    static ICoreWebView2NewWindowRequestedEventHandlerVtbl newWindowVtbl = {
+        NewWindowHandler_QueryInterface,
+        NewWindowHandler_AddRef,
+        NewWindowHandler_Release,
+        NewWindowHandler_Invoke
+    };
+    handler->lpVtbl = &newWindowVtbl;
+    handler->refCount = 1;
+
+    EventRegistrationToken token;
+    HRESULT hr = webview2->lpVtbl->add_NewWindowRequested(
+        webview2, (ICoreWebView2NewWindowRequestedEventHandler*)handler, &token);
+    if (FAILED(hr)) {
+        DebugPrint(L"[WARNING] add_NewWindowRequested failed. HRESULT: 0x%08X\n", hr);
+    }
+
+    handler->lpVtbl->Release((ICoreWebView2NewWindowRequestedEventHandler*)handler);
 }
 
 // Helper to execute JavaScript in WebView2
@@ -1939,27 +2614,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     switch (uMsg) {
         case WM_CREATE:
             CaptureDisplaySettings();
-            
-            wchar_t userDataPath[MAX_PATH];
-            SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, userDataPath);
-            PathAppendW(userDataPath, APP_NAME L"\\WebView2Data");
-            CreateDirectoryW(userDataPath, NULL);
-            
-            EnvCompletedHandler* envHandler = (EnvCompletedHandler*)calloc(1, sizeof(EnvCompletedHandler));
-            static ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerVtbl envVtbl = {
-                EnvCompletedHandler_QueryInterface,
-                EnvCompletedHandler_AddRef,
-                EnvCompletedHandler_Release,
-                EnvCompletedHandler_Invoke
-            };
-            envHandler->lpVtbl = &envVtbl;
-            envHandler->refCount = 1;
-            envHandler->hwnd = hwnd;
-            envHandler->userDataPath = _wcsdup(userDataPath);
-            
-            fnCreateEnvironment(NULL, userDataPath, NULL,
-                (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
-            envHandler->lpVtbl->Release((ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
+            CreateMainWebViewEnvironment(hwnd);
             return 0;
             
         case WM_SIZE:
@@ -2008,6 +2663,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     InterlockedCompareExchange(&g_webViewPrewarmActive, TRUE, TRUE) != TRUE) {
                     DeactivateMainWebView();
                 }
+            } else if (wParam == ID_TIMER_WEBVIEW_RECREATE) {
+                // BrowserProcessExited never arrived; rebuild anyway.
+                DebugPrint(L"[WARNING] Browser exit event not received; rebuilding WebView after timeout\n");
+                FinishMainWebViewRecreate(hwnd);
             }
             return 0;
             
@@ -2028,6 +2687,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             PostQuitMessage(0);
             return 0;
             
+        case WM_APP_SPELLCHECK_CHANGED:
+            if (MessageBoxW(NULL,
+                    L"Spell-check languages were changed.\n\n"
+                    L"The embedded web view has to restart for them to take effect, "
+                    L"which reloads the page - unsaved work in the page will be lost.\n\n"
+                    L"Restart the web view now?\n"
+                    L"(Choosing No applies the change the next time the app starts.)",
+                    APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) == IDYES) {
+                BeginMainWebViewRecreate();
+            }
+            return 0;
+
+        case WM_APP_WEBVIEW_RECREATE:
+            FinishMainWebViewRecreate(hwnd);
+            return 0;
+
         case WM_TRAYICON:
             switch (lParam) {
                 case WM_MOUSEMOVE: PrewarmMainWebView(); break;
@@ -2141,8 +2816,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         // Fallback to INI file (for migration or first launch)
         LoadConfiguration(g_iniPath, &g_config);
     }
+    {
+        // Sanitize hand-edited registry/INI values so the JSON patch and
+        // Chromium both see well-formed language tags.
+        wchar_t rawLangs[512];
+        wcscpy_s(rawLangs, 512, g_config.spellcheckLanguages);
+        NormalizeSpellcheckLanguages(rawLangs, g_config.spellcheckLanguages, 512);
+    }
     wcscpy_s(g_initialUrl, 2048, g_config.url);
     InterlockedExchange(&g_sleepWhenInactive, g_config.sleepWhenInactive ? TRUE : FALSE);
+    InterlockedExchange(&g_openNewWindowsExternally, g_config.openNewWindowsExternally ? TRUE : FALSE);
 
     // On first launch, show configuration dialog
     if (isFirstLaunch) {
@@ -2165,6 +2848,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         wcscpy_s(g_initialUrl, 2048, g_config.url);
     }
+
+    // Apply spell-check languages to the WebView2 profile before the browser
+    // process launches (the Preferences file can only be edited while the
+    // profile is not in use). The config dialog above uses a separate user
+    // data folder, so it does not conflict with this.
+    PatchSpellcheckPreferences();
 
     // Register invisible owner window class (prevents taskbar appearance)
     WNDCLASSEXW ownerWc = {0};
@@ -2225,6 +2914,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Cleanup
     if (g_webView) g_webView->lpVtbl->Release(g_webView);
     if (g_webViewController) g_webViewController->lpVtbl->Release(g_webViewController);
+    if (g_webViewEnv) g_webViewEnv->lpVtbl->Release(g_webViewEnv);
     
     // Clean up tray icon and its resources
     if (g_nid.hIcon) {

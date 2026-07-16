@@ -18,6 +18,12 @@ export default function ConfigView({ config }: Props) {
   const [sleepWhenInactive, setSleepWhenInactive] = useState(
     config.sleepWhenInactive ?? false
   );
+  const [spellcheckLanguages, setSpellcheckLanguages] = useState(
+    config.spellcheckLanguages ?? ""
+  );
+  const [openNewWindowsExternally, setOpenNewWindowsExternally] = useState(
+    config.openNewWindowsExternally ?? false
+  );
   const [urlError, setUrlError] = useState("");
 
   function handleSave() {
@@ -33,6 +39,8 @@ export default function ConfigView({ config }: Props) {
       onHideJs,
       onShowJs,
       sleepWhenInactive,
+      spellcheckLanguages: spellcheckLanguages.trim(),
+      openNewWindowsExternally,
     });
   }
 
@@ -85,6 +93,41 @@ export default function ConfigView({ config }: Props) {
           value={onShowJs}
           onChange={(e) => setOnShowJs(e.target.value)}
         />
+      </div>
+
+      <div className="space-y-1">
+        <Label htmlFor="spellcheckLanguages">Spell-check languages</Label>
+        <Input
+          id="spellcheckLanguages"
+          placeholder="e.g. en-US,pl"
+          value={spellcheckLanguages}
+          onChange={(e) => setSpellcheckLanguages(e.target.value)}
+        />
+        <p className="text-neutral-500 text-[11px] leading-snug">
+          Comma-separated language tags for the built-in spell checker, e.g.{" "}
+          en-US,pl for English + Polish. Leave empty to keep the WebView2
+          default. Each language needs its Windows &quot;basic typing&quot;
+          feature installed. Changes apply after the web view restarts.
+        </p>
+      </div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="openNewWindowsExternally"
+          className="mt-0.5"
+          checked={openNewWindowsExternally}
+          onChange={(e) => setOpenNewWindowsExternally(e.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="openNewWindowsExternally" className="cursor-pointer">
+            Open new windows in the default browser
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Links that would open a new window or tab launch in your system
+            browser instead of a WebView2 popup. Popups that need to talk back
+            to the page (some login flows) may not work while this is on.
+          </p>
+        </div>
       </div>
 
       <div className="flex items-start gap-2 pt-1">
