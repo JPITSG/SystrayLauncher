@@ -1013,14 +1013,46 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             int chromeH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
             int newWindowH = physHeight + chromeH;
             int windowW = windowRect.right - windowRect.left;
-            UINT flags = SWP_NOMOVE | SWP_NOZORDER;
-            if (g_cfgWindowShown) {
-                flags |= SWP_NOACTIVATE;
+
+            // Keep the dialog inside the work area of its monitor. Sizing
+            // with SWP_NOMOVE kept the top edge where a 380px-tall window
+            // had been centered, so tall content grew past the bottom of
+            // the screen; clamp the size (the page scrolls when it cannot
+            // fit) and position the window explicitly.
+            MONITORINFO mi = { sizeof(mi) };
+            RECT work;
+            HMONITOR mon = MonitorFromWindow(g_cfgHwnd, MONITOR_DEFAULTTONEAREST);
+            if (!mon || !GetMonitorInfoW(mon, &mi)) {
+                SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
             } else {
+                work = mi.rcWork;
+            }
+            int workW = work.right - work.left;
+            int workH = work.bottom - work.top;
+            if (newWindowH > workH) newWindowH = workH;
+            if (windowW > workW) windowW = workW;
+
+            int posX = windowRect.left;
+            int posY = windowRect.top;
+            UINT flags = SWP_NOZORDER;
+            if (g_cfgWindowShown) {
+                // Later content growth (the page uses a ResizeObserver):
+                // don't yank a window the user may have moved, just pull it
+                // back inside the work area if it would overflow.
+                flags |= SWP_NOACTIVATE;
+                if (posY + newWindowH > work.bottom) posY = work.bottom - newWindowH;
+                if (posY < work.top) posY = work.top;
+                if (posX + windowW > work.right) posX = work.right - windowW;
+                if (posX < work.left) posX = work.left;
+            } else {
+                // First sizing before the window becomes visible: center it
+                // in the work area.
+                posX = work.left + (workW - windowW) / 2;
+                posY = work.top + (workH - newWindowH) / 2;
                 flags |= SWP_SHOWWINDOW;
                 KillTimer(g_cfgHwnd, ID_TIMER_CFG_SHOW_FALLBACK);
             }
-            SetWindowPos(g_cfgHwnd, NULL, 0, 0, windowW, newWindowH, flags);
+            SetWindowPos(g_cfgHwnd, NULL, posX, posY, windowW, newWindowH, flags);
             g_cfgWindowShown = TRUE;
             cfg_sync_controller_bounds();
         }
@@ -1130,12 +1162,17 @@ static void ShowConfigWebViewDialog(void) {
         classRegistered = TRUE;
     }
 
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    // Center the initial (hidden) window in the primary work area; the
+    // resize message from the page re-centers it at its real height before
+    // it is shown, and clamps it to the work area of whatever monitor it
+    // lands on.
+    RECT workArea;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
     int dpi = (int)GetWindowDpi(NULL);
     int width = MulDiv(480, dpi, 96), height = MulDiv(380, dpi, 96);
-    int posX = (screenW - width) / 2;
-    int posY = (screenH - height) / 2;
+    if (height > workArea.bottom - workArea.top) height = workArea.bottom - workArea.top;
+    int posX = workArea.left + ((workArea.right - workArea.left) - width) / 2;
+    int posY = workArea.top + ((workArea.bottom - workArea.top) - height) / 2;
 
     g_cfgHwnd = CreateWindowExW(0, L"SystrayLauncherCfgWnd", L"Configuration",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
