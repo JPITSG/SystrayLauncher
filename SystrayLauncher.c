@@ -1032,23 +1032,18 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             if (newWindowH > workH) newWindowH = workH;
             if (windowW > workW) windowW = workW;
 
-            int posX = windowRect.left;
-            int posY = windowRect.top;
+            // Always center on the measured height, clamped into the work
+            // area. The page reports its height through a ResizeObserver
+            // that fires more than once (a short first measurement, then the
+            // real height): re-centering every time keeps the dialog
+            // centered instead of anchoring its top edge and letting later
+            // growth push it to the bottom of the screen.
+            int posX = work.left + (workW - windowW) / 2;
+            int posY = work.top + (workH - newWindowH) / 2;
             UINT flags = SWP_NOZORDER;
             if (g_cfgWindowShown) {
-                // Later content growth (the page uses a ResizeObserver):
-                // don't yank a window the user may have moved, just pull it
-                // back inside the work area if it would overflow.
                 flags |= SWP_NOACTIVATE;
-                if (posY + newWindowH > work.bottom) posY = work.bottom - newWindowH;
-                if (posY < work.top) posY = work.top;
-                if (posX + windowW > work.right) posX = work.right - windowW;
-                if (posX < work.left) posX = work.left;
             } else {
-                // First sizing before the window becomes visible: center it
-                // in the work area.
-                posX = work.left + (workW - windowW) / 2;
-                posY = work.top + (workH - newWindowH) / 2;
                 flags |= SWP_SHOWWINDOW;
                 KillTimer(g_cfgHwnd, ID_TIMER_CFG_SHOW_FALLBACK);
             }
