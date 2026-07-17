@@ -3,6 +3,9 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
+#ifndef WINVER
+#define WINVER 0x0A00
+#endif
 
 #include <windows.h>
 #include <stdlib.h>
@@ -17,6 +20,11 @@
 
 #ifndef DWMWA_CLOAKED
 #define DWMWA_CLOAKED 14
+#endif
+
+// Not present in older MinGW headers.
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
 #endif
 
 // WebView2 headers required from SDK
@@ -693,6 +701,30 @@ static void json_escape_wstring(const wchar_t *in, wchar_t *out, size_t outLen) 
     out[j] = L'\0';
 }
 
+// The process is per-monitor DPI aware (see SystrayLauncher.manifest), so
+// window pixels are physical pixels and anything sized from CSS pixels has
+// to be scaled by the window's DPI. GetDpiForWindow is resolved dynamically
+// (Windows 10 1607+); the GDI metric is the fallback and, for an aware
+// process, also returns the real DPI.
+typedef UINT (WINAPI *PFN_GetDpiForWindow)(HWND);
+static UINT GetWindowDpi(HWND hwnd) {
+    static PFN_GetDpiForWindow fnGetDpiForWindow = NULL;
+    static BOOL resolved = FALSE;
+    if (!resolved) {
+        fnGetDpiForWindow = (PFN_GetDpiForWindow)GetProcAddress(
+            GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+        resolved = TRUE;
+    }
+    if (fnGetDpiForWindow && hwnd) {
+        UINT dpi = fnGetDpiForWindow(hwnd);
+        if (dpi) return dpi;
+    }
+    HDC hdc = GetDC(hwnd);
+    UINT dpi = (UINT)GetDeviceCaps(hdc, LOGPIXELSX);
+    ReleaseDC(hwnd, hdc);
+    return dpi ? dpi : 96;
+}
+
 // Config dialog WebView2 helpers
 static void webview_cfg_execute_script(const wchar_t* script) {
     if (!g_cfgWebView || !script) return;
@@ -972,11 +1004,14 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             }
         }
         if (contentHeight > 0 && g_cfgHwnd) {
+            // The page reports its height in CSS pixels; convert to the
+            // physical pixels window sizes use.
+            int physHeight = MulDiv(contentHeight, (int)GetWindowDpi(g_cfgHwnd), 96);
             RECT clientRect = {0}, windowRect = {0};
             GetClientRect(g_cfgHwnd, &clientRect);
             GetWindowRect(g_cfgHwnd, &windowRect);
             int chromeH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
-            int newWindowH = contentHeight + chromeH;
+            int newWindowH = physHeight + chromeH;
             int windowW = windowRect.right - windowRect.left;
             UINT flags = SWP_NOMOVE | SWP_NOZORDER;
             if (g_cfgWindowShown) {
@@ -1001,6 +1036,15 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_SIZE:
             cfg_sync_controller_bounds();
             return 0;
+
+        case WM_DPICHANGED: {
+            const RECT* suggested = (const RECT*)lParam;
+            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
 
         case WM_TIMER:
             if (wParam == ID_TIMER_CFG_SHOW_FALLBACK) {
@@ -1088,7 +1132,8 @@ static void ShowConfigWebViewDialog(void) {
 
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
-    int width = 480, height = 380;
+    int dpi = (int)GetWindowDpi(NULL);
+    int width = MulDiv(480, dpi, 96), height = MulDiv(380, dpi, 96);
     int posX = (screenW - width) / 2;
     int posY = (screenH - height) / 2;
 
@@ -2954,6 +2999,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             if (g_timerId) KillTimer(hwnd, g_timerId);
             g_timerId = SetTimer(hwnd, 1, RESOLUTION_CHANGE_DEBOUNCE_MS, NULL);
             return 0;
+
+        case WM_DPICHANGED: {
+            // Per-monitor DPI aware: adopt the size Windows suggests for the
+            // new monitor's scale; WM_SIZE re-syncs the WebView bounds.
+            const RECT* suggested = (const RECT*)lParam;
+            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
             
         case WM_TIMER:
             if (wParam == 1) {

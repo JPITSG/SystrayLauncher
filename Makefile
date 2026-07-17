@@ -37,7 +37,7 @@ main.o: $(SOURCES)
 	@echo "Compiling $(SOURCES)..."
 	$(CC) -c $< -o $@ $(CFLAGS)
 
-resource.o: $(RESOURCES) resource.h assets/icon.ico assets/dist/index.html assets/WebView2Loader.dll
+resource.o: $(RESOURCES) resource.h SystrayLauncher.manifest assets/icon.ico assets/dist/index.html assets/WebView2Loader.dll
 	@echo "Compiling resources..."
 	$(WINDRES) $< -o $@
 

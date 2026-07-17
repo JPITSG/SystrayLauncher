@@ -2,3 +2,4 @@
 IDI_TRAYICON     ICON   "assets/icon.ico"
 IDR_HTML_UI      RCDATA "assets/dist/index.html"
 IDR_WEBVIEW2_DLL RCDATA "assets/WebView2Loader.dll"
+1                24     "SystrayLauncher.manifest"
