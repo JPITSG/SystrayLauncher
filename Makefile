@@ -16,9 +16,9 @@ SDK_DIR = webview2_sdk
 SDK_URL = https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2
 SDK_INCLUDE = $(SDK_DIR)/build/native/include
 
-CFLAGS = -mwindows -isystem $(SDK_INCLUDE) -I.
+CFLAGS = -mwindows -O2 -isystem $(SDK_INCLUDE) -I.
 LDFLAGS = -mwindows
-LIBS = -lole32 -lshell32 -lshlwapi -luuid -luser32 -lgdi32 -lcomctl32 -ldwmapi
+LIBS = -lole32 -lshell32 -lshlwapi -luuid -luser32 -lgdi32 -ldwmapi
 
 .PHONY: all clean deps check-deps
 

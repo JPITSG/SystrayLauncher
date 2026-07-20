@@ -16,7 +16,6 @@
 #include <shlwapi.h>
 #include <dwmapi.h>
 #include <math.h>
-#include <assert.h>
 
 #ifndef DWMWA_CLOAKED
 #define DWMWA_CLOAKED 14
@@ -600,9 +599,17 @@ static void ApplyConfiguration(void) {
         Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     }
 
-    // Navigate to the new URL only if the main window is visible
-    if (g_webView && g_hwnd && IsWindowVisible(g_hwnd)) {
-        g_webView->lpVtbl->Navigate(g_webView, g_config.url);
+    // Navigate to the new URL right away when the window is visible. When it
+    // is hidden, flag the URL reset for the next show instead: the warm
+    // preload still holds the previous page, and the flag is otherwise only
+    // set by hide transitions - without it, the first Open after saving a new
+    // URL (before the window was ever shown) would present the stale page.
+    if (g_webView && g_hwnd) {
+        if (IsWindowVisible(g_hwnd)) {
+            g_webView->lpVtbl->Navigate(g_webView, g_config.url);
+        } else {
+            InterlockedExchange(&g_resetUrlOnNextShow, TRUE);
+        }
     }
 
     // Re-apply the correct active/sleep state for the (possibly changed)
@@ -785,12 +792,20 @@ static void webview_push_init_config(void) {
     json_escape_wstring(g_config.onShowJs, eShow, 8192);
     json_escape_wstring(g_config.spellcheckLanguages, eSpell, 1024);
 
-    wchar_t script[16384];
-    swprintf(script, 16384,
+    // Sized for every field at maximum, fully escaped, plus the JSON scaffold.
+    // A fixed 16K buffer used to silently truncate the script for large JS
+    // hooks, which broke onInit and left the dialog blank.
+    const size_t scriptCch = 4096 + 512 + 8192 + 8192 + 1024 + 256;
+    wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
+    if (!script) return;
+    int written = swprintf(script, scriptCch,
         L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"spellcheckLanguages\":\"%s\",\"openNewWindowsExternally\":%s}})",
         eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false", eSpell,
         g_config.openNewWindowsExternally ? L"true" : L"false");
-    webview_cfg_execute_script(script);
+    if (written > 0) {
+        webview_cfg_execute_script(script);
+    }
+    free(script);
 }
 
 // Minimal COM handler struct for config dialog (shared by all cfg handlers)
@@ -2651,6 +2666,16 @@ static void DeactivateMainWebView(void) {
 static void PrewarmMainWebView(void) {
     if (!g_hwnd) return;
     if (InterlockedCompareExchange(&g_sleepWhenInactive, TRUE, TRUE) != TRUE) return;
+
+    // Hovering delivers a continuous WM_MOUSEMOVE stream. While a prewarm is
+    // already active the page is warm; just re-arm the timeout instead of
+    // redoing the occlusion scan and cross-process resume/show calls for
+    // every mouse move.
+    if (InterlockedCompareExchange(&g_webViewPrewarmActive, TRUE, TRUE) == TRUE) {
+        SetTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM, WEBVIEW_PREWARM_MS, NULL);
+        return;
+    }
+
     if (!IsWebViewReady()) return;
     if (IsWindowActuallyVisible(g_hwnd)) return;
 
@@ -3007,7 +3032,7 @@ void ShowMainWindow(void) {
 }
 
 void HideMainWindow(void) {
-	if (!g_hwnd) return;
+    if (!g_hwnd) return;
 
     // Stop visibility polling when window is hidden
     StopVisibilityTimer(g_hwnd);
@@ -3187,6 +3212,10 @@ void ShowContextMenu(HWND hwnd) {
 
     SetForegroundWindow(hwnd);
     TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+    // Documented requirement for tray menus (KB135788): force a task switch
+    // after TrackPopupMenu, or the menu will not dismiss when the user
+    // clicks outside it.
+    PostMessageW(hwnd, WM_NULL, 0, 0);
     DestroyMenu(hMenu);
 }
 
@@ -3233,12 +3262,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 }
             } else if (wParam == ID_TIMER_INITIAL_HIDE_JS) {
                 KillTimer(hwnd, ID_TIMER_INITIAL_HIDE_JS);
-                // Start visibility polling after initial JS sync
-                StartVisibilityTimer(hwnd);
+                // Initial JS sync. Occlusion polling is only useful while the
+                // window is shown (ShowMainWindow starts it): a hidden window
+                // cannot become visible on its own, so polling it would burn
+                // EnumWindows/DWM/WebView calls 4x per second forever.
                 UpdateJsVisibilityState(hwnd);
+                if (IsWindowVisible(hwnd)) {
+                    StartVisibilityTimer(hwnd);
+                }
             } else if (wParam == ID_TIMER_VISIBILITY_CHECK) {
                 // Periodic check for window occlusion
                 UpdateJsVisibilityState(hwnd);
+                // Once the window is withdrawn only ShowMainWindow can bring
+                // it back, and that restarts the timer; stop polling until then.
+                if (!IsWindowVisible(hwnd)) {
+                    StopVisibilityTimer(hwnd);
+                }
             } else if (wParam == ID_TIMER_WEBVIEW_PREWARM) {
                 KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
                 InterlockedExchange(&g_webViewPrewarmActive, FALSE);
@@ -3393,7 +3432,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             
         default:
             if (uMsg == g_WM_TASKBARCREATED) {
-                CreateTrayIcon(hwnd);
+                // Explorer restarted: re-add the icon. RefreshTrayIcon also
+                // destroys the old HICON, which a bare CreateTrayIcon leaks.
+                RefreshTrayIcon();
                 return 0;
             }
     }
@@ -3563,9 +3604,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         DispatchMessage(&msg);
     }
     
-    // Cleanup
+    // Cleanup. Close() the controller (as the rebuild paths do) so the
+    // browser process shuts down and flushes its profile promptly instead of
+    // waiting to notice the host process disappear.
     if (g_webView) g_webView->lpVtbl->Release(g_webView);
-    if (g_webViewController) g_webViewController->lpVtbl->Release(g_webViewController);
+    if (g_webViewController) {
+        g_webViewController->lpVtbl->Close(g_webViewController);
+        g_webViewController->lpVtbl->Release(g_webViewController);
+    }
     if (g_webViewEnv) {
         UnregisterBrowserExitedFromCurrentEnv();
         g_webViewEnv->lpVtbl->Release(g_webViewEnv);
