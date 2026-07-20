@@ -43,6 +43,7 @@
 #define ID_TRAY_MENU_OPEN 3
 #define ID_TRAY_MENU_CONFIGURE 5
 #define ID_TRAY_MENU_EXIT 4
+#define ID_TRAY_MENU_RESTART 6
 
 // Registry settings
 #define REG_COMPANY L"JPIT"
@@ -71,7 +72,14 @@
 #define WEBVIEW_RECREATE_FALLBACK_MS 10000
 #define ID_TIMER_POWER_RESUME 8
 #define POWER_RESUME_KICK_DELAY_MS 2000
-#define POWER_RESUME_SETTLE_MS 5000
+#define ID_TIMER_WEBVIEW_LIVENESS 9
+// Each composition kick after a power resume is verified with a script ping;
+// if the runtime does not answer within this window the kick is retried (the
+// graphics stack can lag badly after hibernate), and after
+// POWER_RESUME_MAX_KICKS failed attempts the WebView is rebuilt instead.
+#define POWER_RESUME_LIVENESS_MS 3000
+#define POWER_RESUME_KICK_RETRY_MS 4000
+#define POWER_RESUME_MAX_KICKS 3
 
 // After a suspend-resume failure the resume is retried on every activation
 // tick (4x/s); if it keeps failing this long the runtime is torn down and
@@ -143,6 +151,12 @@ static volatile LONG g_initialPreloadComplete = FALSE;
 static volatile LONG g_webViewRecreatePending = FALSE;
 static volatile LONG g_webViewCreatePending = FALSE;
 static volatile LONG g_resumeFailureCount = 0;
+// Post-power-resume recovery: set when the machine goes down or comes back up
+// and cleared once the WebView has answered a liveness ping (or been rebuilt).
+// While set, the page is kept warm so we never snapshot an unverified page.
+static volatile LONG g_powerResumePending = FALSE;
+static volatile LONG g_webViewPingOutstanding = FALSE;
+static int g_powerKickCount = 0;
 static ULONGLONG g_rebuildBurstStartTick = 0;
 static LONG g_rebuildBurstCount = 0;
 static EventRegistrationToken g_browserExitedToken;
@@ -189,6 +203,9 @@ static void FinishMainWebViewRecreate(HWND hwnd);
 static void HandleUnexpectedBrowserExit(HWND hwnd);
 static void RebuildMainWebViewIfDead(void);
 static void KickWebViewAfterPowerResume(HWND hwnd);
+static void SendMainWebViewLivenessPing(void);
+static void CheckMainWebViewLiveness(HWND hwnd);
+static void RestartApplication(void);
 static void RegisterBrowserExitedOnCurrentEnv(void);
 static void UnregisterBrowserExitedFromCurrentEnv(void);
 static void RegisterMainProcessFailedHandler(ICoreWebView2* webview2);
@@ -288,6 +305,11 @@ typedef struct {
     ICoreWebView2ExecuteScriptCompletedHandlerVtbl* lpVtbl;
     LONG refCount;
 } ExecuteScriptCompletedHandler;
+
+typedef struct {
+    ICoreWebView2ExecuteScriptCompletedHandlerVtbl* lpVtbl;
+    LONG refCount;
+} LivenessPingHandler;
 
 // WebView suspend completion handler
 HRESULT STDMETHODCALLTYPE TrySuspendCompletedHandler_QueryInterface(
@@ -1725,12 +1747,17 @@ static void BeginMainWebViewRecreate(void) {
     KillTimer(g_hwnd, ID_TIMER_INITIAL_HIDE_JS);
     KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM);
     KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PRELOAD);
+    KillTimer(g_hwnd, ID_TIMER_POWER_RESUME);
+    KillTimer(g_hwnd, ID_TIMER_WEBVIEW_LIVENESS);
 
     InterlockedExchange(&g_isInitialized, FALSE);
     InterlockedExchange(&g_initialPreloadComplete, FALSE);
     InterlockedExchange(&g_webViewSuspendPending, FALSE);
     InterlockedExchange(&g_webViewSuspended, FALSE);
     InterlockedExchange(&g_webViewPrewarmActive, FALSE);
+    InterlockedExchange(&g_powerResumePending, FALSE);
+    InterlockedExchange(&g_webViewPingOutstanding, FALSE);
+    g_powerKickCount = 0;
     g_jsVisibility = JS_VISIBILITY_UNKNOWN;
 
     if (g_webView) {
@@ -1772,6 +1799,8 @@ static void HandleUnexpectedBrowserExit(HWND hwnd) {
     KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
     KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
     KillTimer(hwnd, ID_TIMER_WEBVIEW_RECREATE);
+    KillTimer(hwnd, ID_TIMER_POWER_RESUME);
+    KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
 
     InterlockedExchange(&g_isInitialized, FALSE);
     InterlockedExchange(&g_initialPreloadComplete, FALSE);
@@ -1779,6 +1808,9 @@ static void HandleUnexpectedBrowserExit(HWND hwnd) {
     InterlockedExchange(&g_webViewSuspended, FALSE);
     InterlockedExchange(&g_webViewPrewarmActive, FALSE);
     InterlockedExchange(&g_resumeFailureCount, 0);
+    InterlockedExchange(&g_powerResumePending, FALSE);
+    InterlockedExchange(&g_webViewPingOutstanding, FALSE);
+    g_powerKickCount = 0;
     g_jsVisibility = JS_VISIBILITY_UNKNOWN;
 
     if (g_webView) {
@@ -2138,6 +2170,44 @@ HRESULT STDMETHODCALLTYPE TrySuspendCompletedHandler_Invoke(
         SetMainWebViewControllerVisible(desiredVisible);
     }
 
+    return S_OK;
+}
+
+// Liveness ping handler: any answer at all (even an error code) proves the
+// runtime is still talking to us. No answer within POWER_RESUME_LIVENESS_MS
+// means it is wedged; CheckMainWebViewLiveness handles that case.
+HRESULT STDMETHODCALLTYPE LivenessPingHandler_QueryInterface(
+    ICoreWebView2ExecuteScriptCompletedHandler* This,
+    REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2ExecuteScriptCompletedHandler)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE LivenessPingHandler_AddRef(
+    ICoreWebView2ExecuteScriptCompletedHandler* This) {
+    return InterlockedIncrement(&((LivenessPingHandler*)This)->refCount);
+}
+
+ULONG STDMETHODCALLTYPE LivenessPingHandler_Release(
+    ICoreWebView2ExecuteScriptCompletedHandler* This) {
+    ULONG refCount = InterlockedDecrement(&((LivenessPingHandler*)This)->refCount);
+    if (refCount == 0) {
+        free(This);
+    }
+    return refCount;
+}
+
+HRESULT STDMETHODCALLTYPE LivenessPingHandler_Invoke(
+    ICoreWebView2ExecuteScriptCompletedHandler* This,
+    HRESULT errorCode, LPCWSTR resultObjectAsJson) {
+    (void)This; (void)errorCode; (void)resultObjectAsJson;
+    InterlockedExchange(&g_webViewPingOutstanding, FALSE);
     return S_OK;
 }
 
@@ -2551,15 +2621,20 @@ static void ActivateMainWebView(void) {
 // is ready to display instantly. The host window is hidden either way, so
 // nothing is shown to the user.
 static void DeactivateMainWebView(void) {
-    InterlockedExchange(&g_webViewPrewarmActive, FALSE);
-    if (g_hwnd) {
-        KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM);
-    }
-
     BOOL sleepEnabled = InterlockedCompareExchange(&g_sleepWhenInactive, TRUE, TRUE) == TRUE;
     BOOL preloaded = InterlockedCompareExchange(&g_initialPreloadComplete, TRUE, TRUE) == TRUE;
+    BOOL recovery = InterlockedCompareExchange(&g_powerResumePending, TRUE, TRUE) == TRUE;
+    BOOL prewarming = InterlockedCompareExchange(&g_webViewPrewarmActive, TRUE, TRUE) == TRUE;
 
-    if (sleepEnabled && preloaded) {
+    // Never put the page to sleep while post-resume recovery is unverified
+    // (a possibly-broken page must not be frozen into a suspend snapshot) or
+    // while a tray-hover prewarm is keeping it warm. The steady-state hidden
+    // ticks used to cancel both within 250 ms.
+    if (sleepEnabled && preloaded && !recovery && !prewarming) {
+        InterlockedExchange(&g_webViewPrewarmActive, FALSE);
+        if (g_hwnd) {
+            KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM);
+        }
         InterlockedExchange(&g_webViewDesiredVisible, FALSE);
         SetMainWebViewControllerVisible(FALSE);
         SuspendMainWebViewRuntime();
@@ -2588,27 +2663,98 @@ static void PrewarmMainWebView(void) {
     DebugPrint(L"[INFO] WebView2 prewarmed (warm render) from tray hover for %d ms\n", WEBVIEW_PREWARM_MS);
 }
 
-// After the machine resumes from sleep/hibernate the GPU-side composition
-// surfaces backing the WebView can be gone; a page that was suspended (or
-// merely hidden) across the power transition then presents as a permanently
-// white container. Force the runtime to rebuild its visuals: wake the page,
-// re-assert the bounds, drop and re-add the visual tree, and let the normal
-// visibility logic settle the sleep state again a few seconds later.
-static void KickWebViewAfterPowerResume(HWND hwnd) {
-    if (!IsWebViewReady() || !g_webViewController) return;
+// Ask the runtime to run a trivial script; the completion handler clearing
+// g_webViewPingOutstanding is the "pong". A synchronous call failure is
+// treated as no answer (the flag stays set) so the liveness check escalates.
+static void SendMainWebViewLivenessPing(void) {
+    if (!IsWebViewReady()) return;
+    if (InterlockedCompareExchange(&g_webViewPingOutstanding, TRUE, TRUE) == TRUE) return;
 
-    DebugPrint(L"[INFO] System resumed; refreshing WebView2 composition\n");
-    InterlockedExchange(&g_webViewPrewarmActive, TRUE);
-    InterlockedExchange(&g_webViewDesiredVisible, TRUE);
+    LivenessPingHandler* handler =
+        (LivenessPingHandler*)calloc(1, sizeof(LivenessPingHandler));
+    if (!handler) return;
+
+    static ICoreWebView2ExecuteScriptCompletedHandlerVtbl pingVtbl = {
+        LivenessPingHandler_QueryInterface,
+        LivenessPingHandler_AddRef,
+        LivenessPingHandler_Release,
+        LivenessPingHandler_Invoke
+    };
+    handler->lpVtbl = &pingVtbl;
+    handler->refCount = 1;
+
+    InterlockedExchange(&g_webViewPingOutstanding, TRUE);
+    HRESULT hr = g_webView->lpVtbl->ExecuteScript(g_webView, L"1",
+        (ICoreWebView2ExecuteScriptCompletedHandler*)handler);
+    if (FAILED(hr)) {
+        DebugPrint(L"[WARNING] Liveness ping could not be sent. HRESULT: 0x%08X\n", hr);
+    }
+
+    handler->lpVtbl->Release((ICoreWebView2ExecuteScriptCompletedHandler*)handler);
+}
+
+// After the machine resumes from sleep/hibernate the GPU-side composition
+// surfaces backing the WebView can be gone and the runtime may stop answering
+// altogether; a page in that state presents as a permanently white container.
+// The graphics stack can take many seconds to come back after hibernate, so
+// this runs as a short sequence rather than a single attempt: wake the page,
+// re-assert the bounds, drop and re-add the visual tree, then verify with a
+// script ping. CheckMainWebViewLiveness re-arms the kick on silence, or
+// rebuilds the WebView when the runtime keeps ignoring us. Until recovery
+// completes, DeactivateMainWebView keeps the page warm so a possibly-broken
+// page is never frozen into a suspend snapshot.
+static void KickWebViewAfterPowerResume(HWND hwnd) {
+    if (!IsWebViewReady() || !g_webViewController) {
+        // Nothing to kick; force the liveness check down the rebuild path.
+        InterlockedExchange(&g_webViewPingOutstanding, TRUE);
+        SetTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS, POWER_RESUME_LIVENESS_MS, NULL);
+        return;
+    }
+
+    DebugPrint(L"[INFO] System resumed; refreshing WebView2 composition (attempt %d)\n",
+               g_powerKickCount);
     ResumeMainWebViewRuntime();
     SyncMainWebViewBounds();
     g_webViewController->lpVtbl->put_IsVisible(g_webViewController, FALSE);
     g_webViewController->lpVtbl->put_IsVisible(g_webViewController, TRUE);
     g_webViewController->lpVtbl->NotifyParentWindowPositionChanged(g_webViewController);
 
-    // Reuse the prewarm settle path: when this fires the WebView is
-    // activated or put back to sleep according to the actual visibility.
-    SetTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM, POWER_RESUME_SETTLE_MS, NULL);
+    SendMainWebViewLivenessPing();
+    SetTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS, POWER_RESUME_LIVENESS_MS, NULL);
+}
+
+// Runs POWER_RESUME_LIVENESS_MS after each kick. A cleared ping flag means
+// the runtime answered: recovery is done and the normal visibility/sleep
+// state can settle. Silence means the runtime is wedged: retry the kick a
+// few times, then tear the WebView down and rebuild it.
+static void CheckMainWebViewLiveness(HWND hwnd) {
+    if (InterlockedCompareExchange(&g_powerResumePending, TRUE, TRUE) != TRUE) return;
+
+    if (InterlockedCompareExchange(&g_webViewPingOutstanding, TRUE, TRUE) != TRUE) {
+        InterlockedExchange(&g_powerResumePending, FALSE);
+        g_powerKickCount = 0;
+        DebugPrint(L"[INFO] WebView2 responsive after power resume\n");
+        if (IsWindowActuallyVisible(hwnd)) {
+            ActivateMainWebView();
+        } else {
+            DeactivateMainWebView();
+        }
+        return;
+    }
+
+    // Allow the next kick to ping again (a late pong is harmless).
+    InterlockedExchange(&g_webViewPingOutstanding, FALSE);
+
+    if (IsWebViewReady() && g_powerKickCount < POWER_RESUME_MAX_KICKS) {
+        DebugPrint(L"[WARNING] WebView2 not answering after power resume; retrying\n");
+        SetTimer(hwnd, ID_TIMER_POWER_RESUME, POWER_RESUME_KICK_RETRY_MS, NULL);
+        return;
+    }
+
+    DebugPrint(L"[WARNING] WebView2 unresponsive after power resume; forcing rebuild\n");
+    InterlockedExchange(&g_powerResumePending, FALSE);
+    g_powerKickCount = 0;
+    PostMessageW(hwnd, WM_APP_WEBVIEW_RECREATE, 0, 0);
 }
 
 // Called when a navigation completes. The first completion marks the initial
@@ -2689,7 +2835,12 @@ static BOOL IsWindowActuallyVisible(HWND hwnd) {
 
     RECT ourRect;
     if (!GetWindowRect(hwnd, &ourRect)) return FALSE;
-    if (!MonitorFromRect(&ourRect, MONITOR_DEFAULTTONULL)) return FALSE;
+    if (!MonitorFromRect(&ourRect, MONITOR_DEFAULTTONULL)) {
+        // Monitors are still being re-enumerated (common right after resume
+        // from hibernate, or during docking changes). Assume visible rather
+        // than suspending a WebView the user may be looking at.
+        return TRUE;
+    }
 
     // Create a region representing our window
     HRGN visibleRgn = CreateRectRgnIndirect(&ourRect);
@@ -2986,6 +3137,34 @@ void ClearWebViewCacheAndReload(void) {
     profile2->lpVtbl->Release(profile2);
 }
 
+// Restart the executable: launch a fresh instance and shut this one down.
+// The new instance retries the single-instance mutex (see WinMain) until this
+// process has released it during exit.
+static void RestartApplication(void) {
+    wchar_t exePath[MAX_PATH];
+    if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0) {
+        return;
+    }
+
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {0};
+    if (!CreateProcessW(exePath, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        MessageBoxW(NULL, L"Failed to restart the application.", APP_NAME,
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    // Same shutdown path as tray Exit.
+    if (g_nid.hIcon) {
+        DestroyIcon(g_nid.hIcon);
+        g_nid.hIcon = NULL;
+    }
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    PostQuitMessage(0);
+}
+
 void ShowContextMenu(HWND hwnd) {
     POINT pt;
     GetCursorPos(&pt);
@@ -2999,6 +3178,7 @@ void ShowContextMenu(HWND hwnd) {
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_REFRESH, L"Refresh");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_CLEAR_CACHE, L"Refresh + Clear Cache");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_RESTART, L"Restart");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_OPEN, L"Open");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_CONFIGURE, L"Configure");
@@ -3081,14 +3261,38 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 FinishMainWebViewRecreate(hwnd);
             } else if (wParam == ID_TIMER_POWER_RESUME) {
                 KillTimer(hwnd, ID_TIMER_POWER_RESUME);
+                g_powerKickCount++;
                 KickWebViewAfterPowerResume(hwnd);
+            } else if (wParam == ID_TIMER_WEBVIEW_LIVENESS) {
+                KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
+                CheckMainWebViewLiveness(hwnd);
             }
             return 0;
 
         case WM_POWERBROADCAST:
-            if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
-                // Give the graphics stack a moment to come back up, then
-                // repair the WebView composition (see KickWebViewAfterPowerResume).
+            if (wParam == PBT_APMSUSPEND) {
+                // Going down: from here on, nothing we believe about the
+                // runtime's suspend/resume state can be trusted. The recovery
+                // sequence starts when a resume broadcast arrives.
+                InterlockedExchange(&g_powerResumePending, TRUE);
+                return TRUE;
+            }
+            if (wParam == PBT_APMQUERYSUSPENDFAILED) {
+                // The suspend was vetoed; there is nothing to recover from.
+                InterlockedExchange(&g_powerResumePending, FALSE);
+                return TRUE;
+            }
+            if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND ||
+                wParam == PBT_APMRESUMECRITICAL) {
+                // (Re)start the recovery sequence. Several resume broadcasts
+                // can arrive for a single resume; restarting is idempotent.
+                // Give the graphics stack a moment to come back up before the
+                // first kick (see KickWebViewAfterPowerResume).
+                KillTimer(hwnd, ID_TIMER_POWER_RESUME);
+                KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
+                InterlockedExchange(&g_webViewPingOutstanding, FALSE);
+                InterlockedExchange(&g_powerResumePending, TRUE);
+                g_powerKickCount = 0;
                 SetTimer(hwnd, ID_TIMER_POWER_RESUME, POWER_RESUME_KICK_DELAY_MS, NULL);
             }
             return TRUE;
@@ -3108,6 +3312,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
             KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
             KillTimer(hwnd, ID_TIMER_POWER_RESUME);
+            KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
             PostQuitMessage(0);
             return 0;
             
@@ -3167,6 +3372,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 case ID_TRAY_MENU_OPEN:
                     ShowMainWindow();
                     return 0;
+                case ID_TRAY_MENU_RESTART:
+                    RestartApplication();
+                    return 0;
                 case ID_TRAY_MENU_CONFIGURE:
                     g_cfgSaved = FALSE;
                     ShowConfigWebViewDialog();
@@ -3208,9 +3416,20 @@ void DebugPrint(const wchar_t* format, ...) {
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     g_hInstance = hInstance;
     
-    // Single instance check
+    // Single instance check. A restarted instance (tray Restart) can arrive
+    // while the previous process is still shutting down, so retry briefly
+    // before declaring another instance is running.
     g_hMutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    for (int attempt = 0;
+         g_hMutex && GetLastError() == ERROR_ALREADY_EXISTS && attempt < 10;
+         attempt++) {
+        CloseHandle(g_hMutex);
+        Sleep(250);
+        g_hMutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
+    }
+    if (g_hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(g_hMutex);
+        g_hMutex = NULL;
         MessageBoxW(NULL, L"SystrayLauncher is already running.\n\nCheck your system tray for the application icon.",
                     L"Already Running", MB_OK | MB_ICONINFORMATION);
         return 0;
