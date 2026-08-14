@@ -21,6 +21,7 @@ export default function ConfigView({ config }: Props) {
   const [openNewWindowsExternally, setOpenNewWindowsExternally] = useState(
     config.openNewWindowsExternally ?? false
   );
+  const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
   const [urlError, setUrlError] = useState("");
 
   function handleSave() {
@@ -37,6 +38,7 @@ export default function ConfigView({ config }: Props) {
       onShowJs,
       sleepWhenInactive,
       openNewWindowsExternally,
+      debugLog,
     });
   }
 
@@ -124,6 +126,26 @@ export default function ConfigView({ config }: Props) {
           <p className="text-neutral-500 text-[11px] leading-snug">
             Suspends the page to save CPU while the window is hidden. The page is
             still preloaded at startup and wakes when you hover the tray icon.
+          </p>
+        </div>
+      </div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="debugLog"
+          className="mt-0.5"
+          checked={debugLog}
+          onChange={(e) => setDebugLog(e.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="debugLog" className="cursor-pointer">
+            Enable debug logging
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Writes diagnostic events (recovery attempts, web view rebuilds,
+            power transitions) to{" "}
+            %LOCALAPPDATA%\SystrayLauncher\debug.log. Useful when reporting
+            issues; leave off for normal use.
           </p>
         </div>
       </div>

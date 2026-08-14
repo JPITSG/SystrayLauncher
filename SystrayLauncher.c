@@ -54,6 +54,7 @@
 #define REG_VALUE_ONSHOWJS L"OnShowJS"
 #define REG_VALUE_SLEEP L"SleepWhenInactive"
 #define REG_VALUE_NEWWINDOW L"OpenNewWindowsExternally"
+#define REG_VALUE_DEBUGLOG L"DebugLog"
 #define REG_VALUE_CONFIGURED L"Configured"
 
 #define ID_TIMER_INITIAL_HIDE_JS 2
@@ -72,6 +73,14 @@
 // is reset to the configured URL in the background - still hidden - so the
 // next open starts fresh without a visible navigation.
 #define URL_RESET_AFTER_HIDE_MS 60000
+// On-open health verification (see ArmMainHealthCheck): every 100 ms the
+// page is asked for a frame heartbeat while the window stays up; a verdict
+// falls after 1 s. The lifetime cap only bounds the wait for an in-flight
+// rebuild to come up.
+#define ID_TIMER_HEALTH_CHECK 10
+#define HEALTH_CHECK_INTERVAL_MS 100
+#define HEALTH_CHECK_VERDICT_TICKS 10
+#define HEALTH_CHECK_LIFETIME_TICKS 600
 #define ID_TIMER_POWER_RESUME 8
 #define POWER_RESUME_KICK_DELAY_MS 2000
 #define ID_TIMER_WEBVIEW_LIVENESS 9
@@ -110,6 +119,7 @@ typedef struct {
     wchar_t onShowJs[4096];
     BOOL sleepWhenInactive;
     BOOL openNewWindowsExternally;
+    BOOL debugLogEnabled;
 } Configuration;
 
 typedef enum {
@@ -144,6 +154,7 @@ static volatile LONG g_webViewSuspended = FALSE;
 static volatile LONG g_resetUrlOnNextShow = FALSE;
 static volatile LONG g_sleepWhenInactive = FALSE;
 static volatile LONG g_openNewWindowsExternally = FALSE;
+static volatile LONG g_debugLogEnabled = FALSE;
 static volatile LONG g_initialPreloadComplete = FALSE;
 static volatile LONG g_webViewCreatePending = FALSE;
 static volatile LONG g_resumeFailureCount = 0;
@@ -153,6 +164,18 @@ static volatile LONG g_resumeFailureCount = 0;
 static volatile LONG g_powerResumePending = FALSE;
 static volatile LONG g_webViewPingOutstanding = FALSE;
 static int g_powerKickCount = 0;
+// On-open health verification. g_presentationUnverified is set on every
+// power transition and cleared only once a SHOWN window passes the on-screen
+// check: the hidden-time recovery above can prove the runtime answers
+// scripts, but never that pixels actually reach the screen - after hibernate
+// the two can differ (the "white container"). g_framePongSeen is flipped by
+// the requestAnimationFrame heartbeat the page posts back while the check
+// runs (see ArmMainHealthCheck).
+static volatile LONG g_presentationUnverified = FALSE;
+static volatile LONG g_framePongSeen = FALSE;
+static int g_healthTicks = 0;       // probing ticks with a live WebView
+static int g_healthTotalTicks = 0;  // lifetime of this poll (safety cap)
+static BOOL g_healthHealed = FALSE; // one rebuild per open
 static ULONGLONG g_rebuildBurstStartTick = 0;
 static LONG g_rebuildBurstCount = 0;
 static EventRegistrationToken g_browserExitedToken;
@@ -216,9 +239,12 @@ static void SetMainWebViewControllerVisible(BOOL visible);
 static void PrewarmMainWebView(void);
 static void ResetTargetPageIfNeeded(void);
 static void ResetTargetPageInBackground(void);
+static void ArmMainHealthCheck(void);
+static void KickMainWebViewComposition(void);
 static void OnMainNavigationCompleted(void);
 static void RegisterMainNavigationCompletedHandler(ICoreWebView2* webview2);
 static void RegisterMainNewWindowRequestedHandler(ICoreWebView2* webview2);
+static void RegisterMainWebMessageHandler(ICoreWebView2* webview2);
 static void GetTargetWindowRect(int* x, int* y, int* w, int* h);
 
 // Registry and config dialog functions
@@ -346,6 +372,7 @@ void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     config->onShowJs[0] = L'\0';
     config->sleepWhenInactive = FALSE;
     config->openNewWindowsExternally = FALSE;
+    config->debugLogEnabled = FALSE;
 
     if (!PathFileExistsW(iniPath)) {
         CreateDefaultIni(iniPath);
@@ -415,6 +442,9 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
     } else if (wcscmp(key, L"opennewwindowsexternally") == 0) {
         wchar_t c = towlower(value[0]);
         config->openNewWindowsExternally = (c == L'1' || c == L't' || c == L'y');
+    } else if (wcscmp(key, L"debuglog") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->debugLogEnabled = (c == L'1' || c == L't' || c == L'y');
     }
 }
 
@@ -484,6 +514,15 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         config->openNewWindowsExternally = FALSE;
     }
 
+    // Load DebugLog (default disabled)
+    DWORD dbgVal = 0;
+    dataSize = sizeof(dbgVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_DEBUGLOG, NULL, &dataType, (LPBYTE)&dbgVal, &dataSize) == ERROR_SUCCESS) {
+        config->debugLogEnabled = (dbgVal != 0);
+    } else {
+        config->debugLogEnabled = FALSE;
+    }
+
     RegCloseKey(hKey);
     return TRUE;
 }
@@ -522,6 +561,11 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     DWORD newWinVal = config->openNewWindowsExternally ? 1 : 0;
     RegSetValueExW(hKey, REG_VALUE_NEWWINDOW, 0, REG_DWORD,
                    (const BYTE*)&newWinVal, sizeof(newWinVal));
+
+    // Save DebugLog
+    DWORD dbgVal = config->debugLogEnabled ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_DEBUGLOG, 0, REG_DWORD,
+                   (const BYTE*)&dbgVal, sizeof(dbgVal));
 
     // Drop the value left behind by versions that had the (never functional)
     // spell-check option.
@@ -568,6 +612,9 @@ static void ApplyConfiguration(void) {
     // Sync the new-window handling setting (read live by the handler, so a
     // toggle applies without restarting the WebView)
     InterlockedExchange(&g_openNewWindowsExternally, g_config.openNewWindowsExternally ? TRUE : FALSE);
+
+    // Sync debug logging (read live by DebugPrint)
+    InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
 
     // Update window title
     if (g_hwnd) {
@@ -778,9 +825,10 @@ static void webview_push_init_config(void) {
     wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
     if (!script) return;
     int written = swprintf(script, scriptCch,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s}})",
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"debugLog\":%s}})",
         eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false",
-        g_config.openNewWindowsExternally ? L"true" : L"false");
+        g_config.openNewWindowsExternally ? L"true" : L"false",
+        g_config.debugLogEnabled ? L"true" : L"false");
     if (written > 0) {
         webview_cfg_execute_script(script);
     }
@@ -981,6 +1029,7 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         MultiByteToWideChar(CP_UTF8, 0, showJs, -1, g_config.onShowJs, 4096);
         g_config.sleepWhenInactive = json_get_bool(msg, "sleepWhenInactive", FALSE);
         g_config.openNewWindowsExternally = json_get_bool(msg, "openNewWindowsExternally", FALSE);
+        g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
 
         SaveConfigToRegistry(&g_config);
         MarkAsConfigured();
@@ -1567,6 +1616,7 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
         RegisterMainNavigationCompletedHandler(webview2);
         RegisterMainNewWindowRequestedHandler(webview2);
         RegisterMainProcessFailedHandler(webview2);
+        RegisterMainWebMessageHandler(webview2);
 
         webview2->lpVtbl->Navigate(webview2, g_initialUrl);
 
@@ -1577,6 +1627,13 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
 
         if (initiallyVisible && InterlockedExchange(&g_resetUrlOnNextShow, FALSE) == TRUE) {
             ResetTargetPageIfNeeded();
+        }
+
+        if (initiallyVisible) {
+            // A (re)built container under a visible window gets verified like
+            // any open. Re-arming resets the counters but not the one-heal-
+            // per-open budget, so a rebuild that stays broken cannot loop.
+            ArmMainHealthCheck();
         }
 
         // Schedule initial JS sync after WebView is ready.
@@ -2009,6 +2066,79 @@ static void RegisterMainProcessFailedHandler(ICoreWebView2* webview2) {
     handler->lpVtbl->Release((ICoreWebView2ProcessFailedEventHandler*)handler);
 }
 
+// Web messages from the main page: the only one the app understands is the
+// frame-heartbeat pong posted by the health probe (see SendMainFrameProbe);
+// anything else a page happens to post is ignored.
+typedef struct {
+    ICoreWebView2WebMessageReceivedEventHandlerVtbl* lpVtbl;
+    LONG refCount;
+} MainMsgHandler;
+
+static HRESULT STDMETHODCALLTYPE MainMsgHandler_QueryInterface(
+    ICoreWebView2WebMessageReceivedEventHandler* This,
+    REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2WebMessageReceivedEventHandler)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE MainMsgHandler_AddRef(
+    ICoreWebView2WebMessageReceivedEventHandler* This) {
+    return InterlockedIncrement(&((MainMsgHandler*)This)->refCount);
+}
+
+static ULONG STDMETHODCALLTYPE MainMsgHandler_Release(
+    ICoreWebView2WebMessageReceivedEventHandler* This) {
+    ULONG refCount = InterlockedDecrement(&((MainMsgHandler*)This)->refCount);
+    if (refCount == 0) free(This);
+    return refCount;
+}
+
+static HRESULT STDMETHODCALLTYPE MainMsgHandler_Invoke(
+    ICoreWebView2WebMessageReceivedEventHandler* This,
+    ICoreWebView2* sender, ICoreWebView2WebMessageReceivedEventArgs* args) {
+    (void)This; (void)sender;
+
+    LPWSTR msg = NULL;
+    if (SUCCEEDED(args->lpVtbl->TryGetWebMessageAsString(args, &msg)) && msg) {
+        if (wcscmp(msg, L"SystrayLauncher.framePong") == 0) {
+            InterlockedExchange(&g_framePongSeen, TRUE);
+        }
+        CoTaskMemFree(msg);
+    }
+    return S_OK;
+}
+
+static void RegisterMainWebMessageHandler(ICoreWebView2* webview2) {
+    if (!webview2) return;
+
+    MainMsgHandler* handler = (MainMsgHandler*)calloc(1, sizeof(MainMsgHandler));
+    if (!handler) return;
+
+    static ICoreWebView2WebMessageReceivedEventHandlerVtbl msgVtbl = {
+        MainMsgHandler_QueryInterface,
+        MainMsgHandler_AddRef,
+        MainMsgHandler_Release,
+        MainMsgHandler_Invoke
+    };
+    handler->lpVtbl = &msgVtbl;
+    handler->refCount = 1;
+
+    EventRegistrationToken token;
+    HRESULT hr = webview2->lpVtbl->add_WebMessageReceived(
+        webview2, (ICoreWebView2WebMessageReceivedEventHandler*)handler, &token);
+    if (FAILED(hr)) {
+        DebugPrint(L"[WARNING] add_WebMessageReceived failed. HRESULT: 0x%08X\n", hr);
+    }
+
+    handler->lpVtbl->Release((ICoreWebView2WebMessageReceivedEventHandler*)handler);
+}
+
 // Helper to execute JavaScript in WebView2
 void ExecuteJavaScript(const wchar_t* js) {
     if (!g_webView || !js || js[0] == L'\0') return;
@@ -2253,6 +2383,29 @@ static void SendMainWebViewLivenessPing(void) {
     handler->lpVtbl->Release((ICoreWebView2ExecuteScriptCompletedHandler*)handler);
 }
 
+// Rebuild the WebView's presentation without touching the page: re-assert
+// the bounds (with a one-pixel jiggle that forces the compositor to
+// reallocate its surfaces), drop and re-add the visual tree, and refresh the
+// parent-position bookkeeping. This is the cheap repair for composition
+// surfaces lost across sleep/hibernate.
+static void KickMainWebViewComposition(void) {
+    if (!g_webViewController || !g_hwnd) return;
+
+    ResumeMainWebViewRuntime();
+
+    RECT bounds;
+    GetClientRect(g_hwnd, &bounds);
+    if (bounds.bottom - bounds.top > 1) {
+        RECT shrunk = bounds;
+        shrunk.bottom -= 1;
+        g_webViewController->lpVtbl->put_Bounds(g_webViewController, shrunk);
+    }
+    g_webViewController->lpVtbl->put_Bounds(g_webViewController, bounds);
+    g_webViewController->lpVtbl->put_IsVisible(g_webViewController, FALSE);
+    g_webViewController->lpVtbl->put_IsVisible(g_webViewController, TRUE);
+    g_webViewController->lpVtbl->NotifyParentWindowPositionChanged(g_webViewController);
+}
+
 // After the machine resumes from sleep/hibernate the GPU-side composition
 // surfaces backing the WebView can be gone and the runtime may stop answering
 // altogether; a page in that state presents as a permanently white container.
@@ -2273,11 +2426,7 @@ static void KickWebViewAfterPowerResume(HWND hwnd) {
 
     DebugPrint(L"[INFO] System resumed; refreshing WebView2 composition (attempt %d)\n",
                g_powerKickCount);
-    ResumeMainWebViewRuntime();
-    SyncMainWebViewBounds();
-    g_webViewController->lpVtbl->put_IsVisible(g_webViewController, FALSE);
-    g_webViewController->lpVtbl->put_IsVisible(g_webViewController, TRUE);
-    g_webViewController->lpVtbl->NotifyParentWindowPositionChanged(g_webViewController);
+    KickMainWebViewComposition();
 
     SendMainWebViewLivenessPing();
     SetTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS, POWER_RESUME_LIVENESS_MS, NULL);
@@ -2532,6 +2681,78 @@ static void ResetTargetPageInBackground(void) {
     }
 }
 
+// --- On-open health verification ------------------------------------------
+//
+// The hidden-time power-resume recovery above can only prove the runtime
+// answers scripts; whether pixels actually reach the screen is unknowable
+// until the window is shown. So every show runs this check: for up to a
+// second (100 ms ticks, each first confirming the window is still up) the
+// page is asked for a frame heartbeat, and a container that cannot produce
+// one is torn down and rebuilt. Page CONTENT is deliberately irrelevant -
+// a 404 or a blank document heartbeats just as well as the real page.
+
+// Ask the page's compositor for proof of life. requestAnimationFrame only
+// fires when the renderer is producing frames for a visible page, so the
+// pong (posted back as a web message, see MainMsgHandler_Invoke) covers the
+// whole path from script execution to frame production.
+static void SendMainFrameProbe(void) {
+    ExecuteJavaScript(
+        L"requestAnimationFrame(function(){"
+        L"try{window.chrome.webview.postMessage('SystrayLauncher.framePong');}catch(e){}"
+        L"});");
+}
+
+// Begin (or restart) the health poll. Called on every show, and again when a
+// rebuilt WebView comes up under a visible window; the caller manages
+// g_healthHealed so a rebuild that stays broken cannot loop.
+static void ArmMainHealthCheck(void) {
+    if (!g_hwnd) return;
+    g_healthTicks = 0;
+    g_healthTotalTicks = 0;
+    InterlockedExchange(&g_framePongSeen, FALSE);
+    SetTimer(g_hwnd, ID_TIMER_HEALTH_CHECK, HEALTH_CHECK_INTERVAL_MS, NULL);
+}
+
+// Detached-surface detector: after hibernate the renderer can keep producing
+// frames (so the heartbeat passes) into a composition surface that is no
+// longer attached to the window - the screen just shows a uniform white
+// rectangle. Sample a 4x4 interior grid of the client area straight from the
+// screen; a fully uniform color is treated as "not actually presenting".
+// Only called while this window is foreground, and only until one on-screen
+// verification after a power transition has passed, so a legitimately
+// uniform page can trigger at most one needless rebuild per resume.
+static BOOL IsClientAreaUniformColor(HWND hwnd) {
+    RECT rc;
+    if (!GetClientRect(hwnd, &rc)) return FALSE;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w < 32 || h < 32) return FALSE;
+
+    POINT origin = {0, 0};
+    ClientToScreen(hwnd, &origin);
+
+    HDC screen = GetDC(NULL);
+    if (!screen) return FALSE;
+
+    COLORREF first = CLR_INVALID;
+    BOOL uniform = TRUE;
+    for (int iy = 0; iy < 4 && uniform; iy++) {
+        for (int ix = 0; ix < 4; ix++) {
+            int x = origin.x + w * (2 * ix + 1) / 8;
+            int y = origin.y + h * (2 * iy + 1) / 8;
+            COLORREF c = GetPixel(screen, x, y);
+            if (c == CLR_INVALID) { uniform = FALSE; break; }
+            if (first == CLR_INVALID) {
+                first = c;
+            } else if (c != first) {
+                uniform = FALSE;
+                break;
+            }
+        }
+    }
+    ReleaseDC(NULL, screen);
+    return uniform;
+}
+
 // Compute the centered, 90%-of-work-area rectangle used for the main window.
 static void GetTargetWindowRect(int* x, int* y, int* w, int* h) {
     RECT workArea;
@@ -2569,6 +2790,13 @@ void ShowMainWindow(void) {
 
     ActivateMainWebView();
 
+    // A power transition happened since the container was last verified on
+    // screen: refresh the composition up front so a surface lost across
+    // sleep/hibernate never gets a chance to present as a white window.
+    if (InterlockedCompareExchange(&g_presentationUnverified, TRUE, TRUE) == TRUE) {
+        KickMainWebViewComposition();
+    }
+
     if (InterlockedExchange(&g_resetUrlOnNextShow, FALSE) == TRUE) {
         if (IsWebViewReady()) {
             ResetTargetPageIfNeeded();
@@ -2576,6 +2804,10 @@ void ShowMainWindow(void) {
             InterlockedExchange(&g_resetUrlOnNextShow, TRUE);
         }
     }
+
+    // Verify the container actually renders now that it is on screen.
+    g_healthHealed = FALSE;
+    ArmMainHealthCheck();
 
     // Start polling for visibility changes while window is shown
     StartVisibilityTimer(g_hwnd);
@@ -2589,6 +2821,7 @@ void HideMainWindow(void) {
 
     // Stop visibility polling when window is hidden
     StopVisibilityTimer(g_hwnd);
+    KillTimer(g_hwnd, ID_TIMER_HEALTH_CHECK);
 
     ShowWindow(g_hwnd, SW_HIDE);
     UpdateJsVisibilityState(g_hwnd);
@@ -2859,6 +3092,71 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 if (!IsWindowVisible(hwnd)) {
                     ResetTargetPageInBackground();
                 }
+            } else if (wParam == ID_TIMER_HEALTH_CHECK) {
+                // On-open health verification. Each tick first confirms the
+                // window is still up - closed/minimized/fully-covered windows
+                // end the check (a covered page legitimately stops producing
+                // frames, so there is nothing to measure).
+                if (!IsWindowVisible(hwnd) || IsIconic(hwnd) ||
+                    !IsWindowActuallyVisible(hwnd) ||
+                    ++g_healthTotalTicks > HEALTH_CHECK_LIFETIME_TICKS) {
+                    KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
+                } else if (!IsWebViewReady() || !g_webViewController) {
+                    // A rebuild is in flight; absence is not ill health. The
+                    // measurement restarts once the new WebView is up.
+                    g_healthTicks = 0;
+                    InterlockedExchange(&g_framePongSeen, FALSE);
+                } else {
+                    SendMainFrameProbe();
+                    g_healthTicks++;
+                    BOOL framesFlowing =
+                        InterlockedCompareExchange(&g_framePongSeen, TRUE, TRUE) == TRUE;
+                    BOOL unverified =
+                        InterlockedCompareExchange(&g_presentationUnverified, TRUE, TRUE) == TRUE;
+                    if (framesFlowing && !unverified) {
+                        // Frames are flowing and no power transition is in
+                        // question - verified, nothing further to prove.
+                        KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
+                    } else if (g_healthTicks >= HEALTH_CHECK_VERDICT_TICKS) {
+                        BOOL healthy = framesFlowing;
+                        if (healthy && unverified) {
+                            // Heartbeat passed, but this is the first look
+                            // since a power transition: also check that the
+                            // frames reach the screen. Only meaningful while
+                            // frontmost; otherwise accept the heartbeat and
+                            // keep the flag for the next open.
+                            if (GetForegroundWindow() == hwnd) {
+                                if (IsClientAreaUniformColor(hwnd)) {
+                                    healthy = FALSE;
+                                    DebugPrint(L"[WARNING] Container heartbeat OK but screen uniform after power resume\n");
+                                } else {
+                                    InterlockedExchange(&g_presentationUnverified, FALSE);
+                                }
+                            }
+                        }
+                        if (healthy) {
+                            KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
+                            DebugPrint(L"[INFO] Container verified healthy after open\n");
+                        } else if (!g_healthHealed) {
+                            // One heal per open: a full rebuild, the only
+                            // repair that covers every failure mode seen
+                            // after hibernate. The user just opened the
+                            // window, so bypass the burst limiter like any
+                            // manual tray action.
+                            g_healthHealed = TRUE;
+                            DebugPrint(L"[WARNING] Container unhealthy %d ms after open; rebuilding\n",
+                                       g_healthTicks * HEALTH_CHECK_INTERVAL_MS);
+                            g_rebuildBurstStartTick = 0;
+                            g_rebuildBurstCount = 0;
+                            HandleUnexpectedBrowserExit(hwnd);
+                            g_healthTicks = 0;
+                            InterlockedExchange(&g_framePongSeen, FALSE);
+                        } else {
+                            KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
+                            DebugPrint(L"[WARNING] Container still unhealthy after rebuild; waiting for next open\n");
+                        }
+                    }
+                }
             } else if (wParam == ID_TIMER_POWER_RESUME) {
                 KillTimer(hwnd, ID_TIMER_POWER_RESUME);
                 g_powerKickCount++;
@@ -2873,8 +3171,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             if (wParam == PBT_APMSUSPEND) {
                 // Going down: from here on, nothing we believe about the
                 // runtime's suspend/resume state can be trusted. The recovery
-                // sequence starts when a resume broadcast arrives.
+                // sequence starts when a resume broadcast arrives, and the
+                // presentation stays unverified until a SHOWN window passes
+                // the on-open health check.
                 InterlockedExchange(&g_powerResumePending, TRUE);
+                InterlockedExchange(&g_presentationUnverified, TRUE);
                 return TRUE;
             }
             if (wParam == PBT_APMQUERYSUSPENDFAILED) {
@@ -2892,6 +3193,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
                 InterlockedExchange(&g_webViewPingOutstanding, FALSE);
                 InterlockedExchange(&g_powerResumePending, TRUE);
+                InterlockedExchange(&g_presentationUnverified, TRUE);
                 g_powerKickCount = 0;
                 SetTimer(hwnd, ID_TIMER_POWER_RESUME, POWER_RESUME_KICK_DELAY_MS, NULL);
             }
@@ -2912,6 +3214,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
             KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
             KillTimer(hwnd, ID_TIMER_URL_RESET);
+            KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
             KillTimer(hwnd, ID_TIMER_POWER_RESUME);
             KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
             PostQuitMessage(0);
@@ -2985,16 +3288,76 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     return DefWindowProcW(hwnd, uMsg, wParam, lParam);
 }
 
-// Debug output (no-op in release builds)
+// Diagnostic output. Debug builds always emit to the debugger. Release
+// builds are silent unless the user enables the debug log in the config
+// dialog, which appends timestamped lines to
+// %LOCALAPPDATA%\SystrayLauncher\debug.log so field incidents (blank
+// containers, rebuild storms) can be diagnosed after the fact.
+static void GetDebugLogPath(wchar_t path[MAX_PATH]) {
+    path[0] = L'\0';
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, path))) {
+        path[0] = L'\0';
+        return;
+    }
+    PathAppendW(path, APP_NAME);
+    PathAppendW(path, L"debug.log");
+}
+
+static void AppendDebugLogLine(const wchar_t* line) {
+    wchar_t path[MAX_PATH];
+    GetDebugLogPath(path);
+    if (!path[0]) return;
+
+    wchar_t dir[MAX_PATH];
+    wcscpy_s(dir, MAX_PATH, path);
+    PathRemoveFileSpecW(dir);
+    SHCreateDirectoryExW(NULL, dir, NULL);
+
+    // Cap growth: once per process, if the log has passed ~1 MB shift it to
+    // debug.old.log (keeping one previous generation) before appending.
+    static BOOL rotationChecked = FALSE;
+    if (!rotationChecked) {
+        rotationChecked = TRUE;
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad) &&
+            fad.nFileSizeHigh == 0 && fad.nFileSizeLow > 1024 * 1024) {
+            wchar_t oldPath[MAX_PATH];
+            wcscpy_s(oldPath, MAX_PATH, dir);
+            PathAppendW(oldPath, L"debug.old.log");
+            MoveFileExW(path, oldPath, MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+
+    FILE* f = NULL;
+    if (_wfopen_s(&f, path, L"a, ccs=UTF-8") != 0 || !f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fwprintf(f, L"[%04u-%02u-%02u %02u:%02u:%02u.%03u] %s",
+             st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
+    size_t len = wcslen(line);
+    if (len == 0 || line[len - 1] != L'\n') {
+        fputwc(L'\n', f);
+    }
+    fclose(f);
+}
+
 void DebugPrint(const wchar_t* format, ...) {
-#ifdef _DEBUG
+    BOOL logEnabled = InterlockedCompareExchange(&g_debugLogEnabled, TRUE, TRUE) == TRUE;
+#ifndef _DEBUG
+    if (!logEnabled) return;
+#endif
     va_list args;
     va_start(args, format);
     wchar_t buffer[4096];
     vswprintf_s(buffer, sizeof(buffer)/sizeof(wchar_t), format, args);
-    OutputDebugStringW(buffer);
     va_end(args);
+#ifdef _DEBUG
+    OutputDebugStringW(buffer);
 #endif
+    if (logEnabled) {
+        AppendDebugLogLine(buffer);
+    }
 }
 
 // Entry point
@@ -3056,6 +3419,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcscpy_s(g_initialUrl, 2048, g_config.url);
     InterlockedExchange(&g_sleepWhenInactive, g_config.sleepWhenInactive ? TRUE : FALSE);
     InterlockedExchange(&g_openNewWindowsExternally, g_config.openNewWindowsExternally ? TRUE : FALSE);
+    InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
+    DebugPrint(L"[INFO] SystrayLauncher starting\n");
 
     // On first launch, show configuration dialog
     if (isFirstLaunch) {

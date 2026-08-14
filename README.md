@@ -11,6 +11,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 - **External Link Handling** - Optionally open new windows/tabs (`target="_blank"`, `window.open`) in the system default browser instead of a WebView2 popup
 - **Preloaded on Startup** - The page is loaded into the WebView at launch so it is ready the moment you open the window
 - **Hide Grace Period** - Re-opening within 60 seconds of hiding returns exactly where you left off; after that the page resets to the configured URL in the background, so the next open starts fresh with no visible reload
+- **Self-Healing Container** - Every time the window opens, the app verifies the embedded browser is actually rendering (frame heartbeat, plus a screen check after resume from sleep/hibernate) and automatically rebuilds it if it is not — no more permanently blank windows after hibernation
 - **Optional CPU Saving** - Opt-in "sleep when inactive" suspends the web container while hidden to save CPU on laptops, and pre-emptively wakes it when you hover the tray icon
 - **Registry Storage** - Settings persist in Windows Registry (`HKCU\SOFTWARE\JPIT\SystrayLauncher`)
 - **Single Instance** - Only one instance can run at a time
@@ -39,6 +40,7 @@ Settings available in the Configure dialog:
 | JavaScript on Show | JS executed when window becomes visible |
 | Open new windows in the default browser | When enabled, links that would open a new window or tab launch in the system default browser instead of a WebView2 popup. Only `http(s)` links are handed to the browser. Popups that must script back to the opening page (some login flows) may not work while enabled. Disabled by default. |
 | Sleep web container when inactive | When enabled, suspends the WebView to save CPU while the window is hidden, and pre-emptively wakes it on tray-icon hover. The page is always preloaded at startup regardless of this setting. Disabled by default. |
+| Enable debug logging | Appends timestamped diagnostic events (recovery attempts, web view rebuilds, power transitions) to `%LOCALAPPDATA%\SystrayLauncher\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
 
 ## Icon Customization
 

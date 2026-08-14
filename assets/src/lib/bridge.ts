@@ -5,6 +5,7 @@ export interface ConfigData {
   onShowJs: string;
   sleepWhenInactive: boolean;
   openNewWindowsExternally: boolean;
+  debugLog: boolean;
 }
 
 export interface InitData {
@@ -38,6 +39,7 @@ export function saveSettings(config: ConfigData) {
       onShowJs: config.onShowJs,
       sleepWhenInactive: config.sleepWhenInactive,
       openNewWindowsExternally: config.openNewWindowsExternally,
+      debugLog: config.debugLog,
     })
   );
 }
