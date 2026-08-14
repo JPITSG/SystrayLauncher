@@ -4,7 +4,6 @@ export interface ConfigData {
   onHideJs: string;
   onShowJs: string;
   sleepWhenInactive: boolean;
-  spellcheckLanguages: string;
   openNewWindowsExternally: boolean;
 }
 
@@ -38,7 +37,6 @@ export function saveSettings(config: ConfigData) {
       onHideJs: config.onHideJs,
       onShowJs: config.onShowJs,
       sleepWhenInactive: config.sleepWhenInactive,
-      spellcheckLanguages: config.spellcheckLanguages,
       openNewWindowsExternally: config.openNewWindowsExternally,
     })
   );
