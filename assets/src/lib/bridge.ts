@@ -5,6 +5,10 @@ export interface ConfigData {
   onShowJs: string;
   sleepWhenInactive: boolean;
   openNewWindowsExternally: boolean;
+  allowRunningInsecureContent: boolean;
+  insecureContentOrigins: string;
+  lockdownHeader: boolean;
+  lockdownSecret: string;
   debugLog: boolean;
 }
 
@@ -39,6 +43,10 @@ export function saveSettings(config: ConfigData) {
       onShowJs: config.onShowJs,
       sleepWhenInactive: config.sleepWhenInactive,
       openNewWindowsExternally: config.openNewWindowsExternally,
+      allowRunningInsecureContent: config.allowRunningInsecureContent,
+      insecureContentOrigins: config.insecureContentOrigins,
+      lockdownHeader: config.lockdownHeader,
+      lockdownSecret: config.lockdownSecret,
       debugLog: config.debugLog,
     })
   );

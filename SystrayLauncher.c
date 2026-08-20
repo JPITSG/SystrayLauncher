@@ -15,6 +15,7 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <dwmapi.h>
+#include <bcrypt.h>
 #include <math.h>
 
 #ifndef DWMWA_CLOAKED
@@ -29,6 +30,11 @@
 // WebView2 headers required from SDK
 #include "WebView2.h"
 #include "resource.h"
+
+// The C++ helper in the bundled 1.0.3650.58 SDK initializes the required
+// target-version property to CORE_WEBVIEW_TARGET_PRODUCT_VERSION. Keep its
+// value as the fallback for this project's plain-C options object.
+#define WEBVIEW2_TARGET_COMPATIBLE_BROWSER_VERSION L"143.0.3650.58"
 
 #define WINDOW_SIZE_PERCENTAGE 0.9
 #define RESOLUTION_CHANGE_DEBOUNCE_MS 1000
@@ -54,6 +60,10 @@
 #define REG_VALUE_ONSHOWJS L"OnShowJS"
 #define REG_VALUE_SLEEP L"SleepWhenInactive"
 #define REG_VALUE_NEWWINDOW L"OpenNewWindowsExternally"
+#define REG_VALUE_INSECURE_CONTENT L"AllowRunningInsecureContent"
+#define REG_VALUE_INSECURE_CONTENT_ORIGINS L"InsecureContentOrigins"
+#define REG_VALUE_LOCKDOWN L"LockdownHeader"
+#define REG_VALUE_LOCKDOWN_SECRET L"LockdownSecret"
 #define REG_VALUE_DEBUGLOG L"DebugLog"
 #define REG_VALUE_CONFIGURED L"Configured"
 
@@ -119,6 +129,10 @@ typedef struct {
     wchar_t onShowJs[4096];
     BOOL sleepWhenInactive;
     BOOL openNewWindowsExternally;
+    BOOL allowRunningInsecureContent;
+    wchar_t insecureContentOrigins[2048];
+    BOOL lockdownHeader;
+    wchar_t lockdownSecret[256];
     BOOL debugLogEnabled;
 } Configuration;
 
@@ -154,6 +168,10 @@ static volatile LONG g_webViewSuspended = FALSE;
 static volatile LONG g_resetUrlOnNextShow = FALSE;
 static volatile LONG g_sleepWhenInactive = FALSE;
 static volatile LONG g_openNewWindowsExternally = FALSE;
+static volatile LONG g_lockdownHeader = FALSE;
+// Whether the match-everything WebResourceRequested filter is registered on
+// the current main WebView. Per-instance state: reset on every rebuild.
+static BOOL g_lockdownFilterActive = FALSE;
 static volatile LONG g_debugLogEnabled = FALSE;
 static volatile LONG g_initialPreloadComplete = FALSE;
 static volatile LONG g_webViewCreatePending = FALSE;
@@ -196,9 +214,12 @@ static int g_cfgShowFallbackTries = 0;
 // Dynamic WebView2 loading
 static WCHAR g_extractedDllPath[MAX_PATH] = {0};
 typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
-    LPCWSTR, LPCWSTR, void*,
+    LPCWSTR, LPCWSTR, ICoreWebView2EnvironmentOptions*,
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
+typedef HRESULT (STDAPICALLTYPE *PFN_GetAvailableCoreWebView2BrowserVersionString)(
+    LPCWSTR, LPWSTR*);
 static PFN_CreateCoreWebView2EnvironmentWithOptions fnCreateEnvironment = NULL;
+static PFN_GetAvailableCoreWebView2BrowserVersionString fnGetAvailableBrowserVersion = NULL;
 
 // Forward declarations
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
@@ -245,6 +266,8 @@ static void OnMainNavigationCompleted(void);
 static void RegisterMainNavigationCompletedHandler(ICoreWebView2* webview2);
 static void RegisterMainNewWindowRequestedHandler(ICoreWebView2* webview2);
 static void RegisterMainWebMessageHandler(ICoreWebView2* webview2);
+static void RegisterMainWebResourceRequestedHandler(ICoreWebView2* webview2);
+static void ApplyLockdownRequestFilter(void);
 static void GetTargetWindowRect(int* x, int* y, int* w, int* h);
 
 // Registry and config dialog functions
@@ -372,6 +395,10 @@ void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     config->onShowJs[0] = L'\0';
     config->sleepWhenInactive = FALSE;
     config->openNewWindowsExternally = FALSE;
+    config->allowRunningInsecureContent = FALSE;
+    config->insecureContentOrigins[0] = L'\0';
+    config->lockdownHeader = FALSE;
+    config->lockdownSecret[0] = L'\0';
     config->debugLogEnabled = FALSE;
 
     if (!PathFileExistsW(iniPath)) {
@@ -442,6 +469,16 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
     } else if (wcscmp(key, L"opennewwindowsexternally") == 0) {
         wchar_t c = towlower(value[0]);
         config->openNewWindowsExternally = (c == L'1' || c == L't' || c == L'y');
+    } else if (wcscmp(key, L"allowrunninginsecurecontent") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->allowRunningInsecureContent = (c == L'1' || c == L't' || c == L'y');
+    } else if (wcscmp(key, L"insecurecontentorigins") == 0) {
+        wcscpy_s(config->insecureContentOrigins, 2048, value);
+    } else if (wcscmp(key, L"lockdownheader") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->lockdownHeader = (c == L'1' || c == L't' || c == L'y');
+    } else if (wcscmp(key, L"lockdownsecret") == 0) {
+        wcscpy_s(config->lockdownSecret, 256, value);
     } else if (wcscmp(key, L"debuglog") == 0) {
         wchar_t c = towlower(value[0]);
         config->debugLogEnabled = (c == L'1' || c == L't' || c == L'y');
@@ -514,6 +551,48 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         config->openNewWindowsExternally = FALSE;
     }
 
+    // Load AllowRunningInsecureContent (default disabled)
+    DWORD insecureContentVal = 0;
+    dataSize = sizeof(insecureContentVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_INSECURE_CONTENT, NULL, &dataType,
+                         (LPBYTE)&insecureContentVal, &dataSize) == ERROR_SUCCESS) {
+        config->allowRunningInsecureContent = (insecureContentVal != 0);
+    } else {
+        config->allowRunningInsecureContent = FALSE;
+    }
+
+    // Load the exact HTTP origins that WebView2 may treat as trustworthy.
+    config->insecureContentOrigins[0] = L'\0';
+    dataSize = sizeof(config->insecureContentOrigins);
+    if (RegQueryValueExW(hKey, REG_VALUE_INSECURE_CONTENT_ORIGINS, NULL, &dataType,
+                         (LPBYTE)config->insecureContentOrigins, &dataSize) != ERROR_SUCCESS ||
+        dataType != REG_SZ || dataSize < sizeof(wchar_t)) {
+        config->insecureContentOrigins[0] = L'\0';
+    } else {
+        config->insecureContentOrigins[2047] = L'\0';
+    }
+
+    // Load LockdownHeader (default disabled)
+    DWORD lockdownVal = 0;
+    dataSize = sizeof(lockdownVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_LOCKDOWN, NULL, &dataType,
+                         (LPBYTE)&lockdownVal, &dataSize) == ERROR_SUCCESS) {
+        config->lockdownHeader = (lockdownVal != 0);
+    } else {
+        config->lockdownHeader = FALSE;
+    }
+
+    // Load the optional shared secret mixed into the lockdown key.
+    config->lockdownSecret[0] = L'\0';
+    dataSize = sizeof(config->lockdownSecret);
+    if (RegQueryValueExW(hKey, REG_VALUE_LOCKDOWN_SECRET, NULL, &dataType,
+                         (LPBYTE)config->lockdownSecret, &dataSize) != ERROR_SUCCESS ||
+        dataType != REG_SZ || dataSize < sizeof(wchar_t)) {
+        config->lockdownSecret[0] = L'\0';
+    } else {
+        config->lockdownSecret[255] = L'\0';
+    }
+
     // Load DebugLog (default disabled)
     DWORD dbgVal = 0;
     dataSize = sizeof(dbgVal);
@@ -561,6 +640,26 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     DWORD newWinVal = config->openNewWindowsExternally ? 1 : 0;
     RegSetValueExW(hKey, REG_VALUE_NEWWINDOW, 0, REG_DWORD,
                    (const BYTE*)&newWinVal, sizeof(newWinVal));
+
+    // Save AllowRunningInsecureContent
+    DWORD insecureContentVal = config->allowRunningInsecureContent ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_INSECURE_CONTENT, 0, REG_DWORD,
+                   (const BYTE*)&insecureContentVal, sizeof(insecureContentVal));
+
+    // Save the origin-scoped trust allowlist used by the browser process.
+    RegSetValueExW(hKey, REG_VALUE_INSECURE_CONTENT_ORIGINS, 0, REG_SZ,
+                   (const BYTE*)config->insecureContentOrigins,
+                   (DWORD)((wcslen(config->insecureContentOrigins) + 1) * sizeof(wchar_t)));
+
+    // Save LockdownHeader
+    DWORD lockdownVal = config->lockdownHeader ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_LOCKDOWN, 0, REG_DWORD,
+                   (const BYTE*)&lockdownVal, sizeof(lockdownVal));
+
+    // Save LockdownSecret
+    RegSetValueExW(hKey, REG_VALUE_LOCKDOWN_SECRET, 0, REG_SZ,
+                   (const BYTE*)config->lockdownSecret,
+                   (DWORD)((wcslen(config->lockdownSecret) + 1) * sizeof(wchar_t)));
 
     // Save DebugLog
     DWORD dbgVal = config->debugLogEnabled ? 1 : 0;
@@ -612,6 +711,12 @@ static void ApplyConfiguration(void) {
     // Sync the new-window handling setting (read live by the handler, so a
     // toggle applies without restarting the WebView)
     InterlockedExchange(&g_openNewWindowsExternally, g_config.openNewWindowsExternally ? TRUE : FALSE);
+
+    // Sync the lockdown-header setting (read live by the request handler)
+    // and align the request filter with it; a toggle applies without any
+    // restart because only the filter, not the handler, changes.
+    InterlockedExchange(&g_lockdownHeader, g_config.lockdownHeader ? TRUE : FALSE);
+    ApplyLockdownRequestFilter();
 
     // Sync debug logging (read live by DebugPrint)
     InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
@@ -674,6 +779,9 @@ static BOOL load_webview2_loader(void) {
                         if (hMod) {
                             fnCreateEnvironment = (PFN_CreateCoreWebView2EnvironmentWithOptions)
                                 GetProcAddress(hMod, "CreateCoreWebView2EnvironmentWithOptions");
+                            fnGetAvailableBrowserVersion =
+                                (PFN_GetAvailableCoreWebView2BrowserVersionString)GetProcAddress(
+                                    hMod, "GetAvailableCoreWebView2BrowserVersionString");
                             if (fnCreateEnvironment) return TRUE;
                         }
                     }
@@ -812,22 +920,29 @@ static void cfg_sync_controller_bounds(void) {
 }
 
 static void webview_push_init_config(void) {
-    wchar_t eUrl[4096], eTitle[512], eHide[8192], eShow[8192];
+    wchar_t eUrl[4096], eTitle[512], eHide[8192], eShow[8192], eInsecureOrigins[4096];
+    wchar_t eLockdownSecret[512];
     json_escape_wstring(g_config.url, eUrl, 4096);
     json_escape_wstring(g_config.windowTitle, eTitle, 512);
     json_escape_wstring(g_config.onHideJs, eHide, 8192);
     json_escape_wstring(g_config.onShowJs, eShow, 8192);
+    json_escape_wstring(g_config.insecureContentOrigins, eInsecureOrigins, 4096);
+    json_escape_wstring(g_config.lockdownSecret, eLockdownSecret, 512);
 
     // Sized for every field at maximum, fully escaped, plus the JSON scaffold.
     // A fixed 16K buffer used to silently truncate the script for large JS
     // hooks, which broke onInit and left the dialog blank.
-    const size_t scriptCch = 4096 + 512 + 8192 + 8192 + 256;
+    const size_t scriptCch = 4096 + 512 + 8192 + 8192 + 4096 + 512 + 448;
     wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
     if (!script) return;
     int written = swprintf(script, scriptCch,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"debugLog\":%s}})",
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"debugLog\":%s}})",
         eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false",
         g_config.openNewWindowsExternally ? L"true" : L"false",
+        g_config.allowRunningInsecureContent ? L"true" : L"false",
+        eInsecureOrigins,
+        g_config.lockdownHeader ? L"true" : L"false",
+        eLockdownSecret,
         g_config.debugLogEnabled ? L"true" : L"false");
     if (written > 0) {
         webview_cfg_execute_script(script);
@@ -1018,10 +1133,13 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         webview_push_init_config();
     } else if (strcmp(action, "saveSettings") == 0) {
         char url[4096] = {0}, title[512] = {0}, hideJs[8192] = {0}, showJs[8192] = {0};
+        char insecureOrigins[8192] = {0};
         json_get_string(msg, "url", url, sizeof(url));
         json_get_string(msg, "windowTitle", title, sizeof(title));
         json_get_string(msg, "onHideJs", hideJs, sizeof(hideJs));
         json_get_string(msg, "onShowJs", showJs, sizeof(showJs));
+        json_get_string(msg, "insecureContentOrigins", insecureOrigins,
+                        sizeof(insecureOrigins));
 
         MultiByteToWideChar(CP_UTF8, 0, url, -1, g_config.url, 2048);
         MultiByteToWideChar(CP_UTF8, 0, title, -1, g_config.windowTitle, 256);
@@ -1029,6 +1147,22 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         MultiByteToWideChar(CP_UTF8, 0, showJs, -1, g_config.onShowJs, 4096);
         g_config.sleepWhenInactive = json_get_bool(msg, "sleepWhenInactive", FALSE);
         g_config.openNewWindowsExternally = json_get_bool(msg, "openNewWindowsExternally", FALSE);
+        BOOL oldAllowRunningInsecureContent = g_config.allowRunningInsecureContent;
+        wchar_t oldInsecureContentOrigins[2048];
+        wcscpy_s(oldInsecureContentOrigins, 2048, g_config.insecureContentOrigins);
+        g_config.allowRunningInsecureContent =
+            json_get_bool(msg, "allowRunningInsecureContent", FALSE);
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, insecureOrigins, -1,
+                                g_config.insecureContentOrigins, 2048) == 0) {
+            g_config.insecureContentOrigins[0] = L'\0';
+        }
+        char lockdownSecret[1024] = {0};
+        json_get_string(msg, "lockdownSecret", lockdownSecret, sizeof(lockdownSecret));
+        g_config.lockdownHeader = json_get_bool(msg, "lockdownHeader", FALSE);
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, lockdownSecret, -1,
+                                g_config.lockdownSecret, 256) == 0) {
+            g_config.lockdownSecret[0] = L'\0';
+        }
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
 
         SaveConfigToRegistry(&g_config);
@@ -1037,6 +1171,15 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
 
         g_cfgSaved = TRUE;
         PostMessage(g_cfgHwnd, WM_CLOSE, 0, 0);
+        if (g_hwnd &&
+            (oldAllowRunningInsecureContent != g_config.allowRunningInsecureContent ||
+             wcscmp(oldInsecureContentOrigins, g_config.insecureContentOrigins) != 0)) {
+            // Browser arguments are fixed when the environment is created.
+            // Close the dialog first, then restart so the new process creates
+            // the main WebView with the updated mixed-content policy.
+            DebugPrint(L"[INFO] Insecure-content setting changed; restarting launcher\n");
+            PostMessage(g_hwnd, WM_COMMAND, ID_TRAY_MENU_RESTART, 0);
+        }
     } else if (strcmp(action, "close") == 0) {
         PostMessage(g_cfgHwnd, WM_CLOSE, 0, 0);
     } else if (strcmp(action, "resize") == 0) {
@@ -1268,6 +1411,334 @@ static void GetMainUserDataFolder(wchar_t path[MAX_PATH]) {
     PathAppendW(path, APP_NAME L"\\WebView2Data");
 }
 
+static BOOL IsOriginListSeparator(wchar_t c) {
+    return c == L',' || c == L';' || iswspace(c);
+}
+
+static BOOL IsValidOriginPort(const wchar_t* begin, const wchar_t* end) {
+    if (begin >= end) return FALSE;
+
+    unsigned long port = 0;
+    for (const wchar_t* p = begin; p < end; ++p) {
+        if (*p < L'0' || *p > L'9') return FALSE;
+        port = port * 10 + (unsigned long)(*p - L'0');
+        if (port > 65535) return FALSE;
+    }
+    return port > 0;
+}
+
+// AdditionalBrowserArguments is a command line, so only accept exact ASCII
+// HTTP origins here. Besides matching Chromium's documented origin format,
+// this prevents a registry or INI value from introducing another switch.
+static BOOL IsValidInsecureContentOrigin(const wchar_t* origin) {
+    static const wchar_t httpPrefix[] = L"http://";
+    const size_t prefixLen = (sizeof(httpPrefix) / sizeof(httpPrefix[0])) - 1;
+    size_t length = wcslen(origin);
+    if (length <= prefixLen || _wcsnicmp(origin, httpPrefix, prefixLen) != 0) {
+        return FALSE;
+    }
+
+    const wchar_t* authority = origin + prefixLen;
+    const wchar_t* end = origin + length;
+
+    if (*authority == L'[') {
+        const wchar_t* closeBracket = wcschr(authority + 1, L']');
+        if (!closeBracket || closeBracket == authority + 1) return FALSE;
+
+        int colonCount = 0;
+        for (const wchar_t* p = authority + 1; p < closeBracket; ++p) {
+            wchar_t c = *p;
+            if (c == L':') {
+                colonCount++;
+            } else if (!((c >= L'0' && c <= L'9') ||
+                         (c >= L'a' && c <= L'f') ||
+                         (c >= L'A' && c <= L'F') || c == L'.')) {
+                return FALSE;
+            }
+        }
+        if (colonCount < 2) return FALSE;
+
+        if (closeBracket + 1 == end) return TRUE;
+        return closeBracket + 1 < end && closeBracket[1] == L':' &&
+               IsValidOriginPort(closeBracket + 2, end);
+    }
+
+    const wchar_t* portSeparator = NULL;
+    for (const wchar_t* p = authority; p < end; ++p) {
+        if (*p == L':') {
+            if (portSeparator) return FALSE;
+            portSeparator = p;
+        }
+    }
+
+    const wchar_t* hostEnd = portSeparator ? portSeparator : end;
+    if (authority == hostEnd) return FALSE;
+    for (const wchar_t* p = authority; p < hostEnd; ++p) {
+        wchar_t c = *p;
+        if (!((c >= L'0' && c <= L'9') ||
+              (c >= L'a' && c <= L'z') ||
+              (c >= L'A' && c <= L'Z') ||
+              c == L'.' || c == L'-' || c == L'_')) {
+            return FALSE;
+        }
+    }
+
+    return !portSeparator || IsValidOriginPort(portSeparator + 1, end);
+}
+
+static wchar_t* BuildInsecureContentBrowserArguments(size_t* originCount) {
+    if (originCount) *originCount = 0;
+    if (!g_config.allowRunningInsecureContent) return NULL;
+
+    const wchar_t* configured = g_config.insecureContentOrigins;
+    size_t configuredLength = wcslen(configured);
+    wchar_t* origins = (wchar_t*)calloc(configuredLength + 1, sizeof(wchar_t));
+    if (!origins) return NULL;
+
+    size_t originsLength = 0;
+    size_t count = 0;
+    const wchar_t* cursor = configured;
+    while (*cursor) {
+        while (*cursor && IsOriginListSeparator(*cursor)) cursor++;
+        if (!*cursor) break;
+
+        const wchar_t* begin = cursor;
+        while (*cursor && !IsOriginListSeparator(*cursor)) cursor++;
+        size_t tokenLength = (size_t)(cursor - begin);
+        wchar_t token[2048];
+        if (tokenLength == 0 || tokenLength >= sizeof(token) / sizeof(token[0])) {
+            free(origins);
+            DebugPrint(L"[WARNING] Insecure-content origin list is too long or malformed\n");
+            return NULL;
+        }
+        wmemcpy(token, begin, tokenLength);
+        token[tokenLength] = L'\0';
+
+        if (!IsValidInsecureContentOrigin(token)) {
+            free(origins);
+            DebugPrint(L"[WARNING] Insecure-content setting requires exact ASCII http:// origins\n");
+            return NULL;
+        }
+
+        if (count > 0) origins[originsLength++] = L',';
+        wmemcpy(origins + originsLength, token, tokenLength);
+        originsLength += tokenLength;
+        origins[originsLength] = L'\0';
+        count++;
+    }
+
+    if (count == 0) {
+        free(origins);
+        DebugPrint(L"[WARNING] Insecure-content setting is enabled but no HTTP origins are configured\n");
+        return NULL;
+    }
+
+    static const wchar_t argumentPrefix[] =
+        L"--unsafely-treat-insecure-origin-as-secure=";
+    size_t argumentLength = wcslen(argumentPrefix) + originsLength;
+    wchar_t* arguments = (wchar_t*)malloc((argumentLength + 1) * sizeof(wchar_t));
+    if (!arguments) {
+        free(origins);
+        return NULL;
+    }
+    wcscpy_s(arguments, argumentLength + 1, argumentPrefix);
+    wcscat_s(arguments, argumentLength + 1, origins);
+    free(origins);
+    if (originCount) *originCount = count;
+    return arguments;
+}
+
+// Plain-C implementation of the base WebView2 environment-options COM
+// interface. The SDK's convenience implementation requires C++/WRL, while
+// this application deliberately remains a single C translation unit.
+typedef struct {
+    ICoreWebView2EnvironmentOptionsVtbl* lpVtbl;
+    LONG refCount;
+    LPWSTR additionalBrowserArguments;
+    LPWSTR language;
+    LPWSTR targetCompatibleBrowserVersion;
+    BOOL allowSingleSignOnUsingOSPrimaryAccount;
+} MainEnvironmentOptions;
+
+static HRESULT CopyEnvironmentOptionString(LPCWSTR source, LPWSTR* value) {
+    if (!value) return E_POINTER;
+    *value = NULL;
+    if (!source) return S_OK;
+
+    size_t bytes = (wcslen(source) + 1) * sizeof(wchar_t);
+    LPWSTR copy = (LPWSTR)CoTaskMemAlloc(bytes);
+    if (!copy) return E_OUTOFMEMORY;
+    memcpy(copy, source, bytes);
+    *value = copy;
+    return S_OK;
+}
+
+static HRESULT SetEnvironmentOptionString(LPWSTR* destination, LPCWSTR value) {
+    LPWSTR copy = NULL;
+    if (value) {
+        size_t bytes = (wcslen(value) + 1) * sizeof(wchar_t);
+        copy = (LPWSTR)CoTaskMemAlloc(bytes);
+        if (!copy) return E_OUTOFMEMORY;
+        memcpy(copy, value, bytes);
+    }
+    CoTaskMemFree(*destination);
+    *destination = copy;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE MainEnvironmentOptions_QueryInterface(
+    ICoreWebView2EnvironmentOptions* This, REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = NULL;
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2EnvironmentOptions)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE MainEnvironmentOptions_AddRef(
+    ICoreWebView2EnvironmentOptions* This) {
+    return (ULONG)InterlockedIncrement(&((MainEnvironmentOptions*)This)->refCount);
+}
+
+static ULONG STDMETHODCALLTYPE MainEnvironmentOptions_Release(
+    ICoreWebView2EnvironmentOptions* This) {
+    MainEnvironmentOptions* options = (MainEnvironmentOptions*)This;
+    ULONG refCount = (ULONG)InterlockedDecrement(&options->refCount);
+    if (refCount == 0) {
+        CoTaskMemFree(options->additionalBrowserArguments);
+        CoTaskMemFree(options->language);
+        CoTaskMemFree(options->targetCompatibleBrowserVersion);
+        free(options);
+    }
+    return refCount;
+}
+
+static HRESULT STDMETHODCALLTYPE MainEnvironmentOptions_get_AdditionalBrowserArguments(
+    ICoreWebView2EnvironmentOptions* This, LPWSTR* value) {
+    return CopyEnvironmentOptionString(
+        ((MainEnvironmentOptions*)This)->additionalBrowserArguments, value);
+}
+
+static HRESULT STDMETHODCALLTYPE MainEnvironmentOptions_put_AdditionalBrowserArguments(
+    ICoreWebView2EnvironmentOptions* This, LPCWSTR value) {
+    return SetEnvironmentOptionString(
+        &((MainEnvironmentOptions*)This)->additionalBrowserArguments, value);
+}
+
+static HRESULT STDMETHODCALLTYPE MainEnvironmentOptions_get_Language(
+    ICoreWebView2EnvironmentOptions* This, LPWSTR* value) {
+    return CopyEnvironmentOptionString(((MainEnvironmentOptions*)This)->language, value);
+}
+
+static HRESULT STDMETHODCALLTYPE MainEnvironmentOptions_put_Language(
+    ICoreWebView2EnvironmentOptions* This, LPCWSTR value) {
+    return SetEnvironmentOptionString(&((MainEnvironmentOptions*)This)->language, value);
+}
+
+static HRESULT STDMETHODCALLTYPE MainEnvironmentOptions_get_TargetCompatibleBrowserVersion(
+    ICoreWebView2EnvironmentOptions* This, LPWSTR* value) {
+    return CopyEnvironmentOptionString(
+        ((MainEnvironmentOptions*)This)->targetCompatibleBrowserVersion, value);
+}
+
+static HRESULT STDMETHODCALLTYPE MainEnvironmentOptions_put_TargetCompatibleBrowserVersion(
+    ICoreWebView2EnvironmentOptions* This, LPCWSTR value) {
+    return SetEnvironmentOptionString(
+        &((MainEnvironmentOptions*)This)->targetCompatibleBrowserVersion, value);
+}
+
+static HRESULT STDMETHODCALLTYPE MainEnvironmentOptions_get_AllowSingleSignOnUsingOSPrimaryAccount(
+    ICoreWebView2EnvironmentOptions* This, BOOL* allow) {
+    if (!allow) return E_POINTER;
+    *allow = ((MainEnvironmentOptions*)This)->allowSingleSignOnUsingOSPrimaryAccount;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE MainEnvironmentOptions_put_AllowSingleSignOnUsingOSPrimaryAccount(
+    ICoreWebView2EnvironmentOptions* This, BOOL allow) {
+    ((MainEnvironmentOptions*)This)->allowSingleSignOnUsingOSPrimaryAccount = allow;
+    return S_OK;
+}
+
+static BOOL ValidateMainEnvironmentOptions(ICoreWebView2EnvironmentOptions* options) {
+    LPWSTR arguments = NULL;
+    LPWSTR language = NULL;
+    LPWSTR targetVersion = NULL;
+    BOOL allowSingleSignOn = TRUE;
+
+    HRESULT argumentsHr = options->lpVtbl->get_AdditionalBrowserArguments(
+        options, &arguments);
+    HRESULT languageHr = options->lpVtbl->get_Language(options, &language);
+    HRESULT targetHr = options->lpVtbl->get_TargetCompatibleBrowserVersion(
+        options, &targetVersion);
+    HRESULT singleSignOnHr =
+        options->lpVtbl->get_AllowSingleSignOnUsingOSPrimaryAccount(
+            options, &allowSingleSignOn);
+
+    BOOL valid = SUCCEEDED(argumentsHr) && arguments && arguments[0] != L'\0' &&
+                 SUCCEEDED(languageHr) &&
+                 SUCCEEDED(targetHr) && targetVersion && targetVersion[0] != L'\0' &&
+                 SUCCEEDED(singleSignOnHr) && !allowSingleSignOn;
+
+    CoTaskMemFree(arguments);
+    CoTaskMemFree(language);
+    CoTaskMemFree(targetVersion);
+    return valid;
+}
+
+static ICoreWebView2EnvironmentOptions* CreateMainEnvironmentOptions(
+    LPCWSTR additionalBrowserArguments) {
+    static ICoreWebView2EnvironmentOptionsVtbl vtbl = {
+        MainEnvironmentOptions_QueryInterface,
+        MainEnvironmentOptions_AddRef,
+        MainEnvironmentOptions_Release,
+        MainEnvironmentOptions_get_AdditionalBrowserArguments,
+        MainEnvironmentOptions_put_AdditionalBrowserArguments,
+        MainEnvironmentOptions_get_Language,
+        MainEnvironmentOptions_put_Language,
+        MainEnvironmentOptions_get_TargetCompatibleBrowserVersion,
+        MainEnvironmentOptions_put_TargetCompatibleBrowserVersion,
+        MainEnvironmentOptions_get_AllowSingleSignOnUsingOSPrimaryAccount,
+        MainEnvironmentOptions_put_AllowSingleSignOnUsingOSPrimaryAccount
+    };
+
+    MainEnvironmentOptions* options =
+        (MainEnvironmentOptions*)calloc(1, sizeof(MainEnvironmentOptions));
+    if (!options) return NULL;
+    options->lpVtbl = &vtbl;
+    options->refCount = 1;
+    ICoreWebView2EnvironmentOptions* interfaceOptions =
+        (ICoreWebView2EnvironmentOptions*)options;
+
+    // A non-null target version is mandatory for a custom options object.
+    // Prefer the installed runtime version so this remains compatible with
+    // machines that have not yet updated to the bundled SDK's corresponding
+    // runtime; fall back to the SDK default if version discovery is unavailable.
+    LPWSTR installedBrowserVersion = NULL;
+    LPCWSTR targetVersion = WEBVIEW2_TARGET_COMPATIBLE_BROWSER_VERSION;
+    if (fnGetAvailableBrowserVersion &&
+        SUCCEEDED(fnGetAvailableBrowserVersion(NULL, &installedBrowserVersion)) &&
+        installedBrowserVersion && installedBrowserVersion[0] != L'\0') {
+        targetVersion = installedBrowserVersion;
+    }
+
+    if (FAILED(MainEnvironmentOptions_put_AdditionalBrowserArguments(
+            interfaceOptions, additionalBrowserArguments)) ||
+        FAILED(MainEnvironmentOptions_put_TargetCompatibleBrowserVersion(
+            interfaceOptions, targetVersion)) ||
+        !ValidateMainEnvironmentOptions(interfaceOptions)) {
+        CoTaskMemFree(installedBrowserVersion);
+        MainEnvironmentOptions_Release((ICoreWebView2EnvironmentOptions*)options);
+        return NULL;
+    }
+    CoTaskMemFree(installedBrowserVersion);
+    return interfaceOptions;
+}
+
 // Create the WebView2 environment for the main window. The controller and
 // WebView are then built by the completion handlers (EnvCompletedHandler et
 // al). Used from WM_CREATE and when rebuilding after a browser-process death.
@@ -1295,8 +1766,34 @@ static void CreateMainWebViewEnvironment(HWND hwnd) {
     envHandler->hwnd = hwnd;
     envHandler->userDataPath = _wcsdup(userDataPath);
 
-    HRESULT hr = fnCreateEnvironment(NULL, userDataPath, NULL,
+    ICoreWebView2EnvironmentOptions* environmentOptions = NULL;
+    size_t insecureOriginCount = 0;
+    wchar_t* browserArguments =
+        BuildInsecureContentBrowserArguments(&insecureOriginCount);
+    if (browserArguments) {
+        environmentOptions = CreateMainEnvironmentOptions(browserArguments);
+        free(browserArguments);
+        if (!environmentOptions) {
+            DebugPrint(L"[WARNING] Could not construct valid WebView2 environment options\n");
+        } else {
+            DebugPrint(L"[WARNING] Treating %lu configured HTTP origin(s) as trustworthy\n",
+                       (unsigned long)insecureOriginCount);
+        }
+    }
+
+    HRESULT hr = fnCreateEnvironment(NULL, userDataPath, environmentOptions,
         (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
+    if (hr == E_INVALIDARG && environmentOptions) {
+        // Keep the launcher usable if a future runtime changes its options
+        // contract. The retry is secure-by-default because it omits the
+        // insecure-origin browser argument.
+        DebugPrint(L"[WARNING] WebView2 rejected environment options; retrying without them\n");
+        hr = fnCreateEnvironment(NULL, userDataPath, NULL,
+            (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
+    }
+    if (environmentOptions) {
+        environmentOptions->lpVtbl->Release(environmentOptions);
+    }
     envHandler->lpVtbl->Release((ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
     if (FAILED(hr)) {
         InterlockedExchange(&g_webViewCreatePending, FALSE);
@@ -1414,6 +1911,7 @@ static void HandleUnexpectedBrowserExit(HWND hwnd) {
     InterlockedExchange(&g_webViewPingOutstanding, FALSE);
     g_powerKickCount = 0;
     g_jsVisibility = JS_VISIBILITY_UNKNOWN;
+    g_lockdownFilterActive = FALSE;  // filters die with the WebView instance
 
     if (g_webView) {
         g_webView->lpVtbl->Release(g_webView);
@@ -1617,6 +2115,12 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
         RegisterMainNewWindowRequestedHandler(webview2);
         RegisterMainProcessFailedHandler(webview2);
         RegisterMainWebMessageHandler(webview2);
+
+        // Attach the lockdown machinery before the first navigation so the
+        // initial page load already carries the header when enabled.
+        RegisterMainWebResourceRequestedHandler(webview2);
+        g_lockdownFilterActive = FALSE;  // fresh WebView has no filters yet
+        ApplyLockdownRequestFilter();
 
         webview2->lpVtbl->Navigate(webview2, g_initialUrl);
 
@@ -2137,6 +2641,281 @@ static void RegisterMainWebMessageHandler(ICoreWebView2* webview2) {
     }
 
     handler->lpVtbl->Release((ICoreWebView2WebMessageReceivedEventHandler*)handler);
+}
+
+// --- X-Lockdown request header ---------------------------------------------
+//
+// Optional gateway token: when enabled, every HTTP(S) request the container
+// issues carries an X-Lockdown header holding the request's own User-Agent
+// value, AES-256-CBC encrypted under a key derived from the current UTC hour
+// and an optional shared secret, then base64 encoded. A gateway derives the
+// keys for the previous, current and next hour, tries each, and passes the
+// request when a decryption matches the request's User-Agent header — a
+// rolling access token that needs no state or clock precision on the client.
+// The PHP counterpart is in the README; the layout must match it exactly:
+//
+//   key          = SHA-256(secret_utf8 + "|" + "YYYY-MM-DD HH:00:00")  (UTC)
+//   header value = base64(IV[16] || ciphertext)          (PKCS#7 padding)
+
+#define LOCKDOWN_HEADER_NAME L"X-Lockdown"
+#define LOCKDOWN_UA_MAX 1024        // UTF-8 User-Agent bytes incl. NUL
+#define LOCKDOWN_VALUE_CCH 1600     // base64(16 + padded UA) + NUL
+
+static BOOL LockdownSha256(const BYTE* data, ULONG dataLen, BYTE hash[32]) {
+    BCRYPT_ALG_HANDLE alg = NULL;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM,
+                                                    NULL, 0))) {
+        return FALSE;
+    }
+
+    BOOL ok = FALSE;
+    BCRYPT_HASH_HANDLE hashHandle = NULL;
+    if (BCRYPT_SUCCESS(BCryptCreateHash(alg, &hashHandle, NULL, 0, NULL, 0, 0))) {
+        ok = BCRYPT_SUCCESS(BCryptHashData(hashHandle, (PUCHAR)data, dataLen, 0)) &&
+             BCRYPT_SUCCESS(BCryptFinishHash(hashHandle, hash, 32, 0));
+        BCryptDestroyHash(hashHandle);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+static BOOL LockdownAesCbcEncrypt(const BYTE key[32], const BYTE iv[16],
+                                  const BYTE* plain, ULONG plainLen,
+                                  BYTE* cipher, ULONG cipherCap, ULONG* cipherLen) {
+    BCRYPT_ALG_HANDLE alg = NULL;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM,
+                                                    NULL, 0))) {
+        return FALSE;
+    }
+
+    BOOL ok = FALSE;
+    if (BCRYPT_SUCCESS(BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
+            (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0))) {
+        BCRYPT_KEY_HANDLE keyHandle = NULL;
+        if (BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(alg, &keyHandle, NULL, 0,
+                (PUCHAR)key, 32, 0))) {
+            BYTE ivCopy[16];  // BCryptEncrypt advances the IV in place
+            memcpy(ivCopy, iv, sizeof(ivCopy));
+            ok = BCRYPT_SUCCESS(BCryptEncrypt(keyHandle, (PUCHAR)plain, plainLen,
+                    NULL, ivCopy, sizeof(ivCopy), cipher, cipherCap, cipherLen,
+                    BCRYPT_BLOCK_PADDING));
+            BCryptDestroyKey(keyHandle);
+        }
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+// Build the header value for the given request User-Agent. The result is
+// cached per (UTC hour, User-Agent): a page load fires hundreds of
+// subresource requests but the value only changes on the hour. Single-thread
+// use only — WebView2 raises its events on the UI thread that created it.
+static BOOL BuildLockdownHeaderValue(const char* uaUtf8, wchar_t* out, size_t outCch) {
+    static char cachedUa[LOCKDOWN_UA_MAX];
+    static wchar_t cachedValue[LOCKDOWN_VALUE_CCH];
+    static BOOL cacheValid = FALSE;
+    static WORD cachedYear, cachedMonth, cachedDay, cachedHour;
+
+    SYSTEMTIME st;
+    GetSystemTime(&st);  // UTC by definition
+
+    if (cacheValid &&
+        st.wYear == cachedYear && st.wMonth == cachedMonth &&
+        st.wDay == cachedDay && st.wHour == cachedHour &&
+        strcmp(uaUtf8, cachedUa) == 0) {
+        wcscpy_s(out, outCch, cachedValue);
+        return TRUE;
+    }
+
+    char secretUtf8[768] = "";
+    WideCharToMultiByte(CP_UTF8, 0, g_config.lockdownSecret, -1,
+                        secretUtf8, sizeof(secretUtf8), NULL, NULL);
+    char keyMaterial[832];
+    int keyMaterialLen = snprintf(keyMaterial, sizeof(keyMaterial),
+        "%s|%04u-%02u-%02u %02u:00:00",
+        secretUtf8, st.wYear, st.wMonth, st.wDay, st.wHour);
+    if (keyMaterialLen <= 0 || keyMaterialLen >= (int)sizeof(keyMaterial)) {
+        return FALSE;
+    }
+
+    BYTE key[32];
+    if (!LockdownSha256((const BYTE*)keyMaterial, (ULONG)keyMaterialLen, key)) {
+        return FALSE;
+    }
+
+    BYTE payload[16 + LOCKDOWN_UA_MAX + 16];  // IV || ciphertext (padded)
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, payload, 16,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        return FALSE;
+    }
+
+    ULONG cipherLen = 0;
+    if (!LockdownAesCbcEncrypt(key, payload, (const BYTE*)uaUtf8,
+            (ULONG)strlen(uaUtf8), payload + 16,
+            (ULONG)(sizeof(payload) - 16), &cipherLen)) {
+        return FALSE;
+    }
+
+    char base64[LOCKDOWN_VALUE_CCH];
+    DWORD base64Len = (DWORD)sizeof(base64);
+    if (!CryptBinaryToStringA(payload, 16 + cipherLen,
+            CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, base64, &base64Len)) {
+        return FALSE;
+    }
+
+    // Base64 is plain ASCII; widen it for SetHeader.
+    if (MultiByteToWideChar(CP_ACP, 0, base64, -1, out, (int)outCch) == 0) {
+        return FALSE;
+    }
+
+    cachedYear = st.wYear; cachedMonth = st.wMonth;
+    cachedDay = st.wDay; cachedHour = st.wHour;
+    strcpy_s(cachedUa, sizeof(cachedUa), uaUtf8);
+    wcscpy_s(cachedValue, LOCKDOWN_VALUE_CCH, out);
+    cacheValid = TRUE;
+    return TRUE;
+}
+
+typedef struct {
+    ICoreWebView2WebResourceRequestedEventHandlerVtbl* lpVtbl;
+    LONG refCount;
+} LockdownRequestHandler;
+
+static HRESULT STDMETHODCALLTYPE LockdownRequestHandler_QueryInterface(
+    ICoreWebView2WebResourceRequestedEventHandler* This,
+    REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2WebResourceRequestedEventHandler)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE LockdownRequestHandler_AddRef(
+    ICoreWebView2WebResourceRequestedEventHandler* This) {
+    return InterlockedIncrement(&((LockdownRequestHandler*)This)->refCount);
+}
+
+static ULONG STDMETHODCALLTYPE LockdownRequestHandler_Release(
+    ICoreWebView2WebResourceRequestedEventHandler* This) {
+    ULONG refCount = InterlockedDecrement(&((LockdownRequestHandler*)This)->refCount);
+    if (refCount == 0) free(This);
+    return refCount;
+}
+
+static HRESULT STDMETHODCALLTYPE LockdownRequestHandler_Invoke(
+    ICoreWebView2WebResourceRequestedEventHandler* This,
+    ICoreWebView2* sender, ICoreWebView2WebResourceRequestedEventArgs* args) {
+    (void)This; (void)sender;
+
+    if (InterlockedCompareExchange(&g_lockdownHeader, TRUE, TRUE) != TRUE) {
+        return S_OK;
+    }
+
+    ICoreWebView2WebResourceRequest* request = NULL;
+    if (FAILED(args->lpVtbl->get_Request(args, &request)) || !request) {
+        return S_OK;
+    }
+
+    ICoreWebView2HttpRequestHeaders* headers = NULL;
+    if (SUCCEEDED(request->lpVtbl->get_Headers(request, &headers)) && headers) {
+        // Encrypt the exact User-Agent value this request carries; a request
+        // without one (rare) gets the empty string, which the verifier
+        // compares against its equally absent User-Agent header.
+        LPWSTR uaWide = NULL;
+        headers->lpVtbl->GetHeader(headers, L"User-Agent", &uaWide);
+
+        char uaUtf8[LOCKDOWN_UA_MAX] = "";
+        if (uaWide) {
+            if (WideCharToMultiByte(CP_UTF8, 0, uaWide, -1, uaUtf8,
+                                    sizeof(uaUtf8), NULL, NULL) == 0) {
+                uaUtf8[0] = '\0';
+            }
+            CoTaskMemFree(uaWide);
+        }
+
+        wchar_t value[LOCKDOWN_VALUE_CCH];
+        if (BuildLockdownHeaderValue(uaUtf8, value, LOCKDOWN_VALUE_CCH)) {
+            headers->lpVtbl->SetHeader(headers, LOCKDOWN_HEADER_NAME, value);
+        } else {
+            DebugPrint(L"[WARNING] Could not build X-Lockdown header value\n");
+        }
+        headers->lpVtbl->Release(headers);
+    }
+    request->lpVtbl->Release(request);
+    return S_OK;
+}
+
+static void RegisterMainWebResourceRequestedHandler(ICoreWebView2* webview2) {
+    if (!webview2) return;
+
+    LockdownRequestHandler* handler =
+        (LockdownRequestHandler*)calloc(1, sizeof(LockdownRequestHandler));
+    if (!handler) return;
+
+    static ICoreWebView2WebResourceRequestedEventHandlerVtbl requestVtbl = {
+        LockdownRequestHandler_QueryInterface,
+        LockdownRequestHandler_AddRef,
+        LockdownRequestHandler_Release,
+        LockdownRequestHandler_Invoke
+    };
+    handler->lpVtbl = &requestVtbl;
+    handler->refCount = 1;
+
+    EventRegistrationToken token;
+    HRESULT hr = webview2->lpVtbl->add_WebResourceRequested(
+        webview2, (ICoreWebView2WebResourceRequestedEventHandler*)handler, &token);
+    if (FAILED(hr)) {
+        DebugPrint(L"[WARNING] add_WebResourceRequested failed. HRESULT: 0x%08X\n", hr);
+    }
+
+    handler->lpVtbl->Release((ICoreWebView2WebResourceRequestedEventHandler*)handler);
+}
+
+// Add or remove the match-everything request filter so it agrees with the
+// lockdown setting. The handler itself stays registered either way: only an
+// active filter makes requests round-trip through this process, so a
+// disabled setting costs nothing, and a config-dialog toggle applies live.
+static void ApplyLockdownRequestFilter(void) {
+    if (!g_webView) return;
+
+    BOOL want = g_config.lockdownHeader ? TRUE : FALSE;
+    if (want == g_lockdownFilterActive) return;
+
+    // Prefer the filter variant that also covers service-worker and shared-
+    // worker initiated requests; runtimes without it intercept requests from
+    // documents only.
+    HRESULT hr = E_NOINTERFACE;
+    ICoreWebView2_22* webview22 = NULL;
+    if (SUCCEEDED(g_webView->lpVtbl->QueryInterface(g_webView,
+            &IID_ICoreWebView2_22, (void**)&webview22)) && webview22) {
+        hr = want
+            ? webview22->lpVtbl->AddWebResourceRequestedFilterWithRequestSourceKinds(
+                  webview22, L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                  COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL)
+            : webview22->lpVtbl->RemoveWebResourceRequestedFilterWithRequestSourceKinds(
+                  webview22, L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                  COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL);
+        webview22->lpVtbl->Release(webview22);
+    }
+    if (FAILED(hr)) {
+        hr = want
+            ? g_webView->lpVtbl->AddWebResourceRequestedFilter(
+                  g_webView, L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL)
+            : g_webView->lpVtbl->RemoveWebResourceRequestedFilter(
+                  g_webView, L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+    }
+
+    if (SUCCEEDED(hr)) {
+        g_lockdownFilterActive = want;
+        DebugPrint(want ? L"[INFO] X-Lockdown header enabled for all requests\n"
+                        : L"[INFO] X-Lockdown header disabled\n");
+    } else {
+        DebugPrint(L"[WARNING] Could not update X-Lockdown request filter. HRESULT: 0x%08X\n", hr);
+    }
 }
 
 // Helper to execute JavaScript in WebView2
@@ -3419,6 +4198,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcscpy_s(g_initialUrl, 2048, g_config.url);
     InterlockedExchange(&g_sleepWhenInactive, g_config.sleepWhenInactive ? TRUE : FALSE);
     InterlockedExchange(&g_openNewWindowsExternally, g_config.openNewWindowsExternally ? TRUE : FALSE);
+    InterlockedExchange(&g_lockdownHeader, g_config.lockdownHeader ? TRUE : FALSE);
     InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
     DebugPrint(L"[INFO] SystrayLauncher starting\n");
 

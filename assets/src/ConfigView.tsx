@@ -10,6 +10,32 @@ interface Props {
   config: ConfigData;
 }
 
+function normalizeHttpOrigins(raw: string): string {
+  const entries = raw
+    .split(/[\r\n,]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  const origins: string[] = [];
+
+  for (const entry of entries) {
+    let parsed: URL;
+    try {
+      parsed = new URL(entry);
+    } catch {
+      throw new Error(`Invalid HTTP URL: ${entry}`);
+    }
+    if (parsed.protocol !== "http:") {
+      throw new Error(`Only http:// origins are allowed: ${entry}`);
+    }
+    if (parsed.username || parsed.password) {
+      throw new Error("Origins cannot contain a username or password.");
+    }
+    if (!origins.includes(parsed.origin)) origins.push(parsed.origin);
+  }
+
+  return origins.join(",");
+}
+
 export default function ConfigView({ config }: Props) {
   const [windowTitle, setWindowTitle] = useState(config.windowTitle);
   const [url, setUrl] = useState(config.url);
@@ -21,8 +47,21 @@ export default function ConfigView({ config }: Props) {
   const [openNewWindowsExternally, setOpenNewWindowsExternally] = useState(
     config.openNewWindowsExternally ?? false
   );
+  const [allowRunningInsecureContent, setAllowRunningInsecureContent] = useState(
+    config.allowRunningInsecureContent ?? false
+  );
+  const [insecureContentOrigins, setInsecureContentOrigins] = useState(
+    (config.insecureContentOrigins ?? "").split(",").join("\n")
+  );
+  const [lockdownHeader, setLockdownHeader] = useState(
+    config.lockdownHeader ?? false
+  );
+  const [lockdownSecret, setLockdownSecret] = useState(
+    config.lockdownSecret ?? ""
+  );
   const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
   const [urlError, setUrlError] = useState("");
+  const [insecureOriginsError, setInsecureOriginsError] = useState("");
 
   function handleSave() {
     const trimmedUrl = url.trim();
@@ -30,7 +69,32 @@ export default function ConfigView({ config }: Props) {
       setUrlError("URL cannot be empty.");
       return;
     }
+
+    let normalizedInsecureOrigins = "";
+    if (allowRunningInsecureContent) {
+      try {
+        normalizedInsecureOrigins = normalizeHttpOrigins(insecureContentOrigins);
+      } catch (error) {
+        setInsecureOriginsError(
+          error instanceof Error ? error.message : "Invalid HTTP origin."
+        );
+        return;
+      }
+    } else if (insecureContentOrigins.trim()) {
+      try {
+        normalizedInsecureOrigins = normalizeHttpOrigins(insecureContentOrigins);
+      } catch {
+        // A disabled legacy/INI value must not prevent saving other settings.
+        normalizedInsecureOrigins = "";
+      }
+    }
+    if (allowRunningInsecureContent && !normalizedInsecureOrigins) {
+      setInsecureOriginsError("Add at least one HTTP origin to allow.");
+      return;
+    }
+
     setUrlError("");
+    setInsecureOriginsError("");
     saveSettings({
       url: trimmedUrl,
       windowTitle,
@@ -38,6 +102,10 @@ export default function ConfigView({ config }: Props) {
       onShowJs,
       sleepWhenInactive,
       openNewWindowsExternally,
+      allowRunningInsecureContent,
+      insecureContentOrigins: normalizedInsecureOrigins,
+      lockdownHeader,
+      lockdownSecret: lockdownSecret.trim(),
       debugLog,
     });
   }
@@ -91,6 +159,97 @@ export default function ConfigView({ config }: Props) {
           value={onShowJs}
           onChange={(e) => setOnShowJs(e.target.value)}
         />
+      </div>
+
+      <div className="space-y-1 pt-1">
+        <div className="flex items-start gap-2">
+          <Checkbox
+            id="allowRunningInsecureContent"
+            className="mt-0.5"
+            checked={allowRunningInsecureContent}
+            onChange={(e) => {
+              setAllowRunningInsecureContent(e.target.checked);
+              if (insecureOriginsError) setInsecureOriginsError("");
+            }}
+          />
+          <div className="space-y-0.5">
+            <Label
+              htmlFor="allowRunningInsecureContent"
+              className="cursor-pointer"
+            >
+              Allow listed HTTP origins on HTTPS pages
+            </Label>
+            <p className="text-red-600 text-[11px] leading-snug">
+              Treats the listed HTTP origins as trustworthy so they can load in
+              HTTPS pages. This weakens browser security for those origins.
+              Changing this setting restarts the launcher.
+            </p>
+          </div>
+        </div>
+        {allowRunningInsecureContent && (
+          <div className="ml-6 space-y-1">
+            <Label htmlFor="insecureContentOrigins">Allowed HTTP origins</Label>
+            <Textarea
+              id="insecureContentOrigins"
+              rows={2}
+              maxLength={1800}
+              placeholder={"http://device.local:8080\nhttp://192.168.1.20"}
+              value={insecureContentOrigins}
+              onChange={(e) => {
+                setInsecureContentOrigins(e.target.value);
+                if (insecureOriginsError) setInsecureOriginsError("");
+              }}
+              className={insecureOriginsError ? "border-red-500" : ""}
+            />
+            <p className="text-neutral-500 text-[11px] leading-snug">
+              One URL per line or comma-separated. You may paste a full URL;
+              only its origin (scheme, host, and port) is saved. List every HTTP
+              origin used by the iframe and its redirects.
+            </p>
+            {insecureOriginsError && (
+              <p className="text-red-600 text-[11px]">{insecureOriginsError}</p>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="space-y-1 pt-1">
+        <div className="flex items-start gap-2">
+          <Checkbox
+            id="lockdownHeader"
+            className="mt-0.5"
+            checked={lockdownHeader}
+            onChange={(e) => setLockdownHeader(e.target.checked)}
+          />
+          <div className="space-y-0.5">
+            <Label htmlFor="lockdownHeader" className="cursor-pointer">
+              Send X-Lockdown header
+            </Label>
+            <p className="text-neutral-500 text-[11px] leading-snug">
+              Stamps every request with an X-Lockdown header: the browser's
+              User-Agent encrypted with a key derived from the current UTC hour
+              and the secret below. A gateway that knows the secret can require
+              the header as an extra access check (server recipe in the README).
+            </p>
+          </div>
+        </div>
+        {lockdownHeader && (
+          <div className="ml-6 space-y-1">
+            <Label htmlFor="lockdownSecret">Shared secret</Label>
+            <Input
+              id="lockdownSecret"
+              maxLength={200}
+              placeholder="use the same value on the server"
+              value={lockdownSecret}
+              onChange={(e) => setLockdownSecret(e.target.value)}
+            />
+            <p className="text-neutral-500 text-[11px] leading-snug">
+              Mixed into the hourly encryption key. Optional, but without it
+              anyone who knows the (public) scheme can forge the header.
+              Leading and trailing spaces are ignored.
+            </p>
+          </div>
+        )}
       </div>
 
       <div className="flex items-start gap-2 pt-1">
