@@ -9,6 +9,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 - **Configurable** - Set custom URL, window title, and JavaScript hooks via GUI
 - **JavaScript Hooks** - Execute custom JavaScript when the window is shown or hidden (useful for pausing/resuming web app activity)
 - **External Link Handling** - Optionally open new windows/tabs (`target="_blank"`, `window.open`) in the system default browser instead of a WebView2 popup
+- **Static Host Mappings** - Optionally resolve listed hostnames to configured IP addresses inside the embedded browser without changing system DNS
 - **Optional Mixed Content** - Explicitly allow an HTTPS page to load HTTP content from configured legacy origins
 - **Lockdown Header** - Optionally stamp every request with a rolling, hour-keyed `X-Lockdown` token a gateway can require as an extra access layer
 - **Preloaded on Startup** - The page is loaded into the WebView at launch so it is ready the moment you open the window
@@ -40,11 +41,35 @@ Settings available in the Configure dialog:
 | URL | The web page to load |
 | JavaScript on Hide | JS executed when window is fully covered or hidden |
 | JavaScript on Show | JS executed when window becomes visible |
+| Resolve listed hostnames to static IP addresses | Bypasses normal DNS for explicitly listed hostnames inside the main web container. Enter one `hostname:IP` mapping per line (for example, `device.local:192.168.1.20`). The option is disabled by default and restarts the launcher when changed. |
 | Allow listed HTTP origins on HTTPS pages | Lets an HTTPS page embed content from explicitly listed HTTP origins. Enter one origin per line (for example, `http://device.local:8080`). The option is disabled by default and restarts the launcher when changed. |
 | Send X-Lockdown header | Adds an `X-Lockdown` header to every request the embedded browser makes: the request's own User-Agent encrypted with a key derived from the current UTC hour and an optional shared secret (see [Lockdown Header](#lockdown-header)). Toggling applies immediately. Disabled by default. |
 | Open new windows in the default browser | When enabled, links that would open a new window or tab launch in the system default browser instead of a WebView2 popup. Only `http(s)` links are handed to the browser. Popups that must script back to the opening page (some login flows) may not work while enabled. Disabled by default. |
 | Sleep web container when inactive | When enabled, suspends the WebView to save CPU while the window is hidden, and pre-emptively wakes it on tray-icon hover. The page is always preloaded at startup regardless of this setting. Disabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (recovery attempts, web view rebuilds, power transitions) to `%LOCALAPPDATA%\SystrayLauncher\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
+
+## Static Host Mappings
+
+When **Resolve listed hostnames to static IP addresses** is enabled, the main
+WebView2 environment starts with Chromium `--host-resolver-rules` generated
+from the exact mappings entered in the dialog. For example,
+`device.local:192.168.1.20` makes requests for `device.local` connect to
+`192.168.1.20` without modifying the Windows hosts file or affecting Edge and
+other applications. The configuration dialog uses a separate WebView2
+environment and is not affected.
+
+The URL and web origin remain the configured hostname. HTTPS therefore still
+requires the destination server to present a certificate valid for that
+hostname, and virtual hosting continues to receive the hostname. Each
+subdomain must be listed separately. IPv6 addresses are supported when wrapped
+in brackets, such as `device.local:[2001:db8::20]`. A configured HTTP proxy can
+resolve destination hostnames itself, so these local mappings are intended for
+direct connections.
+
+This feature uses a Chromium browser switch rather than a stable WebView2 DNS
+API. Microsoft documents browser flags as development-oriented and not
+guaranteed long-term, so the behavior should be tested when deploying a new
+WebView2 Runtime version.
 
 The mixed-content option starts WebView2 with the documented
 [`--unsafely-treat-insecure-origin-as-secure`](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/webview-features-flags#available-webview2-browser-flags)

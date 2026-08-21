@@ -7,6 +7,8 @@ export interface ConfigData {
   openNewWindowsExternally: boolean;
   allowRunningInsecureContent: boolean;
   insecureContentOrigins: string;
+  useStaticHostMappings: boolean;
+  staticHostMappings: string;
   lockdownHeader: boolean;
   lockdownSecret: string;
   debugLog: boolean;
@@ -45,6 +47,8 @@ export function saveSettings(config: ConfigData) {
       openNewWindowsExternally: config.openNewWindowsExternally,
       allowRunningInsecureContent: config.allowRunningInsecureContent,
       insecureContentOrigins: config.insecureContentOrigins,
+      useStaticHostMappings: config.useStaticHostMappings,
+      staticHostMappings: config.staticHostMappings,
       lockdownHeader: config.lockdownHeader,
       lockdownSecret: config.lockdownSecret,
       debugLog: config.debugLog,

@@ -36,6 +36,90 @@ function normalizeHttpOrigins(raw: string): string {
   return origins.join(",");
 }
 
+function normalizeStaticHostMappings(raw: string): string {
+  const entries = raw
+    .split(/[\r\n,]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  const mappings: string[] = [];
+  const mappedAddresses = new Map<string, string>();
+
+  for (const entry of entries) {
+    const separator = entry.indexOf(":");
+    if (separator <= 0 || separator === entry.length - 1) {
+      throw new Error(`Use hostname:IP format: ${entry}`);
+    }
+
+    const rawHostname = entry.slice(0, separator).trim();
+    const rawAddress = entry.slice(separator + 1).trim();
+    let parsedHostname: URL;
+    try {
+      parsedHostname = new URL(`http://${rawHostname}/`);
+    } catch {
+      throw new Error(`Invalid hostname: ${rawHostname}`);
+    }
+
+    const hostname = parsedHostname.hostname.toLowerCase();
+    const labels = hostname.split(".");
+    if (
+      !hostname ||
+      hostname.length > 253 ||
+      parsedHostname.host !== parsedHostname.hostname ||
+      parsedHostname.username ||
+      parsedHostname.password ||
+      parsedHostname.pathname !== "/" ||
+      parsedHostname.search ||
+      parsedHostname.hash ||
+      hostname.startsWith("[") ||
+      labels.some(
+        (label) =>
+          !label ||
+          label.length > 63 ||
+          !/^[a-z0-9_-]+$/i.test(label) ||
+          label.startsWith("-") ||
+          label.endsWith("-")
+      )
+    ) {
+      throw new Error(`Invalid hostname: ${rawHostname}`);
+    }
+
+    let address: string;
+    if (rawAddress.startsWith("[") && rawAddress.endsWith("]")) {
+      try {
+        const parsedAddress = new URL(`http://${rawAddress}/`);
+        address = parsedAddress.hostname.toLowerCase();
+        if (!address.startsWith("[") || !address.includes(":")) {
+          throw new Error();
+        }
+      } catch {
+        throw new Error(`Invalid IP address for ${hostname}: ${rawAddress}`);
+      }
+    } else {
+      const octets = rawAddress.split(".");
+      if (
+        octets.length !== 4 ||
+        octets.some(
+          (octet) => !/^\d{1,3}$/.test(octet) || Number(octet) > 255
+        )
+      ) {
+        throw new Error(`Invalid IP address for ${hostname}: ${rawAddress}`);
+      }
+      address = octets.map((octet) => String(Number(octet))).join(".");
+    }
+
+    const previousAddress = mappedAddresses.get(hostname);
+    if (previousAddress && previousAddress !== address) {
+      throw new Error(`Hostname is mapped more than once: ${hostname}`);
+    }
+    if (!previousAddress) {
+      mappedAddresses.set(hostname, address);
+      mappings.push(`${hostname}:${address}`);
+    }
+  }
+
+  return mappings.join(",");
+}
+
 export default function ConfigView({ config }: Props) {
   const [windowTitle, setWindowTitle] = useState(config.windowTitle);
   const [url, setUrl] = useState(config.url);
@@ -53,6 +137,12 @@ export default function ConfigView({ config }: Props) {
   const [insecureContentOrigins, setInsecureContentOrigins] = useState(
     (config.insecureContentOrigins ?? "").split(",").join("\n")
   );
+  const [useStaticHostMappings, setUseStaticHostMappings] = useState(
+    config.useStaticHostMappings ?? false
+  );
+  const [staticHostMappings, setStaticHostMappings] = useState(
+    (config.staticHostMappings ?? "").split(",").join("\n")
+  );
   const [lockdownHeader, setLockdownHeader] = useState(
     config.lockdownHeader ?? false
   );
@@ -62,6 +152,7 @@ export default function ConfigView({ config }: Props) {
   const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
   const [urlError, setUrlError] = useState("");
   const [insecureOriginsError, setInsecureOriginsError] = useState("");
+  const [staticHostsError, setStaticHostsError] = useState("");
 
   function handleSave() {
     const trimmedUrl = url.trim();
@@ -93,8 +184,32 @@ export default function ConfigView({ config }: Props) {
       return;
     }
 
+    let normalizedStaticHosts = "";
+    if (useStaticHostMappings) {
+      try {
+        normalizedStaticHosts = normalizeStaticHostMappings(staticHostMappings);
+      } catch (error) {
+        setStaticHostsError(
+          error instanceof Error ? error.message : "Invalid static host mapping."
+        );
+        return;
+      }
+    } else if (staticHostMappings.trim()) {
+      try {
+        normalizedStaticHosts = normalizeStaticHostMappings(staticHostMappings);
+      } catch {
+        // A disabled legacy/INI value must not prevent saving other settings.
+        normalizedStaticHosts = "";
+      }
+    }
+    if (useStaticHostMappings && !normalizedStaticHosts) {
+      setStaticHostsError("Add at least one hostname and IP address.");
+      return;
+    }
+
     setUrlError("");
     setInsecureOriginsError("");
+    setStaticHostsError("");
     saveSettings({
       url: trimmedUrl,
       windowTitle,
@@ -104,6 +219,8 @@ export default function ConfigView({ config }: Props) {
       openNewWindowsExternally,
       allowRunningInsecureContent,
       insecureContentOrigins: normalizedInsecureOrigins,
+      useStaticHostMappings,
+      staticHostMappings: normalizedStaticHosts,
       lockdownHeader,
       lockdownSecret: lockdownSecret.trim(),
       debugLog,
@@ -159,6 +276,55 @@ export default function ConfigView({ config }: Props) {
           value={onShowJs}
           onChange={(e) => setOnShowJs(e.target.value)}
         />
+      </div>
+
+      <div className="space-y-1 pt-1">
+        <div className="flex items-start gap-2">
+          <Checkbox
+            id="useStaticHostMappings"
+            className="mt-0.5"
+            checked={useStaticHostMappings}
+            onChange={(e) => {
+              setUseStaticHostMappings(e.target.checked);
+              if (staticHostsError) setStaticHostsError("");
+            }}
+          />
+          <div className="space-y-0.5">
+            <Label htmlFor="useStaticHostMappings" className="cursor-pointer">
+              Resolve listed hostnames to static IP addresses
+            </Label>
+            <p className="text-red-600 text-[11px] leading-snug">
+              Routes the listed hostnames to their configured IP addresses
+              inside this web container, bypassing normal DNS. Changing this
+              setting restarts the launcher.
+            </p>
+          </div>
+        </div>
+        {useStaticHostMappings && (
+          <div className="ml-6 space-y-1">
+            <Label htmlFor="staticHostMappings">Static host mappings</Label>
+            <Textarea
+              id="staticHostMappings"
+              rows={2}
+              maxLength={1800}
+              placeholder={"device.local:192.168.1.20\napi.example.com:10.0.0.8"}
+              value={staticHostMappings}
+              onChange={(e) => {
+                setStaticHostMappings(e.target.value);
+                if (staticHostsError) setStaticHostsError("");
+              }}
+              className={staticHostsError ? "border-red-500" : ""}
+            />
+            <p className="text-neutral-500 text-[11px] leading-snug">
+              One hostname:IP mapping per line or comma-separated. HTTPS
+              certificates are still checked against the hostname. List each
+              subdomain separately; wrap IPv6 addresses in brackets.
+            </p>
+            {staticHostsError && (
+              <p className="text-red-600 text-[11px]">{staticHostsError}</p>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="space-y-1 pt-1">

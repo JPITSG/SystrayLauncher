@@ -7,6 +7,8 @@
 #define WINVER 0x0A00
 #endif
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -62,6 +64,8 @@
 #define REG_VALUE_NEWWINDOW L"OpenNewWindowsExternally"
 #define REG_VALUE_INSECURE_CONTENT L"AllowRunningInsecureContent"
 #define REG_VALUE_INSECURE_CONTENT_ORIGINS L"InsecureContentOrigins"
+#define REG_VALUE_STATIC_HOSTS L"UseStaticHostMappings"
+#define REG_VALUE_STATIC_HOST_MAPPINGS L"StaticHostMappings"
 #define REG_VALUE_LOCKDOWN L"LockdownHeader"
 #define REG_VALUE_LOCKDOWN_SECRET L"LockdownSecret"
 #define REG_VALUE_DEBUGLOG L"DebugLog"
@@ -131,6 +135,8 @@ typedef struct {
     BOOL openNewWindowsExternally;
     BOOL allowRunningInsecureContent;
     wchar_t insecureContentOrigins[2048];
+    BOOL useStaticHostMappings;
+    wchar_t staticHostMappings[2048];
     BOOL lockdownHeader;
     wchar_t lockdownSecret[256];
     BOOL debugLogEnabled;
@@ -397,6 +403,8 @@ void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     config->openNewWindowsExternally = FALSE;
     config->allowRunningInsecureContent = FALSE;
     config->insecureContentOrigins[0] = L'\0';
+    config->useStaticHostMappings = FALSE;
+    config->staticHostMappings[0] = L'\0';
     config->lockdownHeader = FALSE;
     config->lockdownSecret[0] = L'\0';
     config->debugLogEnabled = FALSE;
@@ -474,6 +482,11 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
         config->allowRunningInsecureContent = (c == L'1' || c == L't' || c == L'y');
     } else if (wcscmp(key, L"insecurecontentorigins") == 0) {
         wcscpy_s(config->insecureContentOrigins, 2048, value);
+    } else if (wcscmp(key, L"usestatichostmappings") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->useStaticHostMappings = (c == L'1' || c == L't' || c == L'y');
+    } else if (wcscmp(key, L"statichostmappings") == 0) {
+        wcscpy_s(config->staticHostMappings, 2048, value);
     } else if (wcscmp(key, L"lockdownheader") == 0) {
         wchar_t c = towlower(value[0]);
         config->lockdownHeader = (c == L'1' || c == L't' || c == L'y');
@@ -572,6 +585,26 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         config->insecureContentOrigins[2047] = L'\0';
     }
 
+    // Load per-container static hostname resolution (default disabled).
+    DWORD staticHostsVal = 0;
+    dataSize = sizeof(staticHostsVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_STATIC_HOSTS, NULL, &dataType,
+                         (LPBYTE)&staticHostsVal, &dataSize) == ERROR_SUCCESS) {
+        config->useStaticHostMappings = (staticHostsVal != 0);
+    } else {
+        config->useStaticHostMappings = FALSE;
+    }
+
+    config->staticHostMappings[0] = L'\0';
+    dataSize = sizeof(config->staticHostMappings);
+    if (RegQueryValueExW(hKey, REG_VALUE_STATIC_HOST_MAPPINGS, NULL, &dataType,
+                         (LPBYTE)config->staticHostMappings, &dataSize) != ERROR_SUCCESS ||
+        dataType != REG_SZ || dataSize < sizeof(wchar_t)) {
+        config->staticHostMappings[0] = L'\0';
+    } else {
+        config->staticHostMappings[2047] = L'\0';
+    }
+
     // Load LockdownHeader (default disabled)
     DWORD lockdownVal = 0;
     dataSize = sizeof(lockdownVal);
@@ -650,6 +683,14 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     RegSetValueExW(hKey, REG_VALUE_INSECURE_CONTENT_ORIGINS, 0, REG_SZ,
                    (const BYTE*)config->insecureContentOrigins,
                    (DWORD)((wcslen(config->insecureContentOrigins) + 1) * sizeof(wchar_t)));
+
+    // Save the per-container static hostname resolution rules.
+    DWORD staticHostsVal = config->useStaticHostMappings ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_STATIC_HOSTS, 0, REG_DWORD,
+                   (const BYTE*)&staticHostsVal, sizeof(staticHostsVal));
+    RegSetValueExW(hKey, REG_VALUE_STATIC_HOST_MAPPINGS, 0, REG_SZ,
+                   (const BYTE*)config->staticHostMappings,
+                   (DWORD)((wcslen(config->staticHostMappings) + 1) * sizeof(wchar_t)));
 
     // Save LockdownHeader
     DWORD lockdownVal = config->lockdownHeader ? 1 : 0;
@@ -921,26 +962,30 @@ static void cfg_sync_controller_bounds(void) {
 
 static void webview_push_init_config(void) {
     wchar_t eUrl[4096], eTitle[512], eHide[8192], eShow[8192], eInsecureOrigins[4096];
-    wchar_t eLockdownSecret[512];
+    wchar_t eStaticHosts[4096], eLockdownSecret[512];
     json_escape_wstring(g_config.url, eUrl, 4096);
     json_escape_wstring(g_config.windowTitle, eTitle, 512);
     json_escape_wstring(g_config.onHideJs, eHide, 8192);
     json_escape_wstring(g_config.onShowJs, eShow, 8192);
     json_escape_wstring(g_config.insecureContentOrigins, eInsecureOrigins, 4096);
+    json_escape_wstring(g_config.staticHostMappings, eStaticHosts, 4096);
     json_escape_wstring(g_config.lockdownSecret, eLockdownSecret, 512);
 
     // Sized for every field at maximum, fully escaped, plus the JSON scaffold.
     // A fixed 16K buffer used to silently truncate the script for large JS
     // hooks, which broke onInit and left the dialog blank.
-    const size_t scriptCch = 4096 + 512 + 8192 + 8192 + 4096 + 512 + 448;
+    const size_t scriptCch =
+        4096 + 512 + 8192 + 8192 + 4096 + 4096 + 512 + 576;
     wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
     if (!script) return;
     int written = swprintf(script, scriptCch,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"debugLog\":%s}})",
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"debugLog\":%s}})",
         eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false",
         g_config.openNewWindowsExternally ? L"true" : L"false",
         g_config.allowRunningInsecureContent ? L"true" : L"false",
         eInsecureOrigins,
+        g_config.useStaticHostMappings ? L"true" : L"false",
+        eStaticHosts,
         g_config.lockdownHeader ? L"true" : L"false",
         eLockdownSecret,
         g_config.debugLogEnabled ? L"true" : L"false");
@@ -1133,13 +1178,15 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         webview_push_init_config();
     } else if (strcmp(action, "saveSettings") == 0) {
         char url[4096] = {0}, title[512] = {0}, hideJs[8192] = {0}, showJs[8192] = {0};
-        char insecureOrigins[8192] = {0};
+        char insecureOrigins[8192] = {0}, staticHosts[8192] = {0};
         json_get_string(msg, "url", url, sizeof(url));
         json_get_string(msg, "windowTitle", title, sizeof(title));
         json_get_string(msg, "onHideJs", hideJs, sizeof(hideJs));
         json_get_string(msg, "onShowJs", showJs, sizeof(showJs));
         json_get_string(msg, "insecureContentOrigins", insecureOrigins,
                         sizeof(insecureOrigins));
+        json_get_string(msg, "staticHostMappings", staticHosts,
+                        sizeof(staticHosts));
 
         MultiByteToWideChar(CP_UTF8, 0, url, -1, g_config.url, 2048);
         MultiByteToWideChar(CP_UTF8, 0, title, -1, g_config.windowTitle, 256);
@@ -1155,6 +1202,15 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, insecureOrigins, -1,
                                 g_config.insecureContentOrigins, 2048) == 0) {
             g_config.insecureContentOrigins[0] = L'\0';
+        }
+        BOOL oldUseStaticHostMappings = g_config.useStaticHostMappings;
+        wchar_t oldStaticHostMappings[2048];
+        wcscpy_s(oldStaticHostMappings, 2048, g_config.staticHostMappings);
+        g_config.useStaticHostMappings =
+            json_get_bool(msg, "useStaticHostMappings", FALSE);
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, staticHosts, -1,
+                                g_config.staticHostMappings, 2048) == 0) {
+            g_config.staticHostMappings[0] = L'\0';
         }
         char lockdownSecret[1024] = {0};
         json_get_string(msg, "lockdownSecret", lockdownSecret, sizeof(lockdownSecret));
@@ -1173,11 +1229,13 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         PostMessage(g_cfgHwnd, WM_CLOSE, 0, 0);
         if (g_hwnd &&
             (oldAllowRunningInsecureContent != g_config.allowRunningInsecureContent ||
-             wcscmp(oldInsecureContentOrigins, g_config.insecureContentOrigins) != 0)) {
+             wcscmp(oldInsecureContentOrigins, g_config.insecureContentOrigins) != 0 ||
+             oldUseStaticHostMappings != g_config.useStaticHostMappings ||
+             wcscmp(oldStaticHostMappings, g_config.staticHostMappings) != 0)) {
             // Browser arguments are fixed when the environment is created.
             // Close the dialog first, then restart so the new process creates
-            // the main WebView with the updated mixed-content policy.
-            DebugPrint(L"[INFO] Insecure-content setting changed; restarting launcher\n");
+            // the main WebView with the updated network settings.
+            DebugPrint(L"[INFO] Browser environment setting changed; restarting launcher\n");
             PostMessage(g_hwnd, WM_COMMAND, ID_TRAY_MENU_RESTART, 0);
         }
     } else if (strcmp(action, "close") == 0) {
@@ -1548,6 +1606,173 @@ static wchar_t* BuildInsecureContentBrowserArguments(size_t* originCount) {
     return arguments;
 }
 
+static BOOL IsValidStaticHostName(const wchar_t* begin, const wchar_t* end) {
+    size_t length = (size_t)(end - begin);
+    if (length == 0 || length > 253) return FALSE;
+
+    const wchar_t* labelStart = begin;
+    for (const wchar_t* p = begin; p <= end; ++p) {
+        if (p == end || *p == L'.') {
+            size_t labelLength = (size_t)(p - labelStart);
+            if (labelLength == 0 || labelLength > 63 ||
+                *labelStart == L'-' || p[-1] == L'-') {
+                return FALSE;
+            }
+            labelStart = p + 1;
+            continue;
+        }
+
+        wchar_t c = *p;
+        if (!((c >= L'0' && c <= L'9') ||
+              (c >= L'a' && c <= L'z') ||
+              (c >= L'A' && c <= L'Z') ||
+              c == L'-' || c == L'_')) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOL IsValidStaticIpAddress(const wchar_t* begin, const wchar_t* end) {
+    if (begin >= end) return FALSE;
+
+    int addressFamily = AF_INET;
+    if (*begin == L'[') {
+        if (end - begin < 4 || end[-1] != L']') return FALSE;
+        begin++;
+        end--;
+        addressFamily = AF_INET6;
+    }
+
+    size_t length = (size_t)(end - begin);
+    if (length == 0 || length >= 64) return FALSE;
+
+    wchar_t address[64];
+    wmemcpy(address, begin, length);
+    address[length] = L'\0';
+
+    union {
+        IN_ADDR ipv4;
+        IN6_ADDR ipv6;
+    } parsed;
+    return InetPtonW(addressFamily, address, &parsed) == 1;
+}
+
+static BOOL IsValidStaticHostMapping(const wchar_t* mapping,
+                                     const wchar_t** separatorOut) {
+    const wchar_t* separator = wcschr(mapping, L':');
+    if (!separator || separator == mapping || separator[1] == L'\0') {
+        return FALSE;
+    }
+
+    const wchar_t* end = mapping + wcslen(mapping);
+    if (!IsValidStaticHostName(mapping, separator) ||
+        !IsValidStaticIpAddress(separator + 1, end)) {
+        return FALSE;
+    }
+
+    if (separatorOut) *separatorOut = separator;
+    return TRUE;
+}
+
+// Build Chromium resolver rules only from exact ASCII hostnames and literal
+// IP addresses. The strict grammar prevents a registry or INI value from
+// escaping the quoted switch value or introducing another browser argument.
+static wchar_t* BuildStaticHostBrowserArguments(size_t* mappingCount) {
+    if (mappingCount) *mappingCount = 0;
+    if (!g_config.useStaticHostMappings) return NULL;
+
+    const wchar_t* configured = g_config.staticHostMappings;
+    size_t configuredLength = wcslen(configured);
+    size_t rulesCapacity = configuredLength * 2 + 1;
+    wchar_t* rules = (wchar_t*)calloc(rulesCapacity, sizeof(wchar_t));
+    if (!rules) return NULL;
+
+    size_t rulesLength = 0;
+    size_t count = 0;
+    const wchar_t* cursor = configured;
+    while (*cursor) {
+        while (*cursor && IsOriginListSeparator(*cursor)) cursor++;
+        if (!*cursor) break;
+
+        const wchar_t* begin = cursor;
+        while (*cursor && !IsOriginListSeparator(*cursor)) cursor++;
+        size_t tokenLength = (size_t)(cursor - begin);
+        wchar_t token[2048];
+        if (tokenLength == 0 || tokenLength >= sizeof(token) / sizeof(token[0])) {
+            free(rules);
+            DebugPrint(L"[WARNING] Static host mapping list is too long or malformed\n");
+            return NULL;
+        }
+        wmemcpy(token, begin, tokenLength);
+        token[tokenLength] = L'\0';
+
+        const wchar_t* separator = NULL;
+        if (!IsValidStaticHostMapping(token, &separator)) {
+            free(rules);
+            DebugPrint(L"[WARNING] Static hosts require exact hostname:IP mappings\n");
+            return NULL;
+        }
+
+        size_t hostLength = (size_t)(separator - token);
+        size_t addressLength = tokenLength - hostLength - 1;
+        size_t needed = (count > 0 ? 1 : 0) + 4 + hostLength + 1 + addressLength;
+        if (rulesLength + needed + 1 > rulesCapacity) {
+            free(rules);
+            return NULL;
+        }
+
+        if (count > 0) rules[rulesLength++] = L',';
+        wmemcpy(rules + rulesLength, L"MAP ", 4);
+        rulesLength += 4;
+        wmemcpy(rules + rulesLength, token, hostLength);
+        rulesLength += hostLength;
+        rules[rulesLength++] = L' ';
+        wmemcpy(rules + rulesLength, separator + 1, addressLength);
+        rulesLength += addressLength;
+        rules[rulesLength] = L'\0';
+        count++;
+    }
+
+    if (count == 0) {
+        free(rules);
+        DebugPrint(L"[WARNING] Static host mapping is enabled but no mappings are configured\n");
+        return NULL;
+    }
+
+    static const wchar_t argumentPrefix[] = L"--host-resolver-rules=\"";
+    size_t argumentLength = wcslen(argumentPrefix) + rulesLength + 1;
+    wchar_t* arguments = (wchar_t*)malloc((argumentLength + 1) * sizeof(wchar_t));
+    if (!arguments) {
+        free(rules);
+        return NULL;
+    }
+    wcscpy_s(arguments, argumentLength + 1, argumentPrefix);
+    wcscat_s(arguments, argumentLength + 1, rules);
+    wcscat_s(arguments, argumentLength + 1, L"\"");
+    free(rules);
+    if (mappingCount) *mappingCount = count;
+    return arguments;
+}
+
+static wchar_t* JoinBrowserArguments(LPCWSTR first, LPCWSTR second) {
+    size_t firstLength = first ? wcslen(first) : 0;
+    size_t secondLength = second ? wcslen(second) : 0;
+    if (firstLength == 0 && secondLength == 0) return NULL;
+
+    size_t totalLength = firstLength + secondLength +
+                         (firstLength > 0 && secondLength > 0 ? 1 : 0);
+    wchar_t* joined = (wchar_t*)malloc((totalLength + 1) * sizeof(wchar_t));
+    if (!joined) return NULL;
+    joined[0] = L'\0';
+    if (firstLength > 0) wcscat_s(joined, totalLength + 1, first);
+    if (firstLength > 0 && secondLength > 0) {
+        wcscat_s(joined, totalLength + 1, L" ");
+    }
+    if (secondLength > 0) wcscat_s(joined, totalLength + 1, second);
+    return joined;
+}
+
 // Plain-C implementation of the base WebView2 environment-options COM
 // interface. The SDK's convenience implementation requires C++/WRL, while
 // this application deliberately remains a single C translation unit.
@@ -1768,16 +1993,27 @@ static void CreateMainWebViewEnvironment(HWND hwnd) {
 
     ICoreWebView2EnvironmentOptions* environmentOptions = NULL;
     size_t insecureOriginCount = 0;
-    wchar_t* browserArguments =
+    size_t staticHostCount = 0;
+    wchar_t* insecureContentArguments =
         BuildInsecureContentBrowserArguments(&insecureOriginCount);
+    wchar_t* staticHostArguments =
+        BuildStaticHostBrowserArguments(&staticHostCount);
+    wchar_t* browserArguments =
+        JoinBrowserArguments(insecureContentArguments, staticHostArguments);
+    free(insecureContentArguments);
+    free(staticHostArguments);
     if (browserArguments) {
         environmentOptions = CreateMainEnvironmentOptions(browserArguments);
         free(browserArguments);
         if (!environmentOptions) {
             DebugPrint(L"[WARNING] Could not construct valid WebView2 environment options\n");
-        } else {
+        } else if (insecureOriginCount > 0) {
             DebugPrint(L"[WARNING] Treating %lu configured HTTP origin(s) as trustworthy\n",
                        (unsigned long)insecureOriginCount);
+        }
+        if (environmentOptions && staticHostCount > 0) {
+            DebugPrint(L"[INFO] Applying %lu static host mapping(s) to the web container\n",
+                       (unsigned long)staticHostCount);
         }
     }
 
@@ -1785,8 +2021,8 @@ static void CreateMainWebViewEnvironment(HWND hwnd) {
         (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
     if (hr == E_INVALIDARG && environmentOptions) {
         // Keep the launcher usable if a future runtime changes its options
-        // contract. The retry is secure-by-default because it omits the
-        // insecure-origin browser argument.
+        // contract. The retry uses WebView2's defaults because it omits all
+        // configured browser arguments.
         DebugPrint(L"[WARNING] WebView2 rejected environment options; retrying without them\n");
         hr = fnCreateEnvironment(NULL, userDataPath, NULL,
             (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*)envHandler);
