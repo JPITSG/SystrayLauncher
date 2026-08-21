@@ -38,7 +38,7 @@ Settings available in the Configure dialog:
 
 | Setting | Description |
 |---------|-------------|
-| Window Title | Title shown in the window title bar |
+| Window Title | Base title shown with the configured URL hostname when available, plus a loading indicator during navigation |
 | URL | The web page to load |
 | JavaScript on Hide | JS executed when window is fully covered or hidden |
 | JavaScript on Show | JS executed when window becomes visible |

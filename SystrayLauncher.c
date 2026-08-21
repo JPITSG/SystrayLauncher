@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+#include <wctype.h>
 #include <shellapi.h>
 #include <sddl.h>
 #include <shlobj.h>
@@ -105,6 +106,9 @@
 #define HEALTH_CHECK_INTERVAL_MS 100
 #define HEALTH_CHECK_VERDICT_TICKS 10
 #define HEALTH_CHECK_LIFETIME_TICKS 600
+#define ID_TIMER_WINDOW_TITLE_LOADING 11
+#define WINDOW_TITLE_LOADING_INTERVAL_MS 1000
+#define MAIN_WINDOW_TITLE_CCH 768
 #define ID_TIMER_POWER_RESUME 8
 #define POWER_RESUME_KICK_DELAY_MS 2000
 #define ID_TIMER_WEBVIEW_LIVENESS 9
@@ -212,6 +216,9 @@ static int g_healthTotalTicks = 0;  // lifetime of this poll (safety cap)
 static BOOL g_healthHealed = FALSE; // one rebuild per open
 static ULONGLONG g_rebuildBurstStartTick = 0;
 static LONG g_rebuildBurstCount = 0;
+static BOOL g_mainNavigationLoading = TRUE;
+static unsigned int g_loadingTitleDots = 1;
+static UINT64 g_mainNavigationId = 0;
 static EventRegistrationToken g_browserExitedToken;
 static BOOL g_browserExitedRegistered = FALSE;
 static HINSTANCE g_hInstance;
@@ -298,6 +305,10 @@ static void ResetTargetPageInBackground(void);
 static void ArmMainHealthCheck(void);
 static void KickMainWebViewComposition(void);
 static void OnMainNavigationCompleted(void);
+static void BeginMainNavigationTitle(HWND hwnd, UINT64 navigationId);
+static BOOL FinishMainNavigationTitle(HWND hwnd, UINT64 navigationId,
+                                      BOOL navigationIdKnown);
+static void RegisterMainNavigationStartingHandler(ICoreWebView2* webview2);
 static void RegisterMainNavigationCompletedHandler(ICoreWebView2* webview2);
 static void RegisterMainNewWindowRequestedHandler(ICoreWebView2* webview2);
 static void RegisterMainWebMessageHandler(ICoreWebView2* webview2);
@@ -404,6 +415,23 @@ typedef struct {
     ICoreWebView2TrySuspendCompletedHandlerVtbl* lpVtbl;
     LONG refCount;
 } TrySuspendCompletedHandler;
+
+// Navigation starting handler (drives the animated native window title)
+HRESULT STDMETHODCALLTYPE NavStartingHandler_QueryInterface(
+    ICoreWebView2NavigationStartingEventHandler* This,
+    REFIID riid, void** ppvObject);
+ULONG STDMETHODCALLTYPE NavStartingHandler_AddRef(
+    ICoreWebView2NavigationStartingEventHandler* This);
+ULONG STDMETHODCALLTYPE NavStartingHandler_Release(
+    ICoreWebView2NavigationStartingEventHandler* This);
+HRESULT STDMETHODCALLTYPE NavStartingHandler_Invoke(
+    ICoreWebView2NavigationStartingEventHandler* This,
+    ICoreWebView2* sender, ICoreWebView2NavigationStartingEventArgs* args);
+
+typedef struct {
+    ICoreWebView2NavigationStartingEventHandlerVtbl* lpVtbl;
+    LONG refCount;
+} NavStartingHandler;
 
 // Navigation completed handler (settles the initial preload / sleep state)
 HRESULT STDMETHODCALLTYPE NavCompletedHandler_QueryInterface(
@@ -771,6 +799,103 @@ static void MarkAsConfigured(void) {
     }
 }
 
+static BOOL GetConfiguredUrlHostname(wchar_t* hostname, size_t hostnameCount) {
+    if (!hostname || hostnameCount < 2 || !g_config.url[0]) return FALSE;
+
+    hostname[0] = L'\0';
+    URL_COMPONENTS components = {0};
+    components.dwStructSize = sizeof(components);
+    components.lpszHostName = hostname;
+    components.dwHostNameLength = (DWORD)hostnameCount;
+
+    if (!WinHttpCrackUrl(g_config.url, 0, 0, &components) ||
+        (components.nScheme != INTERNET_SCHEME_HTTP &&
+         components.nScheme != INTERNET_SCHEME_HTTPS) ||
+        components.dwHostNameLength == 0 ||
+        components.dwHostNameLength >= hostnameCount) {
+        hostname[0] = L'\0';
+        return FALSE;
+    }
+
+    hostname[components.dwHostNameLength] = L'\0';
+    for (const wchar_t* current = hostname; *current; current++) {
+        if (iswspace(*current) || *current < L' ' ||
+            wcschr(L"/\\?#@", *current) != NULL) {
+            hostname[0] = L'\0';
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static void AppendMainWindowTitlePart(wchar_t* title, size_t titleCount,
+                                      const wchar_t* part) {
+    if (!part || !part[0]) return;
+    if (title[0]) wcscat_s(title, titleCount, L" \x2014 ");
+    wcscat_s(title, titleCount, part);
+}
+
+static void UpdateMainWindowTitle(HWND hwnd) {
+    if (!hwnd) return;
+
+    wchar_t title[MAIN_WINDOW_TITLE_CCH] = L"";
+    wchar_t hostname[256];
+    const wchar_t* configuredTitle =
+        g_config.windowTitle[0] ? g_config.windowTitle : APP_NAME;
+
+    AppendMainWindowTitlePart(title, MAIN_WINDOW_TITLE_CCH, configuredTitle);
+    if (GetConfiguredUrlHostname(hostname, sizeof(hostname) / sizeof(hostname[0]))) {
+        AppendMainWindowTitlePart(title, MAIN_WINDOW_TITLE_CCH, hostname);
+    }
+
+    if (g_mainNavigationLoading) {
+        wchar_t loadingText[16] = L"Loading";
+        for (unsigned int i = 0; i < g_loadingTitleDots; i++) {
+            wcscat_s(loadingText, sizeof(loadingText) / sizeof(loadingText[0]), L".");
+        }
+        AppendMainWindowTitlePart(title, MAIN_WINDOW_TITLE_CCH, loadingText);
+    }
+
+    SetWindowTextW(hwnd, title);
+}
+
+static void BeginMainNavigationTitle(HWND hwnd, UINT64 navigationId) {
+    if (!hwnd) return;
+
+    if (g_mainNavigationLoading && navigationId != 0 &&
+        navigationId == g_mainNavigationId) {
+        return;  // A redirect keeps the same navigation and animation cadence.
+    }
+
+    g_mainNavigationLoading = TRUE;
+    g_mainNavigationId = navigationId;
+    g_loadingTitleDots = 1;
+    UpdateMainWindowTitle(hwnd);
+    SetTimer(hwnd, ID_TIMER_WINDOW_TITLE_LOADING,
+             WINDOW_TITLE_LOADING_INTERVAL_MS, NULL);
+}
+
+static BOOL FinishMainNavigationTitle(HWND hwnd, UINT64 navigationId,
+                                      BOOL navigationIdKnown) {
+    if (!hwnd) return TRUE;
+
+    // A superseded navigation may complete after its replacement has begun.
+    // Ignore that stale completion so the replacement keeps animating.
+    if (g_mainNavigationLoading && navigationIdKnown &&
+        g_mainNavigationId != 0 &&
+        navigationId != g_mainNavigationId) {
+        return FALSE;
+    }
+
+    if (g_mainNavigationLoading) {
+        g_mainNavigationLoading = FALSE;
+        g_mainNavigationId = 0;
+        KillTimer(hwnd, ID_TIMER_WINDOW_TITLE_LOADING);
+        UpdateMainWindowTitle(hwnd);
+    }
+    return TRUE;
+}
+
 static void ApplyConfiguration(void) {
     // Update initial URL
     wcscpy_s(g_initialUrl, 2048, g_config.url);
@@ -791,9 +916,10 @@ static void ApplyConfiguration(void) {
     // Sync debug logging (read live by DebugPrint)
     InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
 
-    // Update window title
+    // Update the stable title parts immediately. If a navigation is already
+    // in progress, its loading suffix remains in place.
     if (g_hwnd) {
-        SetWindowTextW(g_hwnd, g_config.windowTitle);
+        UpdateMainWindowTitle(g_hwnd);
     }
 
     // Update tray icon tooltip
@@ -2930,6 +3056,8 @@ static ICoreWebView2EnvironmentOptions* CreateMainEnvironmentOptions(
 // WebView are then built by the completion handlers (EnvCompletedHandler et
 // al). Used from WM_CREATE and when rebuilding after a browser-process death.
 static void CreateMainWebViewEnvironment(HWND hwnd) {
+    BeginMainNavigationTitle(hwnd, 0);
+
     wchar_t userDataPath[MAX_PATH];
     GetMainUserDataFolder(userDataPath);
     SHCreateDirectoryExW(NULL, userDataPath, NULL);
@@ -3309,6 +3437,7 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
 
         // Settle the sleep state only once the initial navigation finishes so
         // we never suspend a half-loaded page (see OnMainNavigationCompleted).
+        RegisterMainNavigationStartingHandler(webview2);
         RegisterMainNavigationCompletedHandler(webview2);
         RegisterMainNewWindowRequestedHandler(webview2);
         RegisterMainProcessFailedHandler(webview2);
@@ -3520,6 +3649,71 @@ HRESULT STDMETHODCALLTYPE LivenessPingHandler_Invoke(
     return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE NavStartingHandler_QueryInterface(
+    ICoreWebView2NavigationStartingEventHandler* This,
+    REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ICoreWebView2NavigationStartingEventHandler)) {
+        *ppvObject = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE NavStartingHandler_AddRef(
+    ICoreWebView2NavigationStartingEventHandler* This) {
+    NavStartingHandler* handler = (NavStartingHandler*)This;
+    return InterlockedIncrement(&handler->refCount);
+}
+
+ULONG STDMETHODCALLTYPE NavStartingHandler_Release(
+    ICoreWebView2NavigationStartingEventHandler* This) {
+    NavStartingHandler* handler = (NavStartingHandler*)This;
+    ULONG refCount = InterlockedDecrement(&handler->refCount);
+    if (refCount == 0) free(handler);
+    return refCount;
+}
+
+HRESULT STDMETHODCALLTYPE NavStartingHandler_Invoke(
+    ICoreWebView2NavigationStartingEventHandler* This,
+    ICoreWebView2* sender, ICoreWebView2NavigationStartingEventArgs* args) {
+    (void)This;
+    (void)sender;
+
+    UINT64 navigationId = 0;
+    if (args) args->lpVtbl->get_NavigationId(args, &navigationId);
+    BeginMainNavigationTitle(g_hwnd, navigationId);
+    return S_OK;
+}
+
+static void RegisterMainNavigationStartingHandler(ICoreWebView2* webview2) {
+    if (!webview2) return;
+
+    NavStartingHandler* handler =
+        (NavStartingHandler*)calloc(1, sizeof(NavStartingHandler));
+    if (!handler) return;
+
+    static ICoreWebView2NavigationStartingEventHandlerVtbl navVtbl = {
+        NavStartingHandler_QueryInterface,
+        NavStartingHandler_AddRef,
+        NavStartingHandler_Release,
+        NavStartingHandler_Invoke
+    };
+    handler->lpVtbl = &navVtbl;
+    handler->refCount = 1;
+
+    EventRegistrationToken token;
+    HRESULT hr = webview2->lpVtbl->add_NavigationStarting(
+        webview2, (ICoreWebView2NavigationStartingEventHandler*)handler, &token);
+    if (FAILED(hr)) {
+        DebugPrint(L"[WARNING] add_NavigationStarting failed. HRESULT: 0x%08X\n", hr);
+    }
+
+    handler->lpVtbl->Release((ICoreWebView2NavigationStartingEventHandler*)handler);
+}
+
 HRESULT STDMETHODCALLTYPE NavCompletedHandler_QueryInterface(
     ICoreWebView2NavigationCompletedEventHandler* This,
     REFIID riid, void** ppvObject) {
@@ -3554,8 +3748,13 @@ HRESULT STDMETHODCALLTYPE NavCompletedHandler_Invoke(
     ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) {
     (void)This;
     (void)sender;
-    (void)args;
-    OnMainNavigationCompleted();
+
+    UINT64 navigationId = 0;
+    BOOL navigationIdKnown =
+        args && SUCCEEDED(args->lpVtbl->get_NavigationId(args, &navigationId));
+    if (FinishMainNavigationTitle(g_hwnd, navigationId, navigationIdKnown)) {
+        OnMainNavigationCompleted();
+    }
     return S_OK;
 }
 
@@ -5141,6 +5340,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             } else if (wParam == ID_TIMER_WEBVIEW_LIVENESS) {
                 KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
                 CheckMainWebViewLiveness(hwnd);
+            } else if (wParam == ID_TIMER_WINDOW_TITLE_LOADING) {
+                if (!g_mainNavigationLoading) {
+                    KillTimer(hwnd, ID_TIMER_WINDOW_TITLE_LOADING);
+                } else {
+                    g_loadingTitleDots = (g_loadingTitleDots % 3) + 1;
+                    UpdateMainWindowTitle(hwnd);
+                }
             }
             return 0;
 
@@ -5194,6 +5400,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
             KillTimer(hwnd, ID_TIMER_POWER_RESUME);
             KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
+            KillTimer(hwnd, ID_TIMER_WINDOW_TITLE_LOADING);
             PostQuitMessage(0);
             return 0;
             
