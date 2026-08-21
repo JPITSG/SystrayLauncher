@@ -6,7 +6,6 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 
 - **System Tray Integration** - Runs in the system tray; double-click to open, close/minimize to hide
 - **WebView2 Browser** - Uses Microsoft Edge WebView2 for modern web compatibility
-- **Caption Refresh** - Reload the current page from a native refresh button beside the standard window controls
 - **Configurable** - Set custom URL, window title, and JavaScript hooks via GUI
 - **JavaScript Hooks** - Execute custom JavaScript when the window is shown or hidden (useful for pausing/resuming web app activity)
 - **External Link Handling** - Optionally open new windows/tabs (`target="_blank"`, `window.open`) in the system default browser instead of a WebView2 popup

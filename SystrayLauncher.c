@@ -10,7 +10,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <windowsx.h>
 #include <userenv.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -52,7 +51,6 @@
 #define TRAY_ICON_ID 100
 #define WM_TRAYICON (WM_APP + 1)
 #define WM_APP_UPDATE_RESULT (WM_APP + 3)
-#define HT_CAPTION_REFRESH 100
 #define ID_TRAY_MENU_REFRESH 1
 #define ID_TRAY_MENU_CLEAR_CACHE 2
 #define ID_TRAY_MENU_OPEN 3
@@ -218,9 +216,6 @@ static ULONGLONG g_rebuildBurstStartTick = 0;
 static LONG g_rebuildBurstCount = 0;
 static BOOL g_mainNavigationLoading = TRUE;
 static UINT64 g_mainNavigationId = 0;
-static BOOL g_captionRefreshHot = FALSE;
-static BOOL g_captionRefreshPressed = FALSE;
-static BOOL g_captionRefreshTracking = FALSE;
 static EventRegistrationToken g_browserExitedToken;
 static BOOL g_browserExitedRegistered = FALSE;
 static HINSTANCE g_hInstance;
@@ -317,11 +312,6 @@ static void RegisterMainWebMessageHandler(ICoreWebView2* webview2);
 static void RegisterMainWebResourceRequestedHandler(ICoreWebView2* webview2);
 static void ApplyLockdownRequestFilter(void);
 static void GetTargetWindowRect(int* x, int* y, int* w, int* h);
-static void EnableMainCaptionRefreshPainting(HWND hwnd);
-static void DrawMainCaptionRefreshButton(HWND hwnd);
-static void RedrawMainCaptionRefreshButton(HWND hwnd);
-static BOOL IsPointInMainCaptionRefreshButton(HWND hwnd, POINT screenPoint);
-static void RefreshCurrentPage(void);
 
 // Registry and config dialog functions
 static BOOL LoadConfigFromRegistry(Configuration* config);
@@ -1783,212 +1773,6 @@ static UINT GetWindowDpi(HWND hwnd) {
     UINT dpi = (UINT)GetDeviceCaps(hdc, LOGPIXELSX);
     ReleaseDC(hwnd, hdc);
     return dpi ? dpi : 96;
-}
-
-typedef int (WINAPI *PFN_GetSystemMetricsForDpiFn)(int, UINT);
-static int GetWindowSystemMetric(HWND hwnd, int metric) {
-    static PFN_GetSystemMetricsForDpiFn fnGetSystemMetricsForDpi = NULL;
-    static BOOL resolved = FALSE;
-    UINT windowDpi = GetWindowDpi(hwnd);
-
-    if (!resolved) {
-        fnGetSystemMetricsForDpi = (PFN_GetSystemMetricsForDpiFn)GetProcAddress(
-            GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi");
-        resolved = TRUE;
-    }
-    if (fnGetSystemMetricsForDpi) {
-        int value = fnGetSystemMetricsForDpi(metric, windowDpi);
-        if (value > 0) return value;
-    }
-
-    HDC screenDc = GetDC(NULL);
-    UINT systemDpi = screenDc ? (UINT)GetDeviceCaps(screenDc, LOGPIXELSX) : 96;
-    if (screenDc) ReleaseDC(NULL, screenDc);
-    if (!systemDpi) systemDpi = 96;
-    return MulDiv(GetSystemMetrics(metric), (int)windowDpi, (int)systemDpi);
-}
-
-static int GetMainCaptionButtonCount(HWND hwnd) {
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    int count = (style & WS_SYSMENU) ? 1 : 0;  // Close
-    if (style & WS_MAXIMIZEBOX) count++;
-    if (style & WS_MINIMIZEBOX) count++;
-    return count > 0 ? count : 1;
-}
-
-// DWM reports the complete native caption-button strip in window-relative
-// coordinates. The refresh button occupies one native-button-width directly
-// to the left of that strip, leaving Windows in charge of the standard three.
-static BOOL GetMainCaptionRefreshButtonRect(HWND hwnd, RECT* buttonRect) {
-    if (!hwnd || !buttonRect) return FALSE;
-
-    RECT windowRect;
-    if (!GetWindowRect(hwnd, &windowRect)) return FALSE;
-    LONG windowWidth = windowRect.right - windowRect.left;
-    LONG windowHeight = windowRect.bottom - windowRect.top;
-
-    RECT captionButtons = {0};
-    if (SUCCEEDED(DwmGetWindowAttribute(
-            hwnd, DWMWA_CAPTION_BUTTON_BOUNDS,
-            &captionButtons, sizeof(captionButtons))) &&
-        captionButtons.right > captionButtons.left &&
-        captionButtons.bottom > captionButtons.top &&
-        captionButtons.left > 0 && captionButtons.right <= windowWidth &&
-        captionButtons.bottom <= windowHeight) {
-        int nativeButtonCount = GetMainCaptionButtonCount(hwnd);
-        LONG buttonWidth =
-            (captionButtons.right - captionButtons.left) / nativeButtonCount;
-        if (buttonWidth > 0 && captionButtons.left >= buttonWidth) {
-            buttonRect->left = captionButtons.left - buttonWidth;
-            buttonRect->top = captionButtons.top;
-            buttonRect->right = captionButtons.left;
-            buttonRect->bottom = captionButtons.bottom;
-            return TRUE;
-        }
-    }
-
-    // DWM leaves the bounds undefined while a window is hidden or minimized.
-    // This metric-based fallback also covers a machine with composition off.
-    int frameX = GetWindowSystemMetric(hwnd, SM_CXFRAME) +
-                 GetWindowSystemMetric(hwnd, SM_CXPADDEDBORDER);
-    int frameY = GetWindowSystemMetric(hwnd, SM_CYFRAME) +
-                 GetWindowSystemMetric(hwnd, SM_CXPADDEDBORDER);
-    int buttonWidth = GetWindowSystemMetric(hwnd, SM_CXSIZE);
-    int buttonHeight = GetWindowSystemMetric(hwnd, SM_CYSIZE);
-    int nativeButtonCount = GetMainCaptionButtonCount(hwnd);
-    buttonRect->right = windowWidth - frameX - buttonWidth * nativeButtonCount;
-    buttonRect->left = buttonRect->right - buttonWidth;
-    buttonRect->top = frameY;
-    buttonRect->bottom = buttonRect->top + buttonHeight;
-    return buttonRect->left >= frameX && buttonRect->right > buttonRect->left &&
-           buttonRect->bottom <= windowHeight;
-}
-
-static COLORREF BlendCaptionColor(COLORREF base, COLORREF overlay, int percent) {
-    int inverse = 100 - percent;
-    return RGB(
-        (GetRValue(base) * inverse + GetRValue(overlay) * percent) / 100,
-        (GetGValue(base) * inverse + GetGValue(overlay) * percent) / 100,
-        (GetBValue(base) * inverse + GetBValue(overlay) * percent) / 100);
-}
-
-static void EnableMainCaptionRefreshPainting(HWND hwnd) {
-    BOOL allowNonClientPaint = TRUE;
-    DwmSetWindowAttribute(hwnd, DWMWA_ALLOW_NCPAINT,
-                          &allowNonClientPaint, sizeof(allowNonClientPaint));
-}
-
-static void DrawMainCaptionRefreshButton(HWND hwnd) {
-    if (!hwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
-
-    RECT buttonRect;
-    if (!GetMainCaptionRefreshButtonRect(hwnd, &buttonRect)) return;
-
-    HDC windowDc = GetWindowDC(hwnd);
-    if (!windowDc) return;
-    int savedDc = SaveDC(windowDc);
-    IntersectClipRect(windowDc, buttonRect.left, buttonRect.top,
-                      buttonRect.right, buttonRect.bottom);
-
-    LONG buttonHeight = buttonRect.bottom - buttonRect.top;
-    COLORREF baseColor = GetPixel(
-        windowDc, buttonRect.right + 2,
-        buttonRect.top + (buttonHeight / 2));
-    if (baseColor == CLR_INVALID) {
-        baseColor = GetSysColor(
-            GetForegroundWindow() == hwnd ? COLOR_ACTIVECAPTION : COLOR_INACTIVECAPTION);
-    }
-
-    int luminance = (GetRValue(baseColor) * 299 +
-                     GetGValue(baseColor) * 587 +
-                     GetBValue(baseColor) * 114) / 1000;
-    COLORREF contrastColor = luminance >= 128 ? RGB(0, 0, 0) : RGB(255, 255, 255);
-    COLORREF buttonColor = baseColor;
-    if (g_captionRefreshHot) {
-        buttonColor = BlendCaptionColor(
-            baseColor, contrastColor, g_captionRefreshPressed ? 20 : 10);
-    }
-
-    HBRUSH background = CreateSolidBrush(buttonColor);
-    if (background) {
-        FillRect(windowDc, &buttonRect, background);
-        DeleteObject(background);
-    }
-
-    COLORREF glyphColor = contrastColor;
-    if (GetForegroundWindow() != hwnd) {
-        glyphColor = BlendCaptionColor(baseColor, contrastColor, 65);
-    }
-    SetBkMode(windowDc, TRANSPARENT);
-    SetTextColor(windowDc, glyphColor);
-
-    UINT dpi = GetWindowDpi(hwnd);
-    HFONT glyphFont = CreateFontW(
-        -MulDiv(15, (int)dpi, 96), 0, 0, 0, FW_NORMAL,
-        FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Symbol");
-    HFONT previousFont = glyphFont
-        ? (HFONT)SelectObject(windowDc, glyphFont)
-        : NULL;
-    RECT glyphRect = buttonRect;
-    DrawTextW(windowDc, L"\x21BB", -1, &glyphRect,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    if (previousFont) SelectObject(windowDc, previousFont);
-    if (glyphFont) DeleteObject(glyphFont);
-
-    if (savedDc) RestoreDC(windowDc, savedDc);
-    ReleaseDC(hwnd, windowDc);
-}
-
-static void RedrawMainCaptionRefreshButton(HWND hwnd) {
-    if (!hwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
-    RedrawWindow(hwnd, NULL, NULL,
-                 RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW | RDW_NOCHILDREN);
-}
-
-static BOOL IsPointInMainCaptionRefreshButton(HWND hwnd, POINT screenPoint) {
-    RECT buttonRect;
-    RECT windowRect;
-    if (!GetMainCaptionRefreshButtonRect(hwnd, &buttonRect) ||
-        !GetWindowRect(hwnd, &windowRect)) {
-        return FALSE;
-    }
-    POINT windowPoint = {
-        screenPoint.x - windowRect.left,
-        screenPoint.y - windowRect.top
-    };
-    return PtInRect(&buttonRect, windowPoint);
-}
-
-static void SetMainCaptionRefreshState(HWND hwnd, BOOL hot, BOOL pressed) {
-    if (g_captionRefreshHot == hot && g_captionRefreshPressed == pressed) return;
-    g_captionRefreshHot = hot;
-    g_captionRefreshPressed = pressed;
-    RedrawMainCaptionRefreshButton(hwnd);
-}
-
-static void TrackMainCaptionRefreshLeave(HWND hwnd) {
-    if (g_captionRefreshTracking) return;
-    TRACKMOUSEEVENT tracking = {0};
-    tracking.cbSize = sizeof(tracking);
-    tracking.dwFlags = TME_LEAVE | TME_NONCLIENT;
-    tracking.hwndTrack = hwnd;
-    if (TrackMouseEvent(&tracking)) g_captionRefreshTracking = TRUE;
-}
-
-static void RefreshCurrentPage(void) {
-    RebuildMainWebViewIfDead();
-    if (!g_webView) return;
-
-    ResumeMainWebViewRuntime();
-    HRESULT hr = g_webView->lpVtbl->Reload(g_webView);
-    if (FAILED(hr)) {
-        DebugPrint(L"[WARNING] Caption refresh failed. HRESULT: 0x%08X; navigating to target URL\n", hr);
-        ReloadTargetPage();
-    } else {
-        DebugPrint(L"[INFO] Refreshed current page from caption button\n");
-    }
 }
 
 // Config dialog WebView2 helpers
@@ -5394,147 +5178,15 @@ void ShowContextMenu(HWND hwnd) {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_CREATE:
-            EnableMainCaptionRefreshPainting(hwnd);
             CaptureDisplaySettings();
             CreateMainWebViewEnvironment(hwnd);
             return 0;
-
-        case WM_NCHITTEST: {
-            POINT screenPoint = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            if (IsPointInMainCaptionRefreshButton(hwnd, screenPoint)) {
-                return HT_CAPTION_REFRESH;
-            }
-            break;
-        }
-
-        case WM_NCPAINT: {
-            LRESULT result = DefWindowProcW(hwnd, uMsg, wParam, lParam);
-            DrawMainCaptionRefreshButton(hwnd);
-            return result;
-        }
-
-        case WM_NCACTIVATE:
-        case WM_SETTEXT: {
-            LRESULT result = DefWindowProcW(hwnd, uMsg, wParam, lParam);
-            DrawMainCaptionRefreshButton(hwnd);
-            return result;
-        }
-
-        case WM_DWMCOMPOSITIONCHANGED: {
-            LRESULT result = DefWindowProcW(hwnd, uMsg, wParam, lParam);
-            EnableMainCaptionRefreshPainting(hwnd);
-            RedrawMainCaptionRefreshButton(hwnd);
-            return result;
-        }
-
-        case WM_DWMCOLORIZATIONCOLORCHANGED:
-        case WM_THEMECHANGED:
-        case WM_ACTIVATE: {
-            LRESULT result = DefWindowProcW(hwnd, uMsg, wParam, lParam);
-            RedrawMainCaptionRefreshButton(hwnd);
-            return result;
-        }
-
-        case WM_NCMOUSEMOVE:
-            if (wParam == HT_CAPTION_REFRESH) {
-                TrackMainCaptionRefreshLeave(hwnd);
-                SetMainCaptionRefreshState(
-                    hwnd, TRUE, g_captionRefreshPressed);
-                return 0;
-            }
-            if (!g_captionRefreshPressed) {
-                SetMainCaptionRefreshState(hwnd, FALSE, FALSE);
-            }
-            break;
-
-        case WM_NCMOUSELEAVE:
-            g_captionRefreshTracking = FALSE;
-            if (!g_captionRefreshPressed) {
-                SetMainCaptionRefreshState(hwnd, FALSE, FALSE);
-            }
-            break;
-
-        case WM_NCLBUTTONDOWN:
-            if (wParam == HT_CAPTION_REFRESH) {
-                SetForegroundWindow(hwnd);
-                SetMainCaptionRefreshState(hwnd, TRUE, TRUE);
-                SetCapture(hwnd);
-                return 0;
-            }
-            break;
-
-        case WM_NCLBUTTONUP:
-            if (wParam == HT_CAPTION_REFRESH) {
-                POINT screenPoint = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-                BOOL activate = g_captionRefreshPressed &&
-                    IsPointInMainCaptionRefreshButton(hwnd, screenPoint);
-                SetMainCaptionRefreshState(hwnd, activate, FALSE);
-                if (GetCapture() == hwnd) ReleaseCapture();
-                if (activate) {
-                    TrackMainCaptionRefreshLeave(hwnd);
-                    RefreshCurrentPage();
-                }
-                return 0;
-            }
-            break;
-
-        case WM_NCLBUTTONDBLCLK:
-            if (wParam == HT_CAPTION_REFRESH) return 0;
-            break;
-
-        case WM_NCRBUTTONDOWN:
-        case WM_NCRBUTTONUP:
-            if (wParam == HT_CAPTION_REFRESH) return 0;
-            break;
-
-        case WM_SETCURSOR:
-            if (LOWORD(lParam) == HT_CAPTION_REFRESH) {
-                SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_ARROW));
-                return TRUE;
-            }
-            break;
-
-        case WM_MOUSEMOVE:
-            if (g_captionRefreshPressed && GetCapture() == hwnd) {
-                POINT screenPoint = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-                ClientToScreen(hwnd, &screenPoint);
-                SetMainCaptionRefreshState(
-                    hwnd,
-                    IsPointInMainCaptionRefreshButton(hwnd, screenPoint),
-                    TRUE);
-                return 0;
-            }
-            break;
-
-        case WM_LBUTTONUP:
-            if (g_captionRefreshPressed) {
-                POINT screenPoint = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-                ClientToScreen(hwnd, &screenPoint);
-                BOOL activate =
-                    IsPointInMainCaptionRefreshButton(hwnd, screenPoint);
-                SetMainCaptionRefreshState(hwnd, activate, FALSE);
-                if (GetCapture() == hwnd) ReleaseCapture();
-                if (activate) {
-                    TrackMainCaptionRefreshLeave(hwnd);
-                    RefreshCurrentPage();
-                }
-                return 0;
-            }
-            break;
-
-        case WM_CAPTURECHANGED:
-        case WM_CANCELMODE:
-            if (g_captionRefreshPressed) {
-                SetMainCaptionRefreshState(hwnd, FALSE, FALSE);
-            }
-            break;
             
         case WM_SIZE:
             if (wParam == SIZE_MINIMIZED) {
                 DeactivateMainWebView();
             } else if (IsWindowVisible(hwnd)) {
                 ActivateMainWebView();
-                RedrawMainCaptionRefreshButton(hwnd);
             }
             return 0;
             
@@ -5552,7 +5204,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                          suggested->right - suggested->left,
                          suggested->bottom - suggested->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
-            RedrawMainCaptionRefreshButton(hwnd);
             return 0;
         }
             
@@ -5725,10 +5376,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
             
         case WM_DESTROY:
-            if (GetCapture() == hwnd) ReleaseCapture();
-            g_captionRefreshHot = FALSE;
-            g_captionRefreshPressed = FALSE;
-            g_captionRefreshTracking = FALSE;
             KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
             KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
             KillTimer(hwnd, ID_TIMER_URL_RESET);
