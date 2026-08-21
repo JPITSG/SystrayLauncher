@@ -1,5 +1,12 @@
-import { useState } from "react";
-import { type ConfigData, saveSettings, closeDialog } from "./lib/bridge";
+import { useEffect, useState } from "react";
+import {
+  type ConfigData,
+  type UpdateResult,
+  saveSettings,
+  closeDialog,
+  checkForUpdate,
+  onUpdateResult,
+} from "./lib/bridge";
 import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
 import { Input } from "./components/ui/input";
@@ -153,6 +160,23 @@ export default function ConfigView({ config }: Props) {
   const [urlError, setUrlError] = useState("");
   const [insecureOriginsError, setInsecureOriginsError] = useState("");
   const [staticHostsError, setStaticHostsError] = useState("");
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateAlert, setUpdateAlert] = useState<UpdateResult | null>(null);
+
+  useEffect(
+    () =>
+      onUpdateResult((result) => {
+        setUpdateChecking(false);
+        setUpdateAlert(result);
+      }),
+    []
+  );
+
+  function handleUpdate() {
+    setUpdateAlert(null);
+    setUpdateChecking(true);
+    checkForUpdate();
+  }
 
   function handleSave() {
     const trimmedUrl = url.trim();
@@ -476,6 +500,15 @@ export default function ConfigView({ config }: Props) {
       </div>
 
       <div className="flex justify-end gap-2 pt-1">
+        <Button
+          variant="outline"
+          size="sm"
+          className="min-w-[5rem]"
+          disabled={updateChecking}
+          onClick={handleUpdate}
+        >
+          {updateChecking ? "Checking..." : "Update"}
+        </Button>
         <Button variant="outline" size="sm" className="min-w-[5rem]" onClick={closeDialog}>
           Cancel
         </Button>
@@ -483,6 +516,35 @@ export default function ConfigView({ config }: Props) {
           Save
         </Button>
       </div>
+
+      {updateAlert && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="update-alert-title"
+            aria-describedby="update-alert-message"
+            className="w-full max-w-sm space-y-3 rounded-lg border border-neutral-200 bg-white p-4 shadow-xl"
+          >
+            <div className="space-y-1">
+              <h2 id="update-alert-title" className="text-sm font-semibold">
+                {updateAlert.title}
+              </h2>
+              <p
+                id="update-alert-message"
+                className="text-xs leading-relaxed text-neutral-600"
+              >
+                {updateAlert.message}
+              </p>
+            </div>
+            <div className="flex justify-end">
+              <Button size="sm" autoFocus onClick={() => setUpdateAlert(null)}>
+                OK
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -18,9 +18,16 @@ export interface InitData {
   config: ConfigData;
 }
 
+export interface UpdateResult {
+  status: "latest" | "error";
+  title: string;
+  message: string;
+}
+
 type InitCallback = (data: InitData) => void;
 
 let initCallback: InitCallback | null = null;
+let updateResultCallback: ((result: UpdateResult) => void) | null = null;
 
 export function onInit(cb: InitCallback) {
   initCallback = cb;
@@ -30,6 +37,19 @@ export function onInit(cb: InitCallback) {
 (window as unknown as Record<string, unknown>).onInit = (data: InitData) => {
   if (initCallback) initCallback(data);
 };
+
+(window as unknown as Record<string, unknown>).onUpdateResult = (
+  result: UpdateResult
+) => {
+  if (updateResultCallback) updateResultCallback(result);
+};
+
+export function onUpdateResult(cb: (result: UpdateResult) => void) {
+  updateResultCallback = cb;
+  return () => {
+    if (updateResultCallback === cb) updateResultCallback = null;
+  };
+}
 
 export function getInit() {
   window.chrome.webview.postMessage(JSON.stringify({ action: "getInit" }));
@@ -58,6 +78,10 @@ export function saveSettings(config: ConfigData) {
 
 export function closeDialog() {
   window.chrome.webview.postMessage(JSON.stringify({ action: "close" }));
+}
+
+export function checkForUpdate() {
+  window.chrome.webview.postMessage(JSON.stringify({ action: "checkUpdate" }));
 }
 
 export function reportHeight(height: number) {

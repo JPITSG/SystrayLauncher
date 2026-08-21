@@ -11,6 +11,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 - **External Link Handling** - Optionally open new windows/tabs (`target="_blank"`, `window.open`) in the system default browser instead of a WebView2 popup
 - **Static Host Mappings** - Optionally resolve listed hostnames to configured IP addresses inside the embedded browser without changing system DNS
 - **Optional Mixed Content** - Explicitly allow an HTTPS page to load HTTP content from configured legacy origins
+- **Self Update** - Check for the current repository build from the configuration dialog, then replace and restart the launcher when its executable size differs
 - **Lockdown Header** - Optionally stamp every request with a rolling, hour-keyed `X-Lockdown` token a gateway can require as an extra access layer
 - **Preloaded on Startup** - The page is loaded into the WebView at launch so it is ready the moment you open the window
 - **Hide Grace Period** - Re-opening within 60 seconds of hiding returns exactly where you left off; after that the page resets to the configured URL in the background, so the next open starts fresh with no visible reload
@@ -47,6 +48,14 @@ Settings available in the Configure dialog:
 | Open new windows in the default browser | When enabled, links that would open a new window or tab launch in the system default browser instead of a WebView2 popup. Only `http(s)` links are handed to the browser. Popups that must script back to the opening page (some login flows) may not work while enabled. Disabled by default. |
 | Sleep web container when inactive | When enabled, suspends the WebView to save CPU while the window is hidden, and pre-emptively wakes it on tray-icon hover. The page is always preloaded at startup regardless of this setting. Disabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (recovery attempts, web view rebuilds, power transitions) to `%LOCALAPPDATA%\SystrayLauncher\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
+
+The **Update** button compares the running executable's size with the
+repository's [`release/SystrayLauncher.exe`](release/SystrayLauncher.exe). If
+the sizes differ, it downloads that build to the user's temporary directory,
+requests standard Windows UAC approval for the replacement step, safely
+replaces the current executable, and restarts the launcher. Cancelling the UAC
+prompt leaves the current version running. A matching size produces an
+in-dialog notification that the latest version is already installed.
 
 ## Static Host Mappings
 
