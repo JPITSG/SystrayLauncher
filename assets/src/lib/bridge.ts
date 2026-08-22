@@ -19,17 +19,22 @@ export interface InitData {
 }
 
 export interface UpdateResult {
-  status: "newer" | "same" | "older" | "error";
+  status: "newer" | "same" | "older" | "cancelled" | "error";
   title: string;
   message: string;
   currentVersion: string;
   remoteVersion: string;
 }
 
+export interface UpdateProgress {
+  kilobytesPerSecond: number;
+}
+
 type InitCallback = (data: InitData) => void;
 
 let initCallback: InitCallback | null = null;
 let updateResultCallback: ((result: UpdateResult) => void) | null = null;
+let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
 
 export function onInit(cb: InitCallback) {
   initCallback = cb;
@@ -46,10 +51,23 @@ export function onInit(cb: InitCallback) {
   if (updateResultCallback) updateResultCallback(result);
 };
 
+(window as unknown as Record<string, unknown>).onUpdateProgress = (
+  progress: UpdateProgress
+) => {
+  if (updateProgressCallback) updateProgressCallback(progress);
+};
+
 export function onUpdateResult(cb: (result: UpdateResult) => void) {
   updateResultCallback = cb;
   return () => {
     if (updateResultCallback === cb) updateResultCallback = null;
+  };
+}
+
+export function onUpdateProgress(cb: (progress: UpdateProgress) => void) {
+  updateProgressCallback = cb;
+  return () => {
+    if (updateProgressCallback === cb) updateProgressCallback = null;
   };
 }
 
@@ -84,6 +102,12 @@ export function closeDialog() {
 
 export function checkForUpdate() {
   window.chrome.webview.postMessage(JSON.stringify({ action: "checkUpdate" }));
+}
+
+export function cancelUpdateCheck() {
+  window.chrome.webview.postMessage(
+    JSON.stringify({ action: "cancelUpdateCheck" })
+  );
 }
 
 export function installUpdate() {

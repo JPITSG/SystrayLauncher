@@ -53,6 +53,7 @@
 #define TRAY_ICON_ID 100
 #define WM_TRAYICON (WM_APP + 1)
 #define WM_APP_UPDATE_RESULT (WM_APP + 3)
+#define WM_APP_UPDATE_PROGRESS (WM_APP + 4)
 #define ID_TRAY_MENU_REFRESH 1
 #define ID_TRAY_MENU_CLEAR_CACHE 2
 #define ID_TRAY_MENU_OPEN 3
@@ -62,6 +63,7 @@
 
 #define UPDATE_URL L"https://github.com/JPITSG/SystrayLauncher/raw/refs/heads/main/release/SystrayLauncher.exe"
 #define UPDATE_MAX_BYTES (100ULL * 1024ULL * 1024ULL)
+#define UPDATE_PROGRESS_INTERVAL_MS 250
 #define UPDATE_HELPER_READY_MS 10000
 #define UPDATE_HELPER_WAIT_MS 120000
 
@@ -242,6 +244,9 @@ static int g_cfgShowFallbackTries = 0;
 static volatile LONG g_updateCheckPending = FALSE;
 static BOOL g_updateInstallReady = FALSE;
 static volatile LONG g_updateRequestSequence = 0;
+static HANDLE g_updateCancelEvent = NULL;
+static volatile LONG g_updateSpeedKbps = 0;
+static volatile LONG g_updateProgressPosted = FALSE;
 
 typedef struct {
     WORD major;
@@ -254,6 +259,7 @@ typedef enum {
     UPDATE_CHECK_SAME = 1,
     UPDATE_CHECK_NEWER,
     UPDATE_CHECK_OLDER,
+    UPDATE_CHECK_CANCELLED,
     UPDATE_CHECK_ERROR
 } UpdateCheckKind;
 
@@ -303,6 +309,7 @@ static void SendMainWebViewLivenessPing(void);
 static void CheckMainWebViewLiveness(HWND hwnd);
 static void RestartApplication(void);
 static void StartUpdateCheck(void);
+static void CancelUpdateCheck(void);
 static void InstallPreparedUpdate(void);
 static void DiscardPreparedUpdate(void);
 static void RegisterBrowserExitedOnCurrentEnv(void);
@@ -1039,6 +1046,29 @@ static void SetUpdateTaskError(UpdateCheckTask* task, LPCWSTR message,
     }
 }
 
+static BOOL CancelUpdateTaskIfRequested(UpdateCheckTask* task) {
+    if (!task || !g_updateCancelEvent ||
+        WaitForSingleObject(g_updateCancelEvent, 0) != WAIT_OBJECT_0) {
+        return FALSE;
+    }
+    task->kind = UPDATE_CHECK_CANCELLED;
+    task->message[0] = L'\0';
+    return TRUE;
+}
+
+static void PublishUpdateProgress(UpdateCheckTask* task, DWORD speedKbps) {
+    if (!task || CancelUpdateTaskIfRequested(task) ||
+        task->targetWindow != g_cfgHwnd || !IsWindow(task->targetWindow)) {
+        return;
+    }
+
+    InterlockedExchange(&g_updateSpeedKbps, (LONG)speedKbps);
+    if (InterlockedCompareExchange(&g_updateProgressPosted, TRUE, FALSE) == FALSE &&
+        !PostMessageW(task->targetWindow, WM_APP_UPDATE_PROGRESS, 0, 0)) {
+        InterlockedExchange(&g_updateProgressPosted, FALSE);
+    }
+}
+
 static BOOL OpenUpdateHttpRequest(LPCWSTR verb, ULONGLONG cacheBuster,
                                   UpdateHttpRequest* http, DWORD* statusCode) {
     if (!verb || !http) return FALSE;
@@ -1256,10 +1286,13 @@ static BOOL DeleteUpdateTempFile(LPCWSTR path) {
 }
 
 static BOOL QueryRemoteUpdateSize(UpdateCheckTask* task, ULONGLONG* size) {
+    if (CancelUpdateTaskIfRequested(task)) return FALSE;
+
     UpdateHttpRequest http;
     DWORD status = 0;
     if (!OpenUpdateHttpRequest(L"HEAD", task->cacheBuster, &http, &status)) {
         DWORD errorCode = GetLastError();
+        if (CancelUpdateTaskIfRequested(task)) return FALSE;
         if (status) {
             swprintf_s(task->message, sizeof(task->message) / sizeof(wchar_t),
                        L"The update server returned HTTP status %lu.",
@@ -1270,10 +1303,15 @@ static BOOL QueryRemoteUpdateSize(UpdateCheckTask* task, ULONGLONG* size) {
         }
         return FALSE;
     }
+    if (CancelUpdateTaskIfRequested(task)) {
+        CloseUpdateHttpRequest(&http);
+        return FALSE;
+    }
 
     BOOL ok = QueryUpdateContentLength(http.request, size);
     DWORD errorCode = ok ? ERROR_SUCCESS : GetLastError();
     CloseUpdateHttpRequest(&http);
+    if (CancelUpdateTaskIfRequested(task)) return FALSE;
     if (!ok) {
         SetUpdateTaskError(task, L"The update server did not report a valid file size",
                            errorCode);
@@ -1287,10 +1325,13 @@ static BOOL QueryRemoteUpdateSize(UpdateCheckTask* task, ULONGLONG* size) {
 }
 
 static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
+    if (CancelUpdateTaskIfRequested(task)) return FALSE;
+
     UpdateHttpRequest http;
     DWORD status = 0;
     if (!OpenUpdateHttpRequest(L"GET", task->cacheBuster, &http, &status)) {
         DWORD errorCode = GetLastError();
+        if (CancelUpdateTaskIfRequested(task)) return FALSE;
         if (status) {
             swprintf_s(task->message, sizeof(task->message) / sizeof(wchar_t),
                        L"The update download returned HTTP status %lu.",
@@ -1301,6 +1342,10 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
         }
         return FALSE;
     }
+    if (CancelUpdateTaskIfRequested(task)) {
+        CloseUpdateHttpRequest(&http);
+        return FALSE;
+    }
 
     ULONGLONG downloadSize = 0;
     if (QueryUpdateContentLength(http.request, &downloadSize) &&
@@ -1308,6 +1353,10 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
         CloseUpdateHttpRequest(&http);
         SetUpdateTaskError(task,
             L"The available update changed while it was being downloaded. Try again", 0);
+        return FALSE;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
+        CloseUpdateHttpRequest(&http);
         return FALSE;
     }
 
@@ -1323,11 +1372,25 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
 
     BOOL ok = TRUE;
     ULONGLONG totalWritten = 0;
+    ULONGLONG speedWindowBytes = 0;
+    ULONGLONG speedWindowStarted = GetTickCount64();
     BYTE buffer[64 * 1024];
     while (ok) {
+        if (CancelUpdateTaskIfRequested(task)) {
+            ok = FALSE;
+            break;
+        }
+
         DWORD bytesRead = 0;
         if (!WinHttpReadData(http.request, buffer, sizeof(buffer), &bytesRead)) {
-            SetUpdateTaskError(task, L"The update download was interrupted", GetLastError());
+            DWORD errorCode = GetLastError();
+            if (!CancelUpdateTaskIfRequested(task)) {
+                SetUpdateTaskError(task, L"The update download was interrupted", errorCode);
+            }
+            ok = FALSE;
+            break;
+        }
+        if (CancelUpdateTaskIfRequested(task)) {
             ok = FALSE;
             break;
         }
@@ -1351,8 +1414,22 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
             break;
         }
         totalWritten += bytesWritten;
+        speedWindowBytes += bytesWritten;
+
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG elapsed = now - speedWindowStarted;
+        if (elapsed >= UPDATE_PROGRESS_INTERVAL_MS) {
+            ULONGLONG speed = (speedWindowBytes * 1000ULL) /
+                              (elapsed * 1024ULL);
+            if (speed == 0 && speedWindowBytes > 0) speed = 1;
+            if (speed > MAXLONG) speed = MAXLONG;
+            PublishUpdateProgress(task, (DWORD)speed);
+            speedWindowBytes = 0;
+            speedWindowStarted = now;
+        }
     }
 
+    if (ok && CancelUpdateTaskIfRequested(task)) ok = FALSE;
     if (ok && totalWritten != expectedSize) {
         SetUpdateTaskError(task, L"The downloaded update is incomplete", 0);
         ok = FALSE;
@@ -1364,6 +1441,7 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
     CloseHandle(file);
     CloseUpdateHttpRequest(&http);
 
+    if (ok && CancelUpdateTaskIfRequested(task)) ok = FALSE;
     DWORD binaryType = 0;
     if (ok && (!GetBinaryTypeW(task->stagedPath, &binaryType) ||
                binaryType != SCS_64BIT_BINARY)) {
@@ -1383,6 +1461,7 @@ static void DiscardUpdateTask(UpdateCheckTask* task) {
 }
 
 static void PublishUpdateTask(UpdateCheckTask* task) {
+    CancelUpdateTaskIfRequested(task);
     InterlockedExchange(&g_updateCheckPending, FALSE);
     if (!task || task->targetWindow != g_cfgHwnd ||
         !IsWindow(task->targetWindow)) {
@@ -1402,6 +1481,11 @@ static void PublishUpdateTask(UpdateCheckTask* task) {
 
 static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
     UpdateCheckTask* task = (UpdateCheckTask*)parameter;
+    if (CancelUpdateTaskIfRequested(task)) {
+        PublishUpdateTask(task);
+        return 0;
+    }
+
     DWORD pathLength = GetModuleFileNameW(NULL, task->targetPath,
                                          sizeof(task->targetPath) / sizeof(wchar_t));
     if (pathLength == 0 || pathLength >= sizeof(task->targetPath) / sizeof(wchar_t)) {
@@ -1414,6 +1498,10 @@ static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
     if (!GetExecutableVersion(task->targetPath, &task->runningVersion)) {
         SetUpdateTaskError(task, L"Could not read the running application version",
                            GetLastError());
+        PublishUpdateTask(task);
+        return 0;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
         PublishUpdateTask(task);
         return 0;
     }
@@ -1430,8 +1518,16 @@ static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
         PublishUpdateTask(task);
         return 0;
     }
+    if (CancelUpdateTaskIfRequested(task)) {
+        PublishUpdateTask(task);
+        return 0;
+    }
 
     if (!DownloadUpdateFile(task, remoteSize)) {
+        PublishUpdateTask(task);
+        return 0;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
         PublishUpdateTask(task);
         return 0;
     }
@@ -1440,6 +1536,10 @@ static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
         SetUpdateTaskError(task,
             L"The downloaded application does not contain valid version information",
             GetLastError());
+        PublishUpdateTask(task);
+        return 0;
+    }
+    if (CancelUpdateTaskIfRequested(task)) {
         PublishUpdateTask(task);
         return 0;
     }
@@ -1954,6 +2054,14 @@ static void CfgSendUpdateResult(LPCWSTR status, LPCWSTR title, LPCWSTR message) 
     CfgSendUpdateResultWithVersions(status, title, message, L"", L"");
 }
 
+static void CfgSendUpdateProgress(DWORD speedKbps) {
+    wchar_t script[160];
+    int written = swprintf_s(script, sizeof(script) / sizeof(wchar_t),
+        L"window.onUpdateProgress({\"kilobytesPerSecond\":%lu})",
+        (unsigned long)speedKbps);
+    if (written > 0) webview_cfg_execute_script(script);
+}
+
 static void StartUpdateCheck(void) {
     if (!g_cfgHwnd) return;
     if (InterlockedCompareExchange(&g_updateCheckPending, TRUE, FALSE) != FALSE) {
@@ -1965,6 +2073,23 @@ static void StartUpdateCheck(void) {
     // A click always starts from scratch. Do not reuse a previously staged
     // candidate or its version result after the user asks to check again.
     DiscardPreparedUpdate();
+
+    if (!g_updateCancelEvent) {
+        g_updateCancelEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!g_updateCancelEvent) {
+            DWORD errorCode = GetLastError();
+            InterlockedExchange(&g_updateCheckPending, FALSE);
+            wchar_t message[256];
+            swprintf_s(message, sizeof(message) / sizeof(wchar_t),
+                L"Could not initialize update cancellation (Windows error %lu).",
+                (unsigned long)errorCode);
+            CfgSendUpdateResult(L"error", L"Update failed", message);
+            return;
+        }
+    }
+    ResetEvent(g_updateCancelEvent);
+    InterlockedExchange(&g_updateSpeedKbps, 0);
+    InterlockedExchange(&g_updateProgressPosted, FALSE);
 
     UpdateCheckTask* task = (UpdateCheckTask*)calloc(1, sizeof(UpdateCheckTask));
     if (!task) {
@@ -1992,6 +2117,14 @@ static void StartUpdateCheck(void) {
         return;
     }
     CloseHandle(thread);
+}
+
+static void CancelUpdateCheck(void) {
+    if (InterlockedCompareExchange(&g_updateCheckPending, FALSE, FALSE) == TRUE &&
+        g_updateCancelEvent) {
+        DebugPrint(L"[INFO] Update check cancellation requested\n");
+        SetEvent(g_updateCancelEvent);
+    }
 }
 
 static HANDLE CreateUpdateReadyEvent(DWORD processId, wchar_t* eventName,
@@ -2397,6 +2530,8 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         webview_push_init_config();
     } else if (strcmp(action, "checkUpdate") == 0) {
         StartUpdateCheck();
+    } else if (strcmp(action, "cancelUpdateCheck") == 0) {
+        CancelUpdateCheck();
     } else if (strcmp(action, "installUpdate") == 0) {
         InstallPreparedUpdate();
     } else if (strcmp(action, "dismissUpdate") == 0) {
@@ -2538,10 +2673,29 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
 // Config dialog window procedure
 static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_APP_UPDATE_PROGRESS:
+            InterlockedExchange(&g_updateProgressPosted, FALSE);
+            if (InterlockedCompareExchange(&g_updateCheckPending,
+                                           FALSE, FALSE) == TRUE) {
+                DWORD speedKbps = (DWORD)InterlockedCompareExchange(
+                    &g_updateSpeedKbps, 0, 0);
+                CfgSendUpdateProgress(speedKbps);
+            }
+            return 0;
+
         case WM_APP_UPDATE_RESULT: {
+            InterlockedExchange(&g_updateProgressPosted, FALSE);
+            InterlockedExchange(&g_updateSpeedKbps, 0);
             UpdateCheckTask* task = (UpdateCheckTask*)InterlockedExchangePointer(
                 (PVOID volatile*)&g_updatePostedResult, NULL);
             if (!task) return 0;
+
+            if (task->kind == UPDATE_CHECK_CANCELLED) {
+                DebugPrint(L"[INFO] Update check cancelled\n");
+                CfgSendUpdateResult(L"cancelled", L"", L"");
+                DiscardUpdateTask(task);
+                return 0;
+            }
 
             if (task->kind == UPDATE_CHECK_ERROR) {
                 DebugPrint(L"[WARNING] Update check failed: %s\n", task->message);
@@ -2646,6 +2800,7 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return 0;
 
         case WM_DESTROY:
+            if (g_updateCancelEvent) SetEvent(g_updateCancelEvent);
             DiscardUpdateTask((UpdateCheckTask*)InterlockedExchangePointer(
                 (PVOID volatile*)&g_updatePostedResult, NULL));
             DiscardPreparedUpdate();

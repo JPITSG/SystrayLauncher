@@ -53,13 +53,15 @@ Settings available in the Configure dialog:
 Each click of the **Update** button makes a fresh request for the repository's
 [`release/SystrayLauncher.exe`](release/SystrayLauncher.exe), downloads it to
 the user's temporary directory, and compares its embedded Windows file version
-with the running executable's version. The result dialog displays both version
-numbers. A newer build can be installed normally, while a matching build offers
-a **Force update** action to reinstall it; an older repository build is never
+with the running executable's version. While downloading, the button displays
+the current transfer speed and can be clicked again to stop the check and
+remove the partial download. The result dialog displays both version numbers.
+A newer build can be installed normally, while a matching build offers a
+**Force update** action to reinstall it; an older repository build is never
 installed. Installation requests standard Windows UAC approval, safely
-replaces the current executable, and restarts the launcher. Cancelling either
-the dialog or UAC prompt leaves the current version running. File size is used
-only to validate the download and enforce its safety limit.
+replaces the current executable, and restarts the launcher. Cancelling the
+download, result dialog, or UAC prompt leaves the current version running. File
+size is used only to validate the download and enforce its safety limit.
 
 ## Static Host Mappings
 

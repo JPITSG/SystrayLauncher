@@ -5,9 +5,11 @@ import {
   saveSettings,
   closeDialog,
   checkForUpdate,
+  cancelUpdateCheck,
   installUpdate,
   dismissUpdate,
   onUpdateResult,
+  onUpdateProgress,
 } from "./lib/bridge";
 import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
@@ -163,25 +165,43 @@ export default function ConfigView({ config }: Props) {
   const [insecureOriginsError, setInsecureOriginsError] = useState("");
   const [staticHostsError, setStaticHostsError] = useState("");
   const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateCancelling, setUpdateCancelling] = useState(false);
+  const [updateSpeedKbps, setUpdateSpeedKbps] = useState<number | null>(null);
   const [updateAlert, setUpdateAlert] = useState<UpdateResult | null>(null);
 
-  useEffect(
-    () =>
-      onUpdateResult((result) => {
-        setUpdateChecking(false);
-        setUpdateAlert(result);
-      }),
-    []
-  );
+  useEffect(() => {
+    const removeResultListener = onUpdateResult((result) => {
+      setUpdateChecking(false);
+      setUpdateCancelling(false);
+      setUpdateSpeedKbps(null);
+      setUpdateAlert(result.status === "cancelled" ? null : result);
+    });
+    const removeProgressListener = onUpdateProgress((progress) => {
+      setUpdateSpeedKbps(Math.max(0, Math.round(progress.kilobytesPerSecond)));
+    });
+    return () => {
+      removeResultListener();
+      removeProgressListener();
+    };
+  }, []);
 
   function handleUpdate() {
+    if (updateChecking) {
+      setUpdateCancelling(true);
+      cancelUpdateCheck();
+      return;
+    }
     setUpdateAlert(null);
     setUpdateChecking(true);
+    setUpdateCancelling(false);
+    setUpdateSpeedKbps(null);
     checkForUpdate();
   }
 
   function handleInstallUpdate() {
     setUpdateChecking(true);
+    setUpdateCancelling(false);
+    setUpdateSpeedKbps(null);
     installUpdate();
   }
 
@@ -517,13 +537,25 @@ export default function ConfigView({ config }: Props) {
         </span>
         <div className="flex items-center gap-2">
           <Button
-            variant="outline"
+            variant={updateChecking ? "destructive" : "outline"}
             size="sm"
             className="min-w-[5rem]"
-            disabled={updateChecking}
+            disabled={updateCancelling}
+            aria-label={
+              updateChecking ? "Stop update check and download" : undefined
+            }
+            title={
+              updateChecking ? "Stop update check and download" : undefined
+            }
             onClick={handleUpdate}
           >
-            {updateChecking ? "Checking..." : "Update"}
+            {updateCancelling
+              ? "Stopping..."
+              : updateChecking
+                ? updateSpeedKbps === null
+                  ? "Checking..."
+                  : `Checking (${updateSpeedKbps.toLocaleString()} KB/s)...`
+                : "Update"}
           </Button>
           <Button
             variant="outline"
