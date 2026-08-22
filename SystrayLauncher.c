@@ -23,6 +23,7 @@
 #include <dwmapi.h>
 #include <bcrypt.h>
 #include <winhttp.h>
+#include <winver.h>
 #include <math.h>
 
 #ifndef DWMWA_CLOAKED
@@ -986,6 +987,13 @@ typedef struct {
     HINTERNET request;
 } UpdateHttpRequest;
 
+typedef struct {
+    WORD major;
+    WORD minor;
+    WORD patch;
+    WORD build;
+} ExecutableVersion;
+
 static void CloseUpdateHttpRequest(UpdateHttpRequest* http) {
     if (!http) return;
     if (http->request) WinHttpCloseHandle(http->request);
@@ -1103,15 +1111,64 @@ static BOOL QueryUpdateContentLength(HINTERNET request, ULONGLONG* size) {
     return TRUE;
 }
 
-static BOOL GetUpdateLocalFileSize(LPCWSTR path, ULONGLONG* size) {
-    WIN32_FILE_ATTRIBUTE_DATA attributes;
-    if (!path || !size ||
-        !GetFileAttributesExW(path, GetFileExInfoStandard, &attributes)) {
+static BOOL GetExecutableVersion(LPCWSTR path, ExecutableVersion* version) {
+    if (!path || !*path || !version) {
+        SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    *size = ((ULONGLONG)attributes.nFileSizeHigh << 32) |
-            attributes.nFileSizeLow;
+
+    DWORD ignored = 0;
+    DWORD infoSize = GetFileVersionInfoSizeW(path, &ignored);
+    if (infoSize == 0) {
+        DWORD errorCode = GetLastError();
+        SetLastError(errorCode ? errorCode : ERROR_RESOURCE_DATA_NOT_FOUND);
+        return FALSE;
+    }
+
+    BYTE* infoData = (BYTE*)malloc(infoSize);
+    if (!infoData) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    if (!GetFileVersionInfoW(path, 0, infoSize, infoData)) {
+        DWORD errorCode = GetLastError();
+        free(infoData);
+        SetLastError(errorCode ? errorCode : ERROR_INVALID_DATA);
+        return FALSE;
+    }
+
+    VS_FIXEDFILEINFO* fixedInfo = NULL;
+    UINT fixedInfoSize = 0;
+    if (!VerQueryValueW(infoData, L"\\", (LPVOID*)&fixedInfo, &fixedInfoSize) ||
+        !fixedInfo || fixedInfoSize < sizeof(*fixedInfo) ||
+        fixedInfo->dwSignature != VS_FFI_SIGNATURE) {
+        free(infoData);
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
+
+    version->major = HIWORD(fixedInfo->dwFileVersionMS);
+    version->minor = LOWORD(fixedInfo->dwFileVersionMS);
+    version->patch = HIWORD(fixedInfo->dwFileVersionLS);
+    version->build = LOWORD(fixedInfo->dwFileVersionLS);
+    free(infoData);
     return TRUE;
+}
+
+static int CompareExecutableVersions(const ExecutableVersion* left,
+                                     const ExecutableVersion* right) {
+    const WORD leftParts[] = {
+        left->major, left->minor, left->patch, left->build
+    };
+    const WORD rightParts[] = {
+        right->major, right->minor, right->patch, right->build
+    };
+    for (size_t index = 0; index < sizeof(leftParts) / sizeof(leftParts[0]); index++) {
+        if (leftParts[index] < rightParts[index]) return -1;
+        if (leftParts[index] > rightParts[index]) return 1;
+    }
+    return 0;
 }
 
 static BOOL BuildUpdateTempPath(wchar_t path[MAX_PATH], LPCWSTR role,
@@ -1268,7 +1325,7 @@ static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
 
 static void DiscardUpdateTask(UpdateCheckTask* task) {
     if (!task) return;
-    if (task->kind == UPDATE_CHECK_DOWNLOAD_READY && task->stagedPath[0]) {
+    if (task->stagedPath[0]) {
         DeleteUpdateTempFile(task->stagedPath);
     }
     free(task);
@@ -1303,9 +1360,9 @@ static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
         return 0;
     }
 
-    ULONGLONG localSize = 0;
-    if (!GetUpdateLocalFileSize(task->targetPath, &localSize)) {
-        SetUpdateTaskError(task, L"Could not read the running executable size",
+    ExecutableVersion runningVersion;
+    if (!GetExecutableVersion(task->targetPath, &runningVersion)) {
+        SetUpdateTaskError(task, L"Could not read the running application version",
                            GetLastError());
         PublishUpdateTask(task);
         return 0;
@@ -1316,12 +1373,6 @@ static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
         PublishUpdateTask(task);
         return 0;
     }
-    if (localSize == remoteSize) {
-        task->kind = UPDATE_CHECK_LATEST;
-        PublishUpdateTask(task);
-        return 0;
-    }
-
     if (!BuildUpdateTempPath(task->stagedPath, L"download",
                              GetCurrentProcessId())) {
         SetUpdateTaskError(task, L"Could not create the temporary update path",
@@ -1334,6 +1385,27 @@ static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
         PublishUpdateTask(task);
         return 0;
     }
+
+    ExecutableVersion availableVersion;
+    if (!GetExecutableVersion(task->stagedPath, &availableVersion)) {
+        SetUpdateTaskError(task,
+            L"The downloaded application does not contain valid version information",
+            GetLastError());
+        PublishUpdateTask(task);
+        return 0;
+    }
+
+    DebugPrint(L"[INFO] Update versions: running %u.%u.%u.%u, available %u.%u.%u.%u\n",
+               runningVersion.major, runningVersion.minor,
+               runningVersion.patch, runningVersion.build,
+               availableVersion.major, availableVersion.minor,
+               availableVersion.patch, availableVersion.build);
+    if (CompareExecutableVersions(&availableVersion, &runningVersion) <= 0) {
+        task->kind = UPDATE_CHECK_LATEST;
+        PublishUpdateTask(task);
+        return 0;
+    }
+
     task->kind = UPDATE_CHECK_DOWNLOAD_READY;
     PublishUpdateTask(task);
     return 0;
