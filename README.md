@@ -25,6 +25,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 
 Right-click the tray icon to access:
 
+- **SystrayLauncher Version** - Displays the current application version
 - **WebView2 Version** - Displays the current WebView2 runtime version
 - **Refresh** - Reloads the page and brings window to foreground
 - **Refresh + Clear Cache** - Clears browser cache and reloads

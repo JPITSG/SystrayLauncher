@@ -37,6 +37,7 @@
 // WebView2 headers required from SDK
 #include "WebView2.h"
 #include "resource.h"
+#include "version.h"
 
 // The C++ helper in the bundled 1.0.3650.58 SDK initializes the required
 // target-version property to CORE_WEBVIEW_TARGET_PRODUCT_VERSION. Keep its
@@ -5149,11 +5150,14 @@ void ShowContextMenu(HWND hwnd) {
     POINT pt;
     GetCursorPos(&pt);
 
-    // Build version string for menu
+    // Build version strings for menu
+    wchar_t appVersionLabel[160];
     wchar_t versionLabel[160];
+    swprintf_s(appVersionLabel, 160, L"%s %s", APP_NAME, APP_VERSION_WSTRING);
     swprintf_s(versionLabel, 160, L"WebView2: %s", g_webView2Version);
 
     HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, appVersionLabel);
     AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, versionLabel);
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_REFRESH, L"Refresh");

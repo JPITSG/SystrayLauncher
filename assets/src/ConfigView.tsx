@@ -499,22 +499,32 @@ export default function ConfigView({ config }: Props) {
         </div>
       </div>
 
-      <div className="flex justify-end gap-2 pt-1">
-        <Button
-          variant="outline"
-          size="sm"
-          className="min-w-[5rem]"
-          disabled={updateChecking}
-          onClick={handleUpdate}
-        >
-          {updateChecking ? "Checking..." : "Update"}
-        </Button>
-        <Button variant="outline" size="sm" className="min-w-[5rem]" onClick={closeDialog}>
-          Cancel
-        </Button>
-        <Button size="sm" className="min-w-[5rem]" onClick={handleSave}>
-          Save
-        </Button>
+      <div className="flex items-center justify-between gap-3 pt-1">
+        <span className="select-none text-[11px] leading-none tabular-nums text-neutral-400">
+          v{__APP_VERSION__}
+        </span>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            className="min-w-[5rem]"
+            disabled={updateChecking}
+            onClick={handleUpdate}
+          >
+            {updateChecking ? "Checking..." : "Update"}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="min-w-[5rem]"
+            onClick={closeDialog}
+          >
+            Cancel
+          </Button>
+          <Button size="sm" className="min-w-[5rem]" onClick={handleSave}>
+            Save
+          </Button>
+        </div>
       </div>
 
       {updateAlert && (

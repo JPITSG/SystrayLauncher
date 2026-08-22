@@ -8,6 +8,10 @@ RELEASE_DIR = release
 TARGET = $(RELEASE_DIR)/SystrayLauncher.exe
 SOURCES = SystrayLauncher.c
 RESOURCES = resource.rc
+FRONTEND_SOURCES = $(shell find assets/src -type f) \
+	assets/index.html assets/package.json assets/package-lock.json \
+	assets/vite.config.ts assets/tsconfig.json assets/postcss.config.js \
+	assets/tailwind.config.ts
 
 OBJ = main.o resource.o
 
@@ -33,16 +37,16 @@ $(TARGET): $(OBJ) | $(RELEASE_DIR)
 $(RELEASE_DIR):
 	@mkdir -p $(RELEASE_DIR)
 
-main.o: $(SOURCES)
+main.o: $(SOURCES) resource.h version.h
 	@echo "Compiling $(SOURCES)..."
 	$(CC) -c $< -o $@ $(CFLAGS)
 
-resource.o: $(RESOURCES) resource.h SystrayLauncher.manifest assets/icon.ico assets/dist/index.html assets/WebView2Loader.dll
+resource.o: $(RESOURCES) resource.h version.h SystrayLauncher.manifest assets/icon.ico assets/dist/index.html assets/WebView2Loader.dll
 	@echo "Compiling resources..."
 	$(WINDRES) $< -o $@
 
 # Build frontend assets
-assets/dist/index.html: $(wildcard assets/src/**/*.tsx assets/src/**/*.ts assets/src/**/*.css assets/index.html)
+assets/dist/index.html: $(FRONTEND_SOURCES)
 	@echo "Building frontend assets..."
 	cd assets && npm install && npm run build
 
