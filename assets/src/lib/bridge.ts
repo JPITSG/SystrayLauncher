@@ -19,9 +19,11 @@ export interface InitData {
 }
 
 export interface UpdateResult {
-  status: "latest" | "error";
+  status: "newer" | "same" | "older" | "error";
   title: string;
   message: string;
+  currentVersion: string;
+  remoteVersion: string;
 }
 
 type InitCallback = (data: InitData) => void;
@@ -82,6 +84,18 @@ export function closeDialog() {
 
 export function checkForUpdate() {
   window.chrome.webview.postMessage(JSON.stringify({ action: "checkUpdate" }));
+}
+
+export function installUpdate() {
+  window.chrome.webview.postMessage(
+    JSON.stringify({ action: "installUpdate" })
+  );
+}
+
+export function dismissUpdate() {
+  window.chrome.webview.postMessage(
+    JSON.stringify({ action: "dismissUpdate" })
+  );
 }
 
 export function reportHeight(height: number) {

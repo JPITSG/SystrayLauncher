@@ -120,6 +120,13 @@
 #define POWER_RESUME_KICK_RETRY_MS 4000
 #define POWER_RESUME_MAX_KICKS 3
 
+// Backstop for the title's "Loading..." suffix. A navigation's completion
+// event can be lost outright (runtime wedged after hibernate, renderer death
+// mid-flight), which would otherwise pin the suffix forever; when no
+// completion has arrived for this long the suffix is dropped.
+#define ID_TIMER_NAV_TITLE_WATCHDOG 11
+#define NAV_TITLE_WATCHDOG_MS 60000
+
 // After a suspend-resume failure the resume is retried on every activation
 // tick (4x/s); if it keeps failing this long the runtime is torn down and
 // rebuilt instead.
@@ -234,22 +241,35 @@ static BOOL g_cfgWindowShown = FALSE;
 static int g_cfgShowFallbackTries = 0;
 static volatile LONG g_updateCheckPending = FALSE;
 static BOOL g_updateInstallReady = FALSE;
+static volatile LONG g_updateRequestSequence = 0;
+
+typedef struct {
+    WORD major;
+    WORD minor;
+    WORD patch;
+    WORD build;
+} ExecutableVersion;
 
 typedef enum {
-    UPDATE_CHECK_LATEST = 1,
-    UPDATE_CHECK_DOWNLOAD_READY,
+    UPDATE_CHECK_SAME = 1,
+    UPDATE_CHECK_NEWER,
+    UPDATE_CHECK_OLDER,
     UPDATE_CHECK_ERROR
 } UpdateCheckKind;
 
 typedef struct {
     HWND targetWindow;
     UpdateCheckKind kind;
+    ULONGLONG cacheBuster;
+    ExecutableVersion runningVersion;
+    ExecutableVersion availableVersion;
     wchar_t message[512];
     wchar_t targetPath[MAX_PATH];
     wchar_t stagedPath[MAX_PATH];
 } UpdateCheckTask;
 
 static UpdateCheckTask* volatile g_updatePostedResult = NULL;
+static UpdateCheckTask* g_updateReadyTask = NULL;
 
 // Dynamic WebView2 loading
 static WCHAR g_extractedDllPath[MAX_PATH] = {0};
@@ -283,6 +303,8 @@ static void SendMainWebViewLivenessPing(void);
 static void CheckMainWebViewLiveness(HWND hwnd);
 static void RestartApplication(void);
 static void StartUpdateCheck(void);
+static void InstallPreparedUpdate(void);
+static void DiscardPreparedUpdate(void);
 static void RegisterBrowserExitedOnCurrentEnv(void);
 static void UnregisterBrowserExitedFromCurrentEnv(void);
 static void RegisterMainProcessFailedHandler(ICoreWebView2* webview2);
@@ -857,6 +879,10 @@ static void UpdateMainWindowTitle(HWND hwnd) {
 static void BeginMainNavigationTitle(HWND hwnd, UINT64 navigationId) {
     if (!hwnd) return;
 
+    // Every sign of navigation progress re-arms the lost-completion backstop
+    // (see ID_TIMER_NAV_TITLE_WATCHDOG).
+    SetTimer(hwnd, ID_TIMER_NAV_TITLE_WATCHDOG, NAV_TITLE_WATCHDOG_MS, NULL);
+
     if (g_mainNavigationLoading && navigationId != 0 &&
         navigationId == g_mainNavigationId) {
         return;  // A redirect keeps the same navigation and animation cadence.
@@ -872,16 +898,22 @@ static BOOL FinishMainNavigationTitle(HWND hwnd, UINT64 navigationId,
     if (!hwnd) return TRUE;
 
     // A superseded navigation may complete after its replacement has begun.
-    // Ignore that stale completion so the replacement keeps animating.
+    // Ignore only completions that are provably older than the navigation
+    // being animated (WebView2 assigns rising IDs). A failed navigation can
+    // complete under an ID this app never saw start — the error-page commit
+    // raises no NavigationStarting — so treating merely unfamiliar IDs as
+    // stale would swallow that completion and pin "Loading..." over the
+    // error page forever.
     if (g_mainNavigationLoading && navigationIdKnown &&
         g_mainNavigationId != 0 &&
-        navigationId != g_mainNavigationId) {
+        navigationId < g_mainNavigationId) {
         return FALSE;
     }
 
     if (g_mainNavigationLoading) {
         g_mainNavigationLoading = FALSE;
         g_mainNavigationId = 0;
+        KillTimer(hwnd, ID_TIMER_NAV_TITLE_WATCHDOG);
         UpdateMainWindowTitle(hwnd);
     }
     return TRUE;
@@ -987,13 +1019,6 @@ typedef struct {
     HINTERNET request;
 } UpdateHttpRequest;
 
-typedef struct {
-    WORD major;
-    WORD minor;
-    WORD patch;
-    WORD build;
-} ExecutableVersion;
-
 static void CloseUpdateHttpRequest(UpdateHttpRequest* http) {
     if (!http) return;
     if (http->request) WinHttpCloseHandle(http->request);
@@ -1014,8 +1039,8 @@ static void SetUpdateTaskError(UpdateCheckTask* task, LPCWSTR message,
     }
 }
 
-static BOOL OpenUpdateHttpRequest(LPCWSTR verb, UpdateHttpRequest* http,
-                                  DWORD* statusCode) {
+static BOOL OpenUpdateHttpRequest(LPCWSTR verb, ULONGLONG cacheBuster,
+                                  UpdateHttpRequest* http, DWORD* statusCode) {
     if (!verb || !http) return FALSE;
     ZeroMemory(http, sizeof(*http));
     if (statusCode) *statusCode = 0;
@@ -1040,6 +1065,20 @@ static BOOL OpenUpdateHttpRequest(LPCWSTR verb, UpdateHttpRequest* http,
         return FALSE;
     }
 
+    // A unique query value makes each button click reach the current branch
+    // artifact even when an HTTP proxy or GitHub edge cache retains the
+    // previous response. HEAD and GET share the same value within one check.
+    wchar_t cacheSuffix[64];
+    wchar_t separator = wcschr(objectName, L'?') ? L'&' : L'?';
+    int cacheSuffixLength = swprintf_s(cacheSuffix,
+        sizeof(cacheSuffix) / sizeof(wchar_t), L"%lcslUpdate=%016llx",
+        separator, (unsigned long long)cacheBuster);
+    if (cacheSuffixLength <= 0 ||
+        wcscat_s(objectName, sizeof(objectName) / sizeof(wchar_t), cacheSuffix) != 0) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
     http->session = WinHttpOpen(L"SystrayLauncher Update",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0);
@@ -1057,7 +1096,7 @@ static BOOL OpenUpdateHttpRequest(LPCWSTR verb, UpdateHttpRequest* http,
     if (!http->request) goto fail;
 
     static const wchar_t noCacheHeaders[] =
-        L"Cache-Control: no-cache\r\nPragma: no-cache\r\n";
+        L"Cache-Control: no-cache, no-store, max-age=0\r\nPragma: no-cache\r\n";
     WinHttpAddRequestHeaders(http->request, noCacheHeaders, (DWORD)-1L,
                             WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
     if (!WinHttpSendRequest(http->request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
@@ -1171,6 +1210,18 @@ static int CompareExecutableVersions(const ExecutableVersion* left,
     return 0;
 }
 
+static void FormatExecutableVersion(const ExecutableVersion* version,
+                                    wchar_t* text, size_t textCch) {
+    if (!version || !text || textCch == 0) return;
+    if (swprintf_s(text, textCch, L"%u.%u.%u.%u",
+                   (unsigned int)version->major,
+                   (unsigned int)version->minor,
+                   (unsigned int)version->patch,
+                   (unsigned int)version->build) <= 0) {
+        text[0] = L'\0';
+    }
+}
+
 static BOOL BuildUpdateTempPath(wchar_t path[MAX_PATH], LPCWSTR role,
                                 DWORD processId) {
     if (!path || !role || !*role || processId == 0) {
@@ -1207,7 +1258,7 @@ static BOOL DeleteUpdateTempFile(LPCWSTR path) {
 static BOOL QueryRemoteUpdateSize(UpdateCheckTask* task, ULONGLONG* size) {
     UpdateHttpRequest http;
     DWORD status = 0;
-    if (!OpenUpdateHttpRequest(L"HEAD", &http, &status)) {
+    if (!OpenUpdateHttpRequest(L"HEAD", task->cacheBuster, &http, &status)) {
         DWORD errorCode = GetLastError();
         if (status) {
             swprintf_s(task->message, sizeof(task->message) / sizeof(wchar_t),
@@ -1238,7 +1289,7 @@ static BOOL QueryRemoteUpdateSize(UpdateCheckTask* task, ULONGLONG* size) {
 static BOOL DownloadUpdateFile(UpdateCheckTask* task, ULONGLONG expectedSize) {
     UpdateHttpRequest http;
     DWORD status = 0;
-    if (!OpenUpdateHttpRequest(L"GET", &http, &status)) {
+    if (!OpenUpdateHttpRequest(L"GET", task->cacheBuster, &http, &status)) {
         DWORD errorCode = GetLastError();
         if (status) {
             swprintf_s(task->message, sizeof(task->message) / sizeof(wchar_t),
@@ -1360,8 +1411,7 @@ static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
         return 0;
     }
 
-    ExecutableVersion runningVersion;
-    if (!GetExecutableVersion(task->targetPath, &runningVersion)) {
+    if (!GetExecutableVersion(task->targetPath, &task->runningVersion)) {
         SetUpdateTaskError(task, L"Could not read the running application version",
                            GetLastError());
         PublishUpdateTask(task);
@@ -1386,8 +1436,7 @@ static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
         return 0;
     }
 
-    ExecutableVersion availableVersion;
-    if (!GetExecutableVersion(task->stagedPath, &availableVersion)) {
+    if (!GetExecutableVersion(task->stagedPath, &task->availableVersion)) {
         SetUpdateTaskError(task,
             L"The downloaded application does not contain valid version information",
             GetLastError());
@@ -1396,17 +1445,19 @@ static DWORD WINAPI UpdateCheckThread(LPVOID parameter) {
     }
 
     DebugPrint(L"[INFO] Update versions: running %u.%u.%u.%u, available %u.%u.%u.%u\n",
-               runningVersion.major, runningVersion.minor,
-               runningVersion.patch, runningVersion.build,
-               availableVersion.major, availableVersion.minor,
-               availableVersion.patch, availableVersion.build);
-    if (CompareExecutableVersions(&availableVersion, &runningVersion) <= 0) {
-        task->kind = UPDATE_CHECK_LATEST;
-        PublishUpdateTask(task);
-        return 0;
-    }
-
-    task->kind = UPDATE_CHECK_DOWNLOAD_READY;
+               (unsigned int)task->runningVersion.major,
+               (unsigned int)task->runningVersion.minor,
+               (unsigned int)task->runningVersion.patch,
+               (unsigned int)task->runningVersion.build,
+               (unsigned int)task->availableVersion.major,
+               (unsigned int)task->availableVersion.minor,
+               (unsigned int)task->availableVersion.patch,
+               (unsigned int)task->availableVersion.build);
+    int comparison = CompareExecutableVersions(&task->availableVersion,
+                                               &task->runningVersion);
+    task->kind = comparison > 0 ? UPDATE_CHECK_NEWER
+               : comparison < 0 ? UPDATE_CHECK_OLDER
+                                : UPDATE_CHECK_SAME;
     PublishUpdateTask(task);
     return 0;
 }
@@ -1870,21 +1921,37 @@ static void webview_cfg_execute_script(const wchar_t* script) {
     handler->lpVtbl->Release((ICoreWebView2ExecuteScriptCompletedHandler*)handler);
 }
 
-static void CfgSendUpdateResult(LPCWSTR status, LPCWSTR title, LPCWSTR message) {
-    if (!g_cfgWebView || !status || !title || !message) return;
+static void CfgSendUpdateResultWithVersions(LPCWSTR status, LPCWSTR title,
+                                            LPCWSTR message,
+                                            LPCWSTR currentVersion,
+                                            LPCWSTR remoteVersion) {
+    if (!g_cfgWebView || !status || !title || !message ||
+        !currentVersion || !remoteVersion) return;
     wchar_t escapedStatus[64], escapedTitle[256], escapedMessage[1024];
+    wchar_t escapedCurrentVersion[64], escapedRemoteVersion[64];
     json_escape_wstring(status, escapedStatus,
                         sizeof(escapedStatus) / sizeof(wchar_t));
     json_escape_wstring(title, escapedTitle,
                         sizeof(escapedTitle) / sizeof(wchar_t));
     json_escape_wstring(message, escapedMessage,
                         sizeof(escapedMessage) / sizeof(wchar_t));
+    json_escape_wstring(currentVersion, escapedCurrentVersion,
+                        sizeof(escapedCurrentVersion) / sizeof(wchar_t));
+    json_escape_wstring(remoteVersion, escapedRemoteVersion,
+                        sizeof(escapedRemoteVersion) / sizeof(wchar_t));
 
-    wchar_t script[1536];
+    wchar_t script[1792];
     int written = swprintf_s(script, sizeof(script) / sizeof(wchar_t),
-        L"window.onUpdateResult({\"status\":\"%s\",\"title\":\"%s\",\"message\":\"%s\"})",
-        escapedStatus, escapedTitle, escapedMessage);
+        L"window.onUpdateResult({\"status\":\"%s\",\"title\":\"%s\","
+        L"\"message\":\"%s\",\"currentVersion\":\"%s\","
+        L"\"remoteVersion\":\"%s\"})",
+        escapedStatus, escapedTitle, escapedMessage,
+        escapedCurrentVersion, escapedRemoteVersion);
     if (written > 0) webview_cfg_execute_script(script);
+}
+
+static void CfgSendUpdateResult(LPCWSTR status, LPCWSTR title, LPCWSTR message) {
+    CfgSendUpdateResultWithVersions(status, title, message, L"", L"");
 }
 
 static void StartUpdateCheck(void) {
@@ -1895,6 +1962,10 @@ static void StartUpdateCheck(void) {
         return;
     }
 
+    // A click always starts from scratch. Do not reuse a previously staged
+    // candidate or its version result after the user asks to check again.
+    DiscardPreparedUpdate();
+
     UpdateCheckTask* task = (UpdateCheckTask*)calloc(1, sizeof(UpdateCheckTask));
     if (!task) {
         InterlockedExchange(&g_updateCheckPending, FALSE);
@@ -1903,6 +1974,10 @@ static void StartUpdateCheck(void) {
         return;
     }
     task->targetWindow = g_cfgHwnd;
+    LONG sequence = InterlockedIncrement(&g_updateRequestSequence);
+    task->cacheBuster =
+        ((GetTickCount64() ^ GetCurrentProcessId()) << 32) | (DWORD)sequence;
+    if (task->cacheBuster == 0) task->cacheBuster = 1;
 
     HANDLE thread = CreateThread(NULL, 0, UpdateCheckThread, task, 0, NULL);
     if (!thread) {
@@ -2052,6 +2127,48 @@ static BOOL LaunchStagedUpdate(LPCWSTR stagedPath, LPCWSTR targetPath) {
         return FALSE;
     }
     return TRUE;
+}
+
+static void DiscardPreparedUpdate(void) {
+    UpdateCheckTask* task = g_updateReadyTask;
+    g_updateReadyTask = NULL;
+    DiscardUpdateTask(task);
+}
+
+static void InstallPreparedUpdate(void) {
+    UpdateCheckTask* task = g_updateReadyTask;
+    g_updateReadyTask = NULL;
+    if (!task || (task->kind != UPDATE_CHECK_NEWER &&
+                  task->kind != UPDATE_CHECK_SAME)) {
+        DiscardUpdateTask(task);
+        CfgSendUpdateResult(L"error", L"Update unavailable",
+            L"The prepared update is no longer available. Check for updates again.");
+        return;
+    }
+
+    if (LaunchStagedUpdate(task->stagedPath, task->targetPath)) {
+        DebugPrint(L"[INFO] Update accepted; exiting for replacement\n");
+        g_updateInstallReady = TRUE;
+        free(task);  // The updater process now owns the staged file.
+        if (g_cfgHwnd) PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
+        return;
+    }
+
+    DWORD errorCode = GetLastError();
+    wchar_t message[384];
+    LPCWSTR title = L"Update failed";
+    if (errorCode == ERROR_CANCELLED) {
+        title = L"Update cancelled";
+        wcscpy_s(message, sizeof(message) / sizeof(wchar_t),
+            L"Administrator approval was cancelled. Your current version is still running.");
+    } else {
+        swprintf_s(message, sizeof(message) / sizeof(wchar_t),
+            L"The elevated update process could not be started (Windows error %lu).",
+            (unsigned long)errorCode);
+    }
+    DebugPrint(L"[WARNING] %s\n", message);
+    CfgSendUpdateResult(L"error", title, message);
+    DiscardUpdateTask(task);
 }
 
 static void cfg_sync_controller_bounds(void) {
@@ -2280,6 +2397,10 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         webview_push_init_config();
     } else if (strcmp(action, "checkUpdate") == 0) {
         StartUpdateCheck();
+    } else if (strcmp(action, "installUpdate") == 0) {
+        InstallPreparedUpdate();
+    } else if (strcmp(action, "dismissUpdate") == 0) {
+        DiscardPreparedUpdate();
     } else if (strcmp(action, "saveSettings") == 0) {
         char url[4096] = {0}, title[512] = {0}, hideJs[8192] = {0}, showJs[8192] = {0};
         char insecureOrigins[8192] = {0}, staticHosts[8192] = {0};
@@ -2422,41 +2543,48 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 (PVOID volatile*)&g_updatePostedResult, NULL);
             if (!task) return 0;
 
-            if (task->kind == UPDATE_CHECK_LATEST) {
-                CfgSendUpdateResult(L"latest", L"You're up to date",
-                    L"Your version is the latest available.");
-                free(task);
-            } else if (task->kind == UPDATE_CHECK_ERROR) {
+            if (task->kind == UPDATE_CHECK_ERROR) {
                 DebugPrint(L"[WARNING] Update check failed: %s\n", task->message);
                 CfgSendUpdateResult(L"error", L"Update failed", task->message);
-                free(task);
-            } else if (task->kind == UPDATE_CHECK_DOWNLOAD_READY) {
-                if (LaunchStagedUpdate(task->stagedPath, task->targetPath)) {
-                    DebugPrint(L"[INFO] Update downloaded; exiting for replacement\n");
-                    g_updateInstallReady = TRUE;
-                    free(task);  // The updater process now owns the staged file.
-                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                } else {
-                    DWORD errorCode = GetLastError();
-                    wchar_t message[384];
-                    LPCWSTR title = L"Update failed";
-                    if (errorCode == ERROR_CANCELLED) {
-                        title = L"Update cancelled";
-                        wcscpy_s(message, sizeof(message) / sizeof(wchar_t),
-                            L"Administrator approval was cancelled. Your current "
-                            L"version is still running.");
-                    } else {
-                        swprintf_s(message, sizeof(message) / sizeof(wchar_t),
-                            L"The elevated update process could not be started "
-                            L"(Windows error %lu).", (unsigned long)errorCode);
-                    }
-                    DebugPrint(L"[WARNING] %s\n", message);
-                    CfgSendUpdateResult(L"error", title, message);
-                    DiscardUpdateTask(task);
-                }
+                DiscardUpdateTask(task);
+                return 0;
+            }
+
+            wchar_t currentVersion[32], remoteVersion[32];
+            FormatExecutableVersion(&task->runningVersion, currentVersion,
+                                    sizeof(currentVersion) / sizeof(wchar_t));
+            FormatExecutableVersion(&task->availableVersion, remoteVersion,
+                                    sizeof(remoteVersion) / sizeof(wchar_t));
+
+            LPCWSTR status = NULL;
+            LPCWSTR title = NULL;
+            LPCWSTR message = NULL;
+            if (task->kind == UPDATE_CHECK_NEWER) {
+                status = L"newer";
+                title = L"Update available";
+                message = L"A newer version is ready to install.";
+            } else if (task->kind == UPDATE_CHECK_SAME) {
+                status = L"same";
+                title = L"You're up to date";
+                message = L"The remote build matches your current version. "
+                          L"You can force a reinstall if needed.";
+            } else if (task->kind == UPDATE_CHECK_OLDER) {
+                status = L"older";
+                title = L"No update available";
+                message = L"The remote build is older than your current version.";
             } else {
                 DiscardUpdateTask(task);
+                return 0;
             }
+
+            if (task->kind == UPDATE_CHECK_NEWER ||
+                task->kind == UPDATE_CHECK_SAME) {
+                DiscardPreparedUpdate();
+                g_updateReadyTask = task;
+            }
+            CfgSendUpdateResultWithVersions(status, title, message,
+                                            currentVersion, remoteVersion);
+            if (task->kind == UPDATE_CHECK_OLDER) DiscardUpdateTask(task);
             return 0;
         }
 
@@ -2520,6 +2648,7 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_DESTROY:
             DiscardUpdateTask((UpdateCheckTask*)InterlockedExchangePointer(
                 (PVOID volatile*)&g_updatePostedResult, NULL));
+            DiscardPreparedUpdate();
             g_cfgHwnd = NULL;
             g_cfgWindowShown = FALSE;
             KillTimer(hwnd, ID_TIMER_CFG_SHOW_FALLBACK);
@@ -3497,8 +3626,9 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
         // rendering off (IsVisible = FALSE) at the moment we suspend for sleep.
         controller->lpVtbl->put_IsVisible(controller, TRUE);
 
-        // Settle the sleep state only once the initial navigation finishes so
-        // we never suspend a half-loaded page (see OnMainNavigationCompleted).
+        // Settle the sleep state only once navigations finish so we never
+        // suspend a half-loaded page (see OnMainNavigationCompleted and the
+        // in-flight guard in DeactivateMainWebView).
         RegisterMainNavigationStartingHandler(webview2);
         RegisterMainNavigationCompletedHandler(webview2);
         RegisterMainNewWindowRequestedHandler(webview2);
@@ -3746,6 +3876,7 @@ HRESULT STDMETHODCALLTYPE NavStartingHandler_Invoke(
 
     UINT64 navigationId = 0;
     if (args) args->lpVtbl->get_NavigationId(args, &navigationId);
+    DebugPrint(L"[INFO] Main navigation %I64u starting\n", navigationId);
     BeginMainNavigationTitle(g_hwnd, navigationId);
     return S_OK;
 }
@@ -3814,6 +3945,24 @@ HRESULT STDMETHODCALLTYPE NavCompletedHandler_Invoke(
     UINT64 navigationId = 0;
     BOOL navigationIdKnown =
         args && SUCCEEDED(args->lpVtbl->get_NavigationId(args, &navigationId));
+
+    // Read the outcome for the log. Failures land on an error page (or a
+    // server error body); the completion still ends the loading title either
+    // way, so a settled error is never presented as still loading.
+    BOOL isSuccess = TRUE;
+    COREWEBVIEW2_WEB_ERROR_STATUS webErrorStatus =
+        COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+    if (args) {
+        args->lpVtbl->get_IsSuccess(args, &isSuccess);
+        args->lpVtbl->get_WebErrorStatus(args, &webErrorStatus);
+    }
+    if (isSuccess) {
+        DebugPrint(L"[INFO] Main navigation %I64u completed\n", navigationId);
+    } else {
+        DebugPrint(L"[WARNING] Main navigation %I64u failed (WebErrorStatus %d)\n",
+                   navigationId, (int)webErrorStatus);
+    }
+
     if (FinishMainNavigationTitle(g_hwnd, navigationId, navigationIdKnown)) {
         OnMainNavigationCompleted();
     }
@@ -4545,10 +4694,14 @@ static void DeactivateMainWebView(void) {
     BOOL prewarming = InterlockedCompareExchange(&g_webViewPrewarmActive, TRUE, TRUE) == TRUE;
 
     // Never put the page to sleep while post-resume recovery is unverified
-    // (a possibly-broken page must not be frozen into a suspend snapshot) or
-    // while a tray-hover prewarm is keeping it warm. The steady-state hidden
-    // ticks used to cancel both within 250 ms.
-    if (sleepEnabled && preloaded && !recovery && !prewarming) {
+    // (a possibly-broken page must not be frozen into a suspend snapshot),
+    // while a tray-hover prewarm is keeping it warm, or while a navigation is
+    // still in flight — suspending mid-navigation freezes the load half-done
+    // and its completion event may never arrive (the eventual completion
+    // re-runs the settle-then-suspend path). The steady-state hidden ticks
+    // used to cancel both within 250 ms.
+    if (sleepEnabled && preloaded && !recovery && !prewarming &&
+        !g_mainNavigationLoading) {
         InterlockedExchange(&g_webViewPrewarmActive, FALSE);
         if (g_hwnd) {
             KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM);
@@ -5405,6 +5558,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             } else if (wParam == ID_TIMER_WEBVIEW_LIVENESS) {
                 KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
                 CheckMainWebViewLiveness(hwnd);
+            } else if (wParam == ID_TIMER_NAV_TITLE_WATCHDOG) {
+                KillTimer(hwnd, ID_TIMER_NAV_TITLE_WATCHDOG);
+                if (g_mainNavigationLoading) {
+                    DebugPrint(L"[WARNING] Main navigation %I64u never completed; dropping loading title\n",
+                               g_mainNavigationId);
+                    g_mainNavigationLoading = FALSE;
+                    g_mainNavigationId = 0;
+                    UpdateMainWindowTitle(hwnd);
+                    // The in-flight navigation was also holding the page out
+                    // of suspension; let the hidden-state policy settle now.
+                    if (!IsWindowActuallyVisible(hwnd)) {
+                        DeactivateMainWebView();
+                    }
+                }
             }
             return 0;
 
@@ -5458,6 +5625,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
             KillTimer(hwnd, ID_TIMER_POWER_RESUME);
             KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
+            KillTimer(hwnd, ID_TIMER_NAV_TITLE_WATCHDOG);
             PostQuitMessage(0);
             return 0;
             

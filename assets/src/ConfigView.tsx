@@ -5,6 +5,8 @@ import {
   saveSettings,
   closeDialog,
   checkForUpdate,
+  installUpdate,
+  dismissUpdate,
   onUpdateResult,
 } from "./lib/bridge";
 import { Button } from "./components/ui/button";
@@ -176,6 +178,16 @@ export default function ConfigView({ config }: Props) {
     setUpdateAlert(null);
     setUpdateChecking(true);
     checkForUpdate();
+  }
+
+  function handleInstallUpdate() {
+    setUpdateChecking(true);
+    installUpdate();
+  }
+
+  function handleDismissUpdate() {
+    dismissUpdate();
+    setUpdateAlert(null);
   }
 
   function handleSave() {
@@ -547,9 +559,52 @@ export default function ConfigView({ config }: Props) {
                 {updateAlert.message}
               </p>
             </div>
-            <div className="flex justify-end">
-              <Button size="sm" autoFocus onClick={() => setUpdateAlert(null)}>
-                OK
+            {updateAlert.currentVersion && updateAlert.remoteVersion && (
+              <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
+                <dt className="text-neutral-500">Current version</dt>
+                <dd className="font-medium tabular-nums text-neutral-900">
+                  {updateAlert.currentVersion}
+                </dd>
+                <dt className="text-neutral-500">Remote version</dt>
+                <dd className="font-medium tabular-nums text-neutral-900">
+                  {updateAlert.remoteVersion}
+                </dd>
+              </dl>
+            )}
+            <div className="flex justify-end gap-2">
+              {(updateAlert.status === "newer" ||
+                updateAlert.status === "same") && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  autoFocus
+                  disabled={updateChecking}
+                  onClick={handleDismissUpdate}
+                >
+                  Cancel
+                </Button>
+              )}
+              <Button
+                size="sm"
+                autoFocus={
+                  updateAlert.status !== "newer" &&
+                  updateAlert.status !== "same"
+                }
+                disabled={updateChecking}
+                onClick={
+                  updateAlert.status === "newer" ||
+                  updateAlert.status === "same"
+                    ? handleInstallUpdate
+                    : handleDismissUpdate
+                }
+              >
+                {updateChecking
+                  ? "Starting..."
+                  : updateAlert.status === "same"
+                    ? "Force update"
+                    : updateAlert.status === "newer"
+                      ? "Update"
+                      : "OK"}
               </Button>
             </div>
           </div>

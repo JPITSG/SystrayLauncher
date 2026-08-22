@@ -11,7 +11,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 - **External Link Handling** - Optionally open new windows/tabs (`target="_blank"`, `window.open`) in the system default browser instead of a WebView2 popup
 - **Static Host Mappings** - Optionally resolve listed hostnames to configured IP addresses inside the embedded browser without changing system DNS
 - **Optional Mixed Content** - Explicitly allow an HTTPS page to load HTTP content from configured legacy origins
-- **Self Update** - Check the embedded version of the current repository build from the configuration dialog, then replace and restart the launcher when a newer version is available
+- **Self Update** - Compare embedded local and repository versions in the configuration dialog, install newer builds, or force a reinstall of the same version
 - **Lockdown Header** - Optionally stamp every request with a rolling, hour-keyed `X-Lockdown` token a gateway can require as an extra access layer
 - **Preloaded on Startup** - The page is loaded into the WebView at launch so it is ready the moment you open the window
 - **Hide Grace Period** - Re-opening within 60 seconds of hiding returns exactly where you left off; after that the page resets to the configured URL in the background, so the next open starts fresh with no visible reload
@@ -50,14 +50,15 @@ Settings available in the Configure dialog:
 | Sleep web container when inactive | When enabled, suspends the WebView to save CPU while the window is hidden, and pre-emptively wakes it on tray-icon hover. The page is always preloaded at startup regardless of this setting. Disabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (recovery attempts, web view rebuilds, power transitions) to `%LOCALAPPDATA%\SystrayLauncher\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
 
-The **Update** button downloads the repository's
-[`release/SystrayLauncher.exe`](release/SystrayLauncher.exe) to the user's
-temporary directory and compares its embedded Windows file version with the
-running executable's version. A newer build requests standard Windows UAC
-approval for the replacement step, safely replaces the current executable,
-and restarts the launcher. Cancelling the UAC prompt leaves the current version
-running. An equal or older repository version produces an in-dialog
-notification that the latest version is already installed. File size is used
+Each click of the **Update** button makes a fresh request for the repository's
+[`release/SystrayLauncher.exe`](release/SystrayLauncher.exe), downloads it to
+the user's temporary directory, and compares its embedded Windows file version
+with the running executable's version. The result dialog displays both version
+numbers. A newer build can be installed normally, while a matching build offers
+a **Force update** action to reinstall it; an older repository build is never
+installed. Installation requests standard Windows UAC approval, safely
+replaces the current executable, and restarts the launcher. Cancelling either
+the dialog or UAC prompt leaves the current version running. File size is used
 only to validate the download and enforce its safety limit.
 
 ## Static Host Mappings
