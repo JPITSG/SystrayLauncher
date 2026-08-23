@@ -69,9 +69,10 @@ A newer build can be installed normally, while a matching build offers a
 installed. Installation requests standard Windows UAC approval, safely
 replaces the current executable, and restarts the launcher. After a successful
 update, the restarted launcher opens an HTML confirmation with the newly
-installed version. Cancelling the download, result dialog, or UAC prompt leaves
-the current version running. File size is used only to validate the download
-and enforce its safety limit.
+installed version. Dismissing that confirmation leaves the configuration dialog
+open. Cancelling the download, result dialog, or UAC prompt leaves the current
+version running. File size is used only to validate the download and enforce
+its safety limit.
 
 ## Static Host Mappings
 

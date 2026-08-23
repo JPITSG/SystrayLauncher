@@ -243,7 +243,6 @@ static ICoreWebView2* g_cfgWebView = NULL;
 static BOOL g_cfgSaved = FALSE;
 static BOOL g_cfgWindowShown = FALSE;
 static BOOL g_updateConfirmationPending = FALSE;
-static BOOL g_cfgCloseAfterUpdateConfirmation = FALSE;
 static int g_cfgShowFallbackTries = 0;
 static volatile LONG g_updateCheckPending = FALSE;
 static BOOL g_updateInstallReady = FALSE;
@@ -2591,11 +2590,6 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         DiscardPreparedUpdate();
     } else if (strcmp(action, "dismissUpdateConfirmation") == 0) {
         g_updateConfirmationPending = FALSE;
-        BOOL closeConfig = g_cfgCloseAfterUpdateConfirmation;
-        g_cfgCloseAfterUpdateConfirmation = FALSE;
-        if (closeConfig && g_cfgHwnd) {
-            PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
-        }
     } else if (strcmp(action, "saveSettings") == 0) {
         char url[4096] = {0}, title[512] = {0}, hideJs[8192] = {0}, showJs[8192] = {0};
         char insecureOrigins[8192] = {0}, staticHosts[8192] = {0};
@@ -6123,7 +6117,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // startup is ready; recovery launches intentionally stay silent.
     if (updateCompleted) {
         g_updateConfirmationPending = TRUE;
-        g_cfgCloseAfterUpdateConfirmation = TRUE;
         ShowConfigWebViewDialog();
     }
     
