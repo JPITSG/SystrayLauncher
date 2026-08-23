@@ -154,6 +154,10 @@
 // responding and the WebView has to be rebuilt.
 #define WM_APP_WEBVIEW_RECREATE (WM_APP + 2)
 
+// Posted by the fallback proxy's worker threads when the address actually
+// used for a mapped hostname changes, so the title can show the new route.
+#define WM_APP_HOST_ROUTE_CHANGED (WM_APP + 5)
+
 // Static host DNS fallback (see StartStaticHostProxy). A small loopback
 // forward proxy inside the launcher process; the browser reaches it through
 // --proxy-pac-url and the generated PAC script routes only the configured
@@ -295,6 +299,9 @@ typedef struct {
     HostProxyBreakerState state;  // guarded by g_hostProxyLock
     ULONGLONG lastProbeTick;      // tick of the last failed mapped attempt
     BOOL probeInFlight;           // single-flight guard for side-car probes
+    // Address most recently used to reach the host, shown in the window
+    // title; starts as the mapped address. Guarded by g_hostProxyLock.
+    char currentAddress[64];
 } HostProxyMapping;
 
 // Tunnel nodes are owned by their connection thread: the accept thread links
@@ -390,6 +397,9 @@ static void SendMainWebViewLivenessPing(void);
 static void CheckMainWebViewLiveness(HWND hwnd);
 static void RestartApplication(void);
 static void StartUpdateCheck(BOOL automatic);
+static BOOL IsOriginListSeparator(wchar_t c);
+static BOOL IsValidStaticHostMapping(const wchar_t* mapping,
+                                     const wchar_t** separatorOut);
 static void CancelUpdateCheck(void);
 static void InstallPreparedUpdate(void);
 static void DiscardPreparedUpdate(void);
@@ -987,6 +997,98 @@ static BOOL GetConfiguredUrlHostname(wchar_t* hostname, size_t hostnameCount) {
     return TRUE;
 }
 
+// True when the configured host is an IP literal rather than a domain name;
+// the title's route suffix only applies to domains. Colons and brackets can
+// only appear in IPv6 literals, never in hostnames.
+static BOOL IsHostnameIpLiteral(const wchar_t* hostname) {
+    IN_ADDR v4;
+    if (wcschr(hostname, L':') || wcschr(hostname, L'[')) return TRUE;
+    return InetPtonW(AF_INET, hostname, &v4) == 1;
+}
+
+// Fetches the address to show next to the configured hostname in the title:
+// the address the fallback proxy most recently used for it, or the mapped
+// address when the strict resolver rules are active. FALSE when the static
+// mappings do not apply to this hostname.
+static BOOL GetStaticHostDisplayAddress(const wchar_t* hostname,
+                                        wchar_t* address, size_t addressCch) {
+    if (!g_config.useStaticHostMappings || !hostname[0] || addressCch < 2) {
+        return FALSE;
+    }
+    if (IsHostnameIpLiteral(hostname)) return FALSE;
+
+    if (g_hostProxyPort != 0) {
+        // Fallback proxy active: report the route actually in use. Narrow
+        // and lowercase for comparison against the ASCII mapping table.
+        char narrowHost[254];
+        size_t hostLength = wcslen(hostname);
+        BOOL found = FALSE;
+        if (hostLength >= sizeof(narrowHost)) return FALSE;
+        for (size_t i = 0; i < hostLength; i++) {
+            wchar_t c = hostname[i];
+            if (c >= 0x80) return FALSE;
+            if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+            narrowHost[i] = (char)c;
+        }
+        narrowHost[hostLength] = '\0';
+        EnterCriticalSection(&g_hostProxyLock);
+        for (size_t i = 0; i < g_hostProxyMappingCount; i++) {
+            if (strcmp(g_hostProxyMappings[i].host, narrowHost) != 0) continue;
+            const char* current = g_hostProxyMappings[i].currentAddress;
+            size_t length = strlen(current);
+            if (length > 0 && length < addressCch) {
+                for (size_t j = 0; j <= length; j++) {
+                    address[j] = (wchar_t)(unsigned char)current[j];
+                }
+                found = TRUE;
+            }
+            break;
+        }
+        LeaveCriticalSection(&g_hostProxyLock);
+        return found;
+    }
+
+    // Strict resolver rules: the mapped address is always the one in use.
+    // Mirror the all-or-nothing validation of the argument builder - when
+    // any entry is invalid, no rules were applied at all.
+    const wchar_t* cursor = g_config.staticHostMappings;
+    size_t hostLength = wcslen(hostname);
+    while (*cursor) {
+        while (*cursor && IsOriginListSeparator(*cursor)) cursor++;
+        if (!*cursor) break;
+
+        const wchar_t* begin = cursor;
+        while (*cursor && !IsOriginListSeparator(*cursor)) cursor++;
+        size_t tokenLength = (size_t)(cursor - begin);
+        wchar_t token[2048];
+        if (tokenLength == 0 || tokenLength >= sizeof(token) / sizeof(token[0])) {
+            return FALSE;
+        }
+        wmemcpy(token, begin, tokenLength);
+        token[tokenLength] = L'\0';
+
+        const wchar_t* separator = NULL;
+        if (!IsValidStaticHostMapping(token, &separator)) return FALSE;
+        if ((size_t)(separator - token) != hostLength ||
+            _wcsnicmp(token, hostname, hostLength) != 0) {
+            continue;
+        }
+
+        const wchar_t* mappedValue = separator + 1;
+        size_t valueLength = wcslen(mappedValue);
+        if (valueLength >= 2 && mappedValue[0] == L'[' &&
+            mappedValue[valueLength - 1] == L']') {
+            mappedValue++;
+            valueLength -= 2;
+        }
+        if (valueLength == 0 || valueLength >= addressCch) return FALSE;
+        wmemcpy(address, mappedValue, valueLength);
+        address[valueLength] = L'\0';
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static void AppendMainWindowTitlePart(wchar_t* title, size_t titleCount,
                                       const wchar_t* part) {
     if (!part || !part[0]) return;
@@ -1004,7 +1106,17 @@ static void UpdateMainWindowTitle(HWND hwnd) {
 
     AppendMainWindowTitlePart(title, MAIN_WINDOW_TITLE_CCH, configuredTitle);
     if (GetConfiguredUrlHostname(hostname, sizeof(hostname) / sizeof(hostname[0]))) {
-        AppendMainWindowTitlePart(title, MAIN_WINDOW_TITLE_CCH, hostname);
+        wchar_t mappedAddress[64];
+        if (GetStaticHostDisplayAddress(hostname, mappedAddress,
+                                        sizeof(mappedAddress) /
+                                            sizeof(mappedAddress[0]))) {
+            wchar_t hostPart[336];
+            swprintf_s(hostPart, sizeof(hostPart) / sizeof(hostPart[0]),
+                       L"%s (%s)", hostname, mappedAddress);
+            AppendMainWindowTitlePart(title, MAIN_WINDOW_TITLE_CCH, hostPart);
+        } else {
+            AppendMainWindowTitlePart(title, MAIN_WINDOW_TITLE_CCH, hostname);
+        }
     }
 
     if (g_mainNavigationLoading) {
@@ -3698,10 +3810,13 @@ static SOCKET HostProxyConnectMapped(const HostProxyMapping* mapping, unsigned s
 }
 
 // Standard system resolution - hosts file, configured DNS and caches all
-// behave exactly as they would for a direct connection.
-static SOCKET HostProxyConnectViaDns(const char* host, unsigned short port) {
+// behave exactly as they would for a direct connection. On success the
+// numeric address that answered is reported for the title's route display.
+static SOCKET HostProxyConnectViaDns(const char* host, unsigned short port,
+                                     char* usedAddress, size_t usedAddressSize) {
     char portString[8];
     snprintf(portString, sizeof(portString), "%u", (unsigned)port);
+    if (usedAddress && usedAddressSize > 0) usedAddress[0] = '\0';
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -3715,7 +3830,15 @@ static SOCKET HostProxyConnectViaDns(const char* host, unsigned short port) {
     for (const struct addrinfo* address = results; address; address = address->ai_next) {
         if (InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE)) break;
         s = HostProxyConnectWithTimeout(address, HOST_PROXY_DNS_CONNECT_TIMEOUT_MS);
-        if (s != INVALID_SOCKET) break;
+        if (s != INVALID_SOCKET) {
+            if (usedAddress && usedAddressSize > 0 &&
+                getnameinfo(address->ai_addr, (socklen_t)address->ai_addrlen,
+                            usedAddress, (DWORD)usedAddressSize, NULL, 0,
+                            NI_NUMERICHOST) != 0) {
+                usedAddress[0] = '\0';
+            }
+            break;
+        }
     }
     freeaddrinfo(results);
     return s;
@@ -3733,6 +3856,26 @@ static void CloseHostTunnelsForMapping(int mappingIndex, HostProxyTunnel* except
         if (node->upstream != INVALID_SOCKET) shutdown(node->upstream, SD_BOTH);
     }
     LeaveCriticalSection(&g_hostProxyLock);
+}
+
+// Records the address most recently used to reach a mapped host and nudges
+// the UI thread to refresh the window title when the route actually changed.
+static void HostProxySetCurrentAddress(HostProxyMapping* mapping,
+                                       const char* address) {
+    BOOL changed = FALSE;
+    size_t length;
+    if (!address || !address[0]) return;
+    length = strlen(address);
+    if (length >= sizeof(mapping->currentAddress)) return;
+    EnterCriticalSection(&g_hostProxyLock);
+    if (strcmp(mapping->currentAddress, address) != 0) {
+        memcpy(mapping->currentAddress, address, length + 1);
+        changed = TRUE;
+    }
+    LeaveCriticalSection(&g_hostProxyLock);
+    if (changed && g_hwnd) {
+        PostMessageW(g_hwnd, WM_APP_HOST_ROUTE_CHANGED, 0, 0);
+    }
 }
 
 typedef struct {
@@ -3761,6 +3904,7 @@ static DWORD WINAPI HostProxyProbeThread(LPVOID param) {
     if (recovered) {
         DebugPrint(L"[INFO] Mapped address for '%S' answered; resuming mapped routing\n",
                    mapping->host);
+        HostProxySetCurrentAddress(mapping, mapping->address);
         CloseHostTunnelsForMapping(task->mappingIndex, NULL);
     }
     free(task);
@@ -3820,8 +3964,13 @@ static SOCKET HostProxyEstablishUpstream(HostProxyTunnel* tunnel, int mappingInd
 
     SOCKET upstream = INVALID_SOCKET;
     if (state == HOST_PROXY_FALLBACK) {
+        char dnsAddress[64];
         HostProxyStartProbeIfDue(mappingIndex, port);
-        upstream = HostProxyConnectViaDns(mapping->host, port);
+        upstream = HostProxyConnectViaDns(mapping->host, port,
+                                          dnsAddress, sizeof(dnsAddress));
+        if (upstream != INVALID_SOCKET) {
+            HostProxySetCurrentAddress(mapping, dnsAddress);
+        }
     } else {
         upstream = HostProxyConnectMapped(mapping, port);
         if (upstream != INVALID_SOCKET) {
@@ -3835,6 +3984,7 @@ static SOCKET HostProxyEstablishUpstream(HostProxyTunnel* tunnel, int mappingInd
             if (announced) {
                 DebugPrint(L"[INFO] Static host '%S' using mapped address\n", mapping->host);
             }
+            HostProxySetCurrentAddress(mapping, mapping->address);
         } else {
             BOOL wasActive;
             EnterCriticalSection(&g_hostProxyLock);
@@ -3845,7 +3995,12 @@ static SOCKET HostProxyEstablishUpstream(HostProxyTunnel* tunnel, int mappingInd
             DebugPrint(L"[WARNING] Mapped address for '%S' unreachable; using DNS resolution\n",
                        mapping->host);
             if (wasActive) CloseHostTunnelsForMapping(mappingIndex, tunnel);
-            upstream = HostProxyConnectViaDns(mapping->host, port);
+            char dnsAddress[64];
+            upstream = HostProxyConnectViaDns(mapping->host, port,
+                                              dnsAddress, sizeof(dnsAddress));
+            if (upstream != INVALID_SOCKET) {
+                HostProxySetCurrentAddress(mapping, dnsAddress);
+            }
         }
     }
     if (upstream != INVALID_SOCKET) {
@@ -4381,6 +4536,8 @@ static BOOL ParseStaticHostProxyMappings(void) {
         mapping->state = HOST_PROXY_UNTESTED;
         mapping->lastProbeTick = 0;
         mapping->probeInFlight = FALSE;
+        memcpy(mapping->currentAddress, mapping->address,
+               sizeof(mapping->currentAddress));
 
         // Duplicate hostname: first entry wins, matching resolver rules.
         BOOL duplicate = FALSE;
@@ -7160,6 +7317,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_APP_WEBVIEW_RECREATE:
             // The browser process died or stopped resuming; rebuild.
             HandleUnexpectedBrowserExit(hwnd);
+            return 0;
+
+        case WM_APP_HOST_ROUTE_CHANGED:
+            // The fallback proxy switched between the mapped address and
+            // DNS resolution for a mapped hostname; refresh the title.
+            UpdateMainWindowTitle(hwnd);
             return 0;
 
         case WM_TRAYICON:

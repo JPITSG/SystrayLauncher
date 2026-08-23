@@ -95,6 +95,12 @@ in brackets, such as `device.local:[2001:db8::20]`. A configured HTTP proxy can
 resolve destination hostnames itself, so these local mappings are intended for
 direct connections.
 
+When the configured URL's hostname is one of the mapped entries, the main
+window title shows the address currently used for it after the hostname, for
+example `device.local (192.168.1.20)`. With the DNS fallback option below this
+switches live between the mapped address and the DNS-resolved address as the
+route changes.
+
 This feature uses a Chromium browser switch rather than a stable WebView2 DNS
 API. Microsoft documents browser flags as development-oriented and not
 guaranteed long-term, so the behavior should be tested when deploying a new
