@@ -83,6 +83,7 @@
 #define REG_VALUE_STATIC_HOST_MAPPINGS L"StaticHostMappings"
 #define REG_VALUE_LOCKDOWN L"LockdownHeader"
 #define REG_VALUE_LOCKDOWN_SECRET L"LockdownSecret"
+#define REG_VALUE_AUTO_UPDATE L"AutoCheckForUpdates"
 #define REG_VALUE_DEBUGLOG L"DebugLog"
 #define REG_VALUE_CONFIGURED L"Configured"
 
@@ -162,6 +163,7 @@ typedef struct {
     wchar_t staticHostMappings[2048];
     BOOL lockdownHeader;
     wchar_t lockdownSecret[256];
+    BOOL autoCheckForUpdates;
     BOOL debugLogEnabled;
 } Configuration;
 
@@ -492,6 +494,7 @@ void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     config->staticHostMappings[0] = L'\0';
     config->lockdownHeader = FALSE;
     config->lockdownSecret[0] = L'\0';
+    config->autoCheckForUpdates = TRUE;
     config->debugLogEnabled = FALSE;
 
     if (!PathFileExistsW(iniPath)) {
@@ -577,6 +580,9 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
         config->lockdownHeader = (c == L'1' || c == L't' || c == L'y');
     } else if (wcscmp(key, L"lockdownsecret") == 0) {
         wcscpy_s(config->lockdownSecret, 256, value);
+    } else if (wcscmp(key, L"autocheckforupdates") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->autoCheckForUpdates = (c == L'1' || c == L't' || c == L'y');
     } else if (wcscmp(key, L"debuglog") == 0) {
         wchar_t c = towlower(value[0]);
         config->debugLogEnabled = (c == L'1' || c == L't' || c == L'y');
@@ -711,6 +717,16 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         config->lockdownSecret[255] = L'\0';
     }
 
+    // Load automatic update checks (default enabled).
+    DWORD autoUpdateVal = 1;
+    dataSize = sizeof(autoUpdateVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_AUTO_UPDATE, NULL, &dataType,
+                         (LPBYTE)&autoUpdateVal, &dataSize) == ERROR_SUCCESS) {
+        config->autoCheckForUpdates = (autoUpdateVal != 0);
+    } else {
+        config->autoCheckForUpdates = TRUE;
+    }
+
     // Load DebugLog (default disabled)
     DWORD dbgVal = 0;
     dataSize = sizeof(dbgVal);
@@ -786,6 +802,11 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     RegSetValueExW(hKey, REG_VALUE_LOCKDOWN_SECRET, 0, REG_SZ,
                    (const BYTE*)config->lockdownSecret,
                    (DWORD)((wcslen(config->lockdownSecret) + 1) * sizeof(wchar_t)));
+
+    // Save automatic update checks.
+    DWORD autoUpdateVal = config->autoCheckForUpdates ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_AUTO_UPDATE, 0, REG_DWORD,
+                   (const BYTE*)&autoUpdateVal, sizeof(autoUpdateVal));
 
     // Save DebugLog
     DWORD dbgVal = config->debugLogEnabled ? 1 : 0;
@@ -2331,7 +2352,7 @@ static void webview_push_init_config(void) {
     wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
     if (!script) return;
     int written = swprintf(script, scriptCch,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"debugLog\":%s}})",
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"debugLog\":%s}})",
         eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false",
         g_config.openNewWindowsExternally ? L"true" : L"false",
         g_config.allowRunningInsecureContent ? L"true" : L"false",
@@ -2340,6 +2361,7 @@ static void webview_push_init_config(void) {
         eStaticHosts,
         g_config.lockdownHeader ? L"true" : L"false",
         eLockdownSecret,
+        g_config.autoCheckForUpdates ? L"true" : L"false",
         g_config.debugLogEnabled ? L"true" : L"false");
     if (written > 0) {
         webview_cfg_execute_script(script);
@@ -2579,6 +2601,8 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                                 g_config.lockdownSecret, 256) == 0) {
             g_config.lockdownSecret[0] = L'\0';
         }
+        g_config.autoCheckForUpdates =
+            json_get_bool(msg, "autoCheckForUpdates", TRUE);
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
 
         SaveConfigToRegistry(&g_config);

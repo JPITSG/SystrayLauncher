@@ -11,6 +11,7 @@ export interface ConfigData {
   staticHostMappings: string;
   lockdownHeader: boolean;
   lockdownSecret: string;
+  autoCheckForUpdates: boolean;
   debugLog: boolean;
 }
 
@@ -91,6 +92,7 @@ export function saveSettings(config: ConfigData) {
       staticHostMappings: config.staticHostMappings,
       lockdownHeader: config.lockdownHeader,
       lockdownSecret: config.lockdownSecret,
+      autoCheckForUpdates: config.autoCheckForUpdates,
       debugLog: config.debugLog,
     })
   );

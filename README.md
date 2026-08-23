@@ -48,12 +48,19 @@ Settings available in the Configure dialog:
 | Send X-Lockdown header | Adds an `X-Lockdown` header to every request the embedded browser makes: the request's own User-Agent encrypted with a key derived from the current UTC hour and an optional shared secret (see [Lockdown Header](#lockdown-header)). Toggling applies immediately. Disabled by default. |
 | Open new windows in the default browser | When enabled, links that would open a new window or tab launch in the system default browser instead of a WebView2 popup. Only `http(s)` links are handed to the browser. Popups that must script back to the opening page (some login flows) may not work while enabled. Disabled by default. |
 | Sleep web container when inactive | When enabled, suspends the WebView to save CPU while the window is hidden, and pre-emptively wakes it on tray-icon hover. The page is always preloaded at startup regardless of this setting. Disabled by default. |
+| Automatically check for updates | Checks for a newer repository build whenever the Configure dialog opens and prompts only when one is available. Enabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (recovery attempts, web view rebuilds, power transitions) to `%LOCALAPPDATA%\SystrayLauncher\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
 
-Each click of the **Update** button makes a fresh request for the repository's
-[`release/SystrayLauncher.exe`](release/SystrayLauncher.exe), downloads it to
-the user's temporary directory, and compares its embedded Windows file version
-with the running executable's version. While downloading, the button displays
+When **Automatically check for updates** is enabled, opening the Configure
+dialog makes a fresh request for the repository's
+[`release/SystrayLauncher.exe`](release/SystrayLauncher.exe). A newer build
+opens the update dialog; matching or older builds and failed automatic checks
+are silently discarded. The **Update** button performs the same check manually
+and displays every result.
+
+The update check downloads the executable to the user's temporary directory
+and compares its embedded Windows file version with the running executable's
+version. While downloading, the button displays
 the current transfer speed and can be clicked again to stop the check and
 remove the partial download. The result dialog displays both version numbers.
 A newer build can be installed normally, while a matching build offers a

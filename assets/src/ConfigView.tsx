@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   type ConfigData,
   type UpdateResult,
@@ -160,6 +160,9 @@ export default function ConfigView({ config }: Props) {
   const [lockdownSecret, setLockdownSecret] = useState(
     config.lockdownSecret ?? ""
   );
+  const [autoCheckForUpdates, setAutoCheckForUpdates] = useState(
+    config.autoCheckForUpdates ?? true
+  );
   const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
   const [urlError, setUrlError] = useState("");
   const [insecureOriginsError, setInsecureOriginsError] = useState("");
@@ -168,22 +171,41 @@ export default function ConfigView({ config }: Props) {
   const [updateCancelling, setUpdateCancelling] = useState(false);
   const [updateSpeedKbps, setUpdateSpeedKbps] = useState<number | null>(null);
   const [updateAlert, setUpdateAlert] = useState<UpdateResult | null>(null);
+  const updateRequestMode = useRef<"automatic" | "manual" | null>(null);
+  const automaticUpdateStarted = useRef(false);
 
   useEffect(() => {
     const removeResultListener = onUpdateResult((result) => {
+      const wasAutomatic = updateRequestMode.current === "automatic";
+      updateRequestMode.current = null;
       setUpdateChecking(false);
       setUpdateCancelling(false);
       setUpdateSpeedKbps(null);
-      setUpdateAlert(result.status === "cancelled" ? null : result);
+      if (result.status === "cancelled") {
+        setUpdateAlert(null);
+      } else if (wasAutomatic && result.status !== "newer") {
+        dismissUpdate();
+        setUpdateAlert(null);
+      } else {
+        setUpdateAlert(result);
+      }
     });
     const removeProgressListener = onUpdateProgress((progress) => {
       setUpdateSpeedKbps(Math.max(0, Math.round(progress.kilobytesPerSecond)));
     });
+
+    if (config.autoCheckForUpdates && !automaticUpdateStarted.current) {
+      automaticUpdateStarted.current = true;
+      updateRequestMode.current = "automatic";
+      setUpdateChecking(true);
+      checkForUpdate();
+    }
+
     return () => {
       removeResultListener();
       removeProgressListener();
     };
-  }, []);
+  }, [config.autoCheckForUpdates]);
 
   function handleUpdate() {
     if (updateChecking) {
@@ -195,6 +217,7 @@ export default function ConfigView({ config }: Props) {
     setUpdateChecking(true);
     setUpdateCancelling(false);
     setUpdateSpeedKbps(null);
+    updateRequestMode.current = "manual";
     checkForUpdate();
   }
 
@@ -279,6 +302,7 @@ export default function ConfigView({ config }: Props) {
       staticHostMappings: normalizedStaticHosts,
       lockdownHeader,
       lockdownSecret: lockdownSecret.trim(),
+      autoCheckForUpdates,
       debugLog,
     });
   }
@@ -507,6 +531,24 @@ export default function ConfigView({ config }: Props) {
           <p className="text-neutral-500 text-[11px] leading-snug">
             Suspends the page to save CPU while the window is hidden. The page is
             still preloaded at startup and wakes when you hover the tray icon.
+          </p>
+        </div>
+      </div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="autoCheckForUpdates"
+          className="mt-0.5"
+          checked={autoCheckForUpdates}
+          onChange={(e) => setAutoCheckForUpdates(e.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="autoCheckForUpdates" className="cursor-pointer">
+            Automatically check for updates
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Checks whenever this dialog opens and prompts only when a newer
+            version is available.
           </p>
         </div>
       </div>
