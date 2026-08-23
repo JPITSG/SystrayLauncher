@@ -157,10 +157,15 @@ export function dismissUpdateConfirmation() {
   );
 }
 
-export function reportHeight(height: number) {
-  window.chrome.webview.postMessage(
-    JSON.stringify({ action: "resize", height })
-  );
+export function reportSize(height: number, width: number) {
+  // width 0 means "keep the current window width"; the host only widens
+  // the dialog when the page reflows into two columns.
+  const message: { action: string; height: number; width?: number } = {
+    action: "resize",
+    height,
+  };
+  if (width > 0) message.width = width;
+  window.chrome.webview.postMessage(JSON.stringify(message));
 }
 
 declare global {

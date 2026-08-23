@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   type ConfigData,
   type UpdateResult,
@@ -176,6 +176,34 @@ export default function ConfigView({
     config.autoCheckForUpdates ?? true
   );
   const [debugLog, setDebugLog] = useState(config.debugLog ?? false);
+  // Two-column reflow: when a single column would overflow the monitor's
+  // usable height (so the dialog would have to scroll), the settings latch
+  // into two balanced CSS columns at roughly double width for the rest of
+  // this dialog session; the host window follows the reported size.
+  const fieldsRef = useRef<HTMLDivElement>(null);
+  const [twoColumn, setTwoColumn] = useState(false);
+  const [twoColumnWidth, setTwoColumnWidth] = useState(0);
+  useLayoutEffect(() => {
+    if (twoColumn) return;
+    const fields = fieldsRef.current;
+    if (!fields) return;
+    const evaluate = () => {
+      // Work-area height minus a generous allowance for the window frame.
+      const usable = window.screen.availHeight - 96;
+      const baseWidth = document.body.clientWidth;
+      if (
+        document.body.scrollHeight > usable &&
+        window.screen.availWidth >= baseWidth * 2 + 64
+      ) {
+        setTwoColumnWidth(baseWidth * 2 + 32);
+        setTwoColumn(true);
+      }
+    };
+    evaluate();
+    const observer = new ResizeObserver(evaluate);
+    observer.observe(fields);
+    return () => observer.disconnect();
+  }, [twoColumn]);
   const [urlError, setUrlError] = useState("");
   const [insecureOriginsError, setInsecureOriginsError] = useState("");
   const [staticHostsError, setStaticHostsError] = useState("");
@@ -355,7 +383,20 @@ export default function ConfigView({
   }
 
   return (
-    <div className="p-4 space-y-3">
+    <div
+      className="p-4 space-y-3"
+      style={twoColumn ? { width: twoColumnWidth } : undefined}
+    >
+      {/* Layout-only wrapper: single column normally, two balanced columns
+          once the settings outgrow the screen; each block stays intact. */}
+      <div
+        ref={fieldsRef}
+        className={
+          twoColumn
+            ? "columns-2 gap-x-8 [&>*]:mb-3 [&>*]:break-inside-avoid"
+            : "space-y-3"
+        }
+      >
       <div className="space-y-1">
         <Label htmlFor="windowTitle">Window Title</Label>
         <Input
@@ -639,6 +680,7 @@ export default function ConfigView({
             issues; leave off for normal use.
           </p>
         </div>
+      </div>
       </div>
 
       <div className="flex items-center justify-between gap-3 pt-1">

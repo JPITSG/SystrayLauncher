@@ -3125,6 +3125,19 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                 contentHeight = atoi(hp);
             }
         }
+        // Optional desired width: sent when the page reflows the settings
+        // into two columns; absent (0) keeps the current window width.
+        char wStr[32] = {0};
+        json_get_string(msg, "width", wStr, sizeof(wStr));
+        int contentWidth = atoi(wStr);
+        if (contentWidth <= 0) {
+            const char *wp = strstr(msg, "\"width\"");
+            if (wp) {
+                wp += 7;
+                while (*wp == ' ' || *wp == ':') wp++;
+                contentWidth = atoi(wp);
+            }
+        }
         // Content-driven sizing must not fight a maximized (or minimized)
         // window; WM_SIZE keeps the WebView bounds in sync there.
         if (contentHeight > 0 && g_cfgHwnd &&
@@ -3138,6 +3151,12 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             int chromeH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
             int newWindowH = physHeight + chromeH;
             int windowW = windowRect.right - windowRect.left;
+            if (contentWidth > 0) {
+                int chromeW = (windowRect.right - windowRect.left) -
+                              (clientRect.right - clientRect.left);
+                windowW = MulDiv(contentWidth, (int)GetWindowDpi(g_cfgHwnd), 96) +
+                          chromeW;
+            }
 
             // Keep the dialog inside the work area of its monitor. Sizing
             // with SWP_NOMOVE kept the top edge where a 380px-tall window
