@@ -25,8 +25,6 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 
 Right-click the tray icon to access:
 
-- **SystrayLauncher Version** - Displays the current application version
-- **WebView2 Version** - Displays the current WebView2 runtime version
 - **Refresh** - Reloads the page and brings window to foreground
 - **Refresh + Clear Cache** - Clears browser cache and reloads
 - **Open** - Shows the main window
@@ -51,6 +49,9 @@ Settings available in the Configure dialog:
 | Automatically check for updates | Checks for a newer repository build whenever the Configure dialog opens and prompts only when one is available. Enabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (recovery attempts, web view rebuilds, power transitions) to `%LOCALAPPDATA%\SystrayLauncher\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
 
+The footer displays the application and WebView2 runtime versions together as
+`v<application version> / <WebView2 version>`.
+
 When **Automatically check for updates** is enabled, opening the Configure
 dialog makes a fresh request for the repository's
 [`release/SystrayLauncher.exe`](release/SystrayLauncher.exe). A newer build
@@ -67,9 +68,10 @@ A newer build can be installed normally, while a matching build offers a
 **Force update** action to reinstall it; an older repository build is never
 installed. Installation requests standard Windows UAC approval, safely
 replaces the current executable, and restarts the launcher. After a successful
-update, the restarted launcher confirms the newly installed version. Cancelling
-the download, result dialog, or UAC prompt leaves the current version running.
-File size is used only to validate the download and enforce its safety limit.
+update, the restarted launcher opens an HTML confirmation with the newly
+installed version. Cancelling the download, result dialog, or UAC prompt leaves
+the current version running. File size is used only to validate the download
+and enforce its safety limit.
 
 ## Static Host Mappings
 

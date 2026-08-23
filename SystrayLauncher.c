@@ -242,6 +242,8 @@ static ICoreWebView2Controller* g_cfgController = NULL;
 static ICoreWebView2* g_cfgWebView = NULL;
 static BOOL g_cfgSaved = FALSE;
 static BOOL g_cfgWindowShown = FALSE;
+static BOOL g_updateConfirmationPending = FALSE;
+static BOOL g_cfgCloseAfterUpdateConfirmation = FALSE;
 static int g_cfgShowFallbackTries = 0;
 static volatile LONG g_updateCheckPending = FALSE;
 static BOOL g_updateInstallReady = FALSE;
@@ -1037,6 +1039,18 @@ static BOOL load_webview2_loader(void) {
         }
     }
     return FALSE;
+}
+
+static void RefreshWebView2VersionString(void) {
+    if (!fnGetAvailableBrowserVersion) return;
+
+    LPWSTR versionString = NULL;
+    if (SUCCEEDED(fnGetAvailableBrowserVersion(NULL, &versionString)) &&
+        versionString && versionString[0] != L'\0') {
+        wcscpy_s(g_webView2Version,
+                 sizeof(g_webView2Version) / sizeof(wchar_t), versionString);
+    }
+    CoTaskMemFree(versionString);
 }
 
 // --- Self update -----------------------------------------------------------
@@ -1934,17 +1948,6 @@ static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted) {
     return result;
 }
 
-static void ShowUpdateCompletedMessage(void) {
-    wchar_t message[160];
-    int messageLength = swprintf_s(message,
-        sizeof(message) / sizeof(wchar_t),
-        APP_NAME L" has been updated to version %s.", APP_VERSION_WSTRING);
-    if (messageLength <= 0) return;
-
-    MessageBoxW(NULL, message, L"Update complete",
-                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
-}
-
 // JSON helpers
 static BOOL json_get_string(const char *json, const char *key, char *out, size_t outLen) {
     char search[128];
@@ -2357,7 +2360,8 @@ static void cfg_sync_controller_bounds(void) {
 
 static void webview_push_init_config(void) {
     wchar_t eUrl[4096], eTitle[512], eHide[8192], eShow[8192], eInsecureOrigins[4096];
-    wchar_t eStaticHosts[4096], eLockdownSecret[512];
+    wchar_t eStaticHosts[4096], eLockdownSecret[512], eWebView2Version[256];
+    wchar_t eUpdateCompletedVersion[64];
     json_escape_wstring(g_config.url, eUrl, 4096);
     json_escape_wstring(g_config.windowTitle, eTitle, 512);
     json_escape_wstring(g_config.onHideJs, eHide, 8192);
@@ -2365,16 +2369,19 @@ static void webview_push_init_config(void) {
     json_escape_wstring(g_config.insecureContentOrigins, eInsecureOrigins, 4096);
     json_escape_wstring(g_config.staticHostMappings, eStaticHosts, 4096);
     json_escape_wstring(g_config.lockdownSecret, eLockdownSecret, 512);
+    json_escape_wstring(g_webView2Version, eWebView2Version, 256);
+    json_escape_wstring(g_updateConfirmationPending ? APP_VERSION_WSTRING : L"",
+                        eUpdateCompletedVersion, 64);
 
     // Sized for every field at maximum, fully escaped, plus the JSON scaffold.
     // A fixed 16K buffer used to silently truncate the script for large JS
     // hooks, which broke onInit and left the dialog blank.
     const size_t scriptCch =
-        4096 + 512 + 8192 + 8192 + 4096 + 4096 + 512 + 576;
+        4096 + 512 + 8192 + 8192 + 4096 + 4096 + 512 + 256 + 64 + 672;
     wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
     if (!script) return;
     int written = swprintf(script, scriptCch,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"debugLog\":%s}})",
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
         eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false",
         g_config.openNewWindowsExternally ? L"true" : L"false",
         g_config.allowRunningInsecureContent ? L"true" : L"false",
@@ -2384,7 +2391,9 @@ static void webview_push_init_config(void) {
         g_config.lockdownHeader ? L"true" : L"false",
         eLockdownSecret,
         g_config.autoCheckForUpdates ? L"true" : L"false",
-        g_config.debugLogEnabled ? L"true" : L"false");
+        g_config.debugLogEnabled ? L"true" : L"false",
+        eWebView2Version,
+        eUpdateCompletedVersion);
     if (written > 0) {
         webview_cfg_execute_script(script);
     }
@@ -2580,6 +2589,13 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         InstallPreparedUpdate();
     } else if (strcmp(action, "dismissUpdate") == 0) {
         DiscardPreparedUpdate();
+    } else if (strcmp(action, "dismissUpdateConfirmation") == 0) {
+        g_updateConfirmationPending = FALSE;
+        BOOL closeConfig = g_cfgCloseAfterUpdateConfirmation;
+        g_cfgCloseAfterUpdateConfirmation = FALSE;
+        if (closeConfig && g_cfgHwnd) {
+            PostMessageW(g_cfgHwnd, WM_CLOSE, 0, 0);
+        }
     } else if (strcmp(action, "saveSettings") == 0) {
         char url[4096] = {0}, title[512] = {0}, hideJs[8192] = {0}, showJs[8192] = {0};
         char insecureOrigins[8192] = {0}, staticHosts[8192] = {0};
@@ -5576,16 +5592,7 @@ void ShowContextMenu(HWND hwnd) {
     POINT pt;
     GetCursorPos(&pt);
 
-    // Build version strings for menu
-    wchar_t appVersionLabel[160];
-    wchar_t versionLabel[160];
-    swprintf_s(appVersionLabel, 160, L"%s %s", APP_NAME, APP_VERSION_WSTRING);
-    swprintf_s(versionLabel, 160, L"WebView2: %s", g_webView2Version);
-
     HMENU hMenu = CreatePopupMenu();
-    AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, appVersionLabel);
-    AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, versionLabel);
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_REFRESH, L"Refresh");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_CLEAR_CACHE, L"Refresh + Clear Cache");
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_MENU_RESTART, L"Restart");
@@ -6016,6 +6023,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (g_hMutex) { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); }
         return 1;
     }
+    RefreshWebView2VersionString();
 
     // Get exe directory
     wchar_t exePath[MAX_PATH];
@@ -6111,10 +6119,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     CreateTrayIcon(g_hwnd);
 
     // A successful replacement starts exactly once with --finish-update.
-    // Present the installed version after normal startup is ready; recovery
-    // launches use --finish-update-cleanup and intentionally stay silent.
+    // Present its confirmation in the HTML configuration UI after normal
+    // startup is ready; recovery launches intentionally stay silent.
     if (updateCompleted) {
-        ShowUpdateCompletedMessage();
+        g_updateConfirmationPending = TRUE;
+        g_cfgCloseAfterUpdateConfirmation = TRUE;
+        ShowConfigWebViewDialog();
     }
     
     // Message loop

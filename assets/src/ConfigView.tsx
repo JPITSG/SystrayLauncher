@@ -8,6 +8,7 @@ import {
   cancelUpdateCheck,
   installUpdate,
   dismissUpdate,
+  dismissUpdateConfirmation,
   onUpdateResult,
   onUpdateProgress,
 } from "./lib/bridge";
@@ -19,6 +20,8 @@ import { Textarea } from "./components/ui/textarea";
 
 interface Props {
   config: ConfigData;
+  webView2Version: string;
+  updateCompletedVersion: string;
 }
 
 function normalizeHttpOrigins(raw: string): string {
@@ -131,7 +134,11 @@ function normalizeStaticHostMappings(raw: string): string {
   return mappings.join(",");
 }
 
-export default function ConfigView({ config }: Props) {
+export default function ConfigView({
+  config,
+  webView2Version,
+  updateCompletedVersion,
+}: Props) {
   const [windowTitle, setWindowTitle] = useState(config.windowTitle);
   const [url, setUrl] = useState(config.url);
   const [onHideJs, setOnHideJs] = useState(config.onHideJs);
@@ -170,7 +177,17 @@ export default function ConfigView({ config }: Props) {
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateCancelling, setUpdateCancelling] = useState(false);
   const [updateSpeedKbps, setUpdateSpeedKbps] = useState<number | null>(null);
-  const [updateAlert, setUpdateAlert] = useState<UpdateResult | null>(null);
+  const [updateAlert, setUpdateAlert] = useState<UpdateResult | null>(() =>
+    updateCompletedVersion
+      ? {
+          status: "completed",
+          title: "Update complete",
+          message: `SystrayLauncher has been updated to version ${updateCompletedVersion}.`,
+          currentVersion: "",
+          remoteVersion: "",
+        }
+      : null
+  );
   const updateRequestMode = useRef<"automatic" | "manual" | null>(null);
   const automaticUpdateStarted = useRef(false);
 
@@ -194,7 +211,11 @@ export default function ConfigView({ config }: Props) {
       setUpdateSpeedKbps(Math.max(0, Math.round(progress.kilobytesPerSecond)));
     });
 
-    if (config.autoCheckForUpdates && !automaticUpdateStarted.current) {
+    if (
+      config.autoCheckForUpdates &&
+      !updateCompletedVersion &&
+      !automaticUpdateStarted.current
+    ) {
       automaticUpdateStarted.current = true;
       updateRequestMode.current = "automatic";
       setUpdateChecking(true);
@@ -205,7 +226,7 @@ export default function ConfigView({ config }: Props) {
       removeResultListener();
       removeProgressListener();
     };
-  }, [config.autoCheckForUpdates]);
+  }, [config.autoCheckForUpdates, updateCompletedVersion]);
 
   function handleUpdate() {
     if (updateChecking) {
@@ -229,7 +250,11 @@ export default function ConfigView({ config }: Props) {
   }
 
   function handleDismissUpdate() {
-    dismissUpdate();
+    if (updateAlert?.status === "completed") {
+      dismissUpdateConfirmation();
+    } else {
+      dismissUpdate();
+    }
     setUpdateAlert(null);
   }
 
@@ -574,8 +599,11 @@ export default function ConfigView({ config }: Props) {
       </div>
 
       <div className="flex items-center justify-between gap-3 pt-1">
-        <span className="select-none text-[11px] leading-none tabular-nums text-neutral-400">
-          v{__APP_VERSION__}
+        <span
+          className="select-none whitespace-nowrap text-[11px] leading-none tabular-nums text-neutral-400"
+          title="Application version / WebView2 version"
+        >
+          v{__APP_VERSION__} / {webView2Version}
         </span>
         <div className="flex items-center gap-2">
           <Button

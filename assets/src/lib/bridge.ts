@@ -17,10 +17,18 @@ export interface ConfigData {
 
 export interface InitData {
   config: ConfigData;
+  webView2Version: string;
+  updateCompletedVersion: string;
 }
 
 export interface UpdateResult {
-  status: "newer" | "same" | "older" | "cancelled" | "error";
+  status:
+    | "newer"
+    | "same"
+    | "older"
+    | "cancelled"
+    | "error"
+    | "completed";
   title: string;
   message: string;
   currentVersion: string;
@@ -121,6 +129,12 @@ export function installUpdate() {
 export function dismissUpdate() {
   window.chrome.webview.postMessage(
     JSON.stringify({ action: "dismissUpdate" })
+  );
+}
+
+export function dismissUpdateConfirmation() {
+  window.chrome.webview.postMessage(
+    JSON.stringify({ action: "dismissUpdateConfirmation" })
   );
 }
 
