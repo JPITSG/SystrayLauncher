@@ -12,6 +12,8 @@ export interface ConfigData {
   lockdownHeader: boolean;
   lockdownSecret: string;
   autoCheckForUpdates: boolean;
+  updateCheckPending: boolean;
+  updatePromptPending: boolean;
   debugLog: boolean;
 }
 
@@ -33,6 +35,7 @@ export interface UpdateResult {
   message: string;
   currentVersion: string;
   remoteVersion: string;
+  automatic: boolean;
 }
 
 export interface UpdateProgress {
@@ -110,8 +113,16 @@ export function closeDialog() {
   window.chrome.webview.postMessage(JSON.stringify({ action: "close" }));
 }
 
-export function checkForUpdate() {
-  window.chrome.webview.postMessage(JSON.stringify({ action: "checkUpdate" }));
+export function configReady(checkAutomatically = false) {
+  window.chrome.webview.postMessage(
+    JSON.stringify({ action: "configReady", checkAutomatically })
+  );
+}
+
+export function checkForUpdate(automatic = false) {
+  window.chrome.webview.postMessage(
+    JSON.stringify({ action: "checkUpdate", automatic })
+  );
 }
 
 export function cancelUpdateCheck() {
@@ -129,6 +140,12 @@ export function installUpdate() {
 export function dismissUpdate() {
   window.chrome.webview.postMessage(
     JSON.stringify({ action: "dismissUpdate" })
+  );
+}
+
+export function ignoreUpdateVersion(version: string) {
+  window.chrome.webview.postMessage(
+    JSON.stringify({ action: "ignoreUpdateVersion", version })
   );
 }
 
