@@ -66,9 +66,10 @@ remove the partial download. The result dialog displays both version numbers.
 A newer build can be installed normally, while a matching build offers a
 **Force update** action to reinstall it; an older repository build is never
 installed. Installation requests standard Windows UAC approval, safely
-replaces the current executable, and restarts the launcher. Cancelling the
-download, result dialog, or UAC prompt leaves the current version running. File
-size is used only to validate the download and enforce its safety limit.
+replaces the current executable, and restarts the launcher. After a successful
+update, the restarted launcher confirms the newly installed version. Cancelling
+the download, result dialog, or UAC prompt leaves the current version running.
+File size is used only to validate the download and enforce its safety limit.
 
 ## Static Host Mappings
 

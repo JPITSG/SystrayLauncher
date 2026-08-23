@@ -1636,11 +1636,15 @@ static HANDLE DuplicateUpdateLaunchToken(HANDLE process) {
 
 static BOOL LaunchUpdateTarget(LPCWSTR targetPath, LPCWSTR stagedPath,
                                LPCWSTR helperPath, DWORD helperProcessId,
-                               DWORD oldProcessId, HANDLE launchToken) {
+                               DWORD oldProcessId, HANDLE launchToken,
+                               BOOL successfulUpdate) {
     wchar_t commandLine[MAX_PATH * 3 + 256];
+    LPCWSTR finishAction = successfulUpdate
+        ? L"--finish-update"
+        : L"--finish-update-cleanup";
     int commandLength = swprintf_s(commandLine,
         sizeof(commandLine) / sizeof(wchar_t),
-        L"\"%s\" --finish-update %lu %lu \"%s\" \"%s\"", targetPath,
+        L"\"%s\" %s %lu %lu \"%s\" \"%s\"", targetPath, finishAction,
         (unsigned long)helperProcessId, (unsigned long)oldProcessId,
         stagedPath, helperPath);
     if (commandLength <= 0 ||
@@ -1685,7 +1689,7 @@ static int RestartAfterUpdateFailure(LPCWSTR targetPath, LPCWSTR stagedPath,
                                      HANDLE launchToken, LPCWSTR message) {
     MessageBoxW(NULL, message, APP_NAME L" Update", MB_OK | MB_ICONERROR);
     LaunchUpdateTarget(targetPath, stagedPath, helperPath,
-                       GetCurrentProcessId(), oldProcessId, launchToken);
+                       GetCurrentProcessId(), oldProcessId, launchToken, FALSE);
     if (launchToken) CloseHandle(launchToken);
     DeleteUpdateTempFile(stagedPath);
     SetFileAttributesW(helperPath, FILE_ATTRIBUTE_NORMAL);
@@ -1824,7 +1828,7 @@ static int RunUpdateApplyHelper(DWORD oldProcessId, LPCWSTR readyEventName,
     }
 
     if (!LaunchUpdateTarget(targetPath, stagedPath, helperPath,
-                            helperProcessId, oldProcessId, launchToken)) {
+                            helperProcessId, oldProcessId, launchToken, TRUE)) {
         DeleteFileW(targetPath);
         if (!MoveFileExW(backupPath, targetPath,
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -1853,7 +1857,7 @@ static int RunUpdateApplyHelper(DWORD oldProcessId, LPCWSTR readyEventName,
     return 0;
 }
 
-static void FinishUpdateCleanup(DWORD helperProcessId, DWORD oldProcessId,
+static BOOL FinishUpdateCleanup(DWORD helperProcessId, DWORD oldProcessId,
                                 LPCWSTR stagedPath, LPCWSTR helperPath) {
     wchar_t targetPath[MAX_PATH], expectedStagedPath[MAX_PATH];
     wchar_t expectedHelperPath[MAX_PATH];
@@ -1864,7 +1868,7 @@ static void FinishUpdateCleanup(DWORD helperProcessId, DWORD oldProcessId,
         !BuildUpdateTempPath(expectedHelperPath, L"updater", oldProcessId) ||
         _wcsicmp(stagedPath, expectedStagedPath) != 0 ||
         _wcsicmp(helperPath, expectedHelperPath) != 0) {
-        return;
+        return FALSE;
     }
 
     HANDLE helperProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -1889,13 +1893,15 @@ static void FinishUpdateCleanup(DWORD helperProcessId, DWORD oldProcessId,
          ++attempt) {
         Sleep(100);
     }
+    return TRUE;
 }
 
 // Returns an exit code and sets handled for the temporary updater process.
-// The finish mode performs cleanup and then continues normal application
-// startup, so handled remains false for that path.
-static int HandleUpdateCommandLine(BOOL* handled) {
+// Both finish modes perform cleanup and continue normal application startup;
+// updateCompleted identifies only a successful executable replacement.
+static int HandleUpdateCommandLine(BOOL* handled, BOOL* updateCompleted) {
     if (handled) *handled = FALSE;
+    if (updateCompleted) *updateCompleted = FALSE;
     int argumentCount = 0;
     LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
     if (!arguments) return 0;
@@ -1911,16 +1917,32 @@ static int HandleUpdateCommandLine(BOOL* handled) {
                                           arguments[4], arguments[5]);
         }
     } else if (argumentCount == 6 &&
-               wcscmp(arguments[1], L"--finish-update") == 0) {
+               (wcscmp(arguments[1], L"--finish-update") == 0 ||
+                wcscmp(arguments[1], L"--finish-update-cleanup") == 0)) {
         DWORD helperProcessId = 0, oldProcessId = 0;
         if (ParseUpdateProcessId(arguments[2], &helperProcessId) &&
             ParseUpdateProcessId(arguments[3], &oldProcessId)) {
-            FinishUpdateCleanup(helperProcessId, oldProcessId,
-                                arguments[4], arguments[5]);
+            BOOL recognizedHandoff = FinishUpdateCleanup(
+                helperProcessId, oldProcessId, arguments[4], arguments[5]);
+            if (recognizedHandoff && updateCompleted &&
+                wcscmp(arguments[1], L"--finish-update") == 0) {
+                *updateCompleted = TRUE;
+            }
         }
     }
     LocalFree(arguments);
     return result;
+}
+
+static void ShowUpdateCompletedMessage(void) {
+    wchar_t message[160];
+    int messageLength = swprintf_s(message,
+        sizeof(message) / sizeof(wchar_t),
+        APP_NAME L" has been updated to version %s.", APP_VERSION_WSTRING);
+    if (messageLength <= 0) return;
+
+    MessageBoxW(NULL, message, L"Update complete",
+                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
 }
 
 // JSON helpers
@@ -5951,7 +5973,9 @@ void DebugPrint(const wchar_t* format, ...) {
 // Entry point
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     BOOL updateHelperHandled = FALSE;
-    int updateHelperResult = HandleUpdateCommandLine(&updateHelperHandled);
+    BOOL updateCompleted = FALSE;
+    int updateHelperResult = HandleUpdateCommandLine(
+        &updateHelperHandled, &updateCompleted);
     if (updateHelperHandled) return updateHelperResult;
 
     g_hInstance = hInstance;
@@ -6085,6 +6109,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     // Create tray icon (loads embedded icon)
     CreateTrayIcon(g_hwnd);
+
+    // A successful replacement starts exactly once with --finish-update.
+    // Present the installed version after normal startup is ready; recovery
+    // launches use --finish-update-cleanup and intentionally stay silent.
+    if (updateCompleted) {
+        ShowUpdateCompletedMessage();
+    }
     
     // Message loop
     MSG msg;
