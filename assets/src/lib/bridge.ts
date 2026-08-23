@@ -157,14 +157,22 @@ export function dismissUpdateConfirmation() {
   );
 }
 
-export function reportSize(height: number, width: number) {
-  // width 0 means "keep the current window width"; the host only widens
-  // the dialog when the page reflows into two columns.
+// The width the page wants the host window to provide, in CSS pixels; 0
+// means "keep the current window width". Set by the two-column reflow. The
+// layout caps itself at the viewport width (max-width: 100%), so the wanted
+// width is tracked here explicitly instead of being measured from overflow.
+let desiredContentWidth = 0;
+
+export function setDesiredContentWidth(width: number) {
+  desiredContentWidth = width;
+}
+
+export function reportSize(height: number) {
   const message: { action: string; height: number; width?: number } = {
     action: "resize",
     height,
   };
-  if (width > 0) message.width = width;
+  if (desiredContentWidth > 0) message.width = desiredContentWidth;
   window.chrome.webview.postMessage(JSON.stringify(message));
 }
 

@@ -13,6 +13,7 @@ import {
   dismissUpdateConfirmation,
   onUpdateResult,
   onUpdateProgress,
+  setDesiredContentWidth,
 } from "./lib/bridge";
 import { Button } from "./components/ui/button";
 import { Checkbox } from "./components/ui/checkbox";
@@ -195,7 +196,9 @@ export default function ConfigView({
         document.body.scrollHeight > usable &&
         window.screen.availWidth >= baseWidth * 2 + 64
       ) {
-        setTwoColumnWidth(baseWidth * 2 + 32);
+        const width = baseWidth * 2 + 32;
+        setDesiredContentWidth(width);
+        setTwoColumnWidth(width);
         setTwoColumn(true);
       }
     };
@@ -385,7 +388,12 @@ export default function ConfigView({
   return (
     <div
       className="p-4 space-y-3"
-      style={twoColumn ? { width: twoColumnWidth } : undefined}
+      style={
+        // maxWidth absorbs sub-pixel DPI rounding and scrollbar-width
+        // differences between the wanted and granted window size, so the
+        // fixed-width layout can never spill into a horizontal scrollbar.
+        twoColumn ? { width: twoColumnWidth, maxWidth: "100%" } : undefined
+      }
     >
       {/* Layout-only wrapper: single column normally, two balanced columns
           once the settings outgrow the screen; each block stays intact. */}
