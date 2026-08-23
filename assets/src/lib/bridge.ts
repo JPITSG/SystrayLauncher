@@ -9,6 +9,7 @@ export interface ConfigData {
   insecureContentOrigins: string;
   useStaticHostMappings: boolean;
   staticHostMappings: string;
+  staticHostDnsFallback: boolean;
   lockdownHeader: boolean;
   lockdownSecret: string;
   autoCheckForUpdates: boolean;
@@ -101,6 +102,7 @@ export function saveSettings(config: ConfigData) {
       insecureContentOrigins: config.insecureContentOrigins,
       useStaticHostMappings: config.useStaticHostMappings,
       staticHostMappings: config.staticHostMappings,
+      staticHostDnsFallback: config.staticHostDnsFallback,
       lockdownHeader: config.lockdownHeader,
       lockdownSecret: config.lockdownSecret,
       autoCheckForUpdates: config.autoCheckForUpdates,

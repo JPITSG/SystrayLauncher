@@ -163,6 +163,9 @@ export default function ConfigView({
   const [staticHostMappings, setStaticHostMappings] = useState(
     (config.staticHostMappings ?? "").split(",").join("\n")
   );
+  const [staticHostDnsFallback, setStaticHostDnsFallback] = useState(
+    config.staticHostDnsFallback ?? false
+  );
   const [lockdownHeader, setLockdownHeader] = useState(
     config.lockdownHeader ?? false
   );
@@ -341,6 +344,7 @@ export default function ConfigView({
       insecureContentOrigins: normalizedInsecureOrigins,
       useStaticHostMappings,
       staticHostMappings: normalizedStaticHosts,
+      staticHostDnsFallback,
       lockdownHeader,
       lockdownSecret: lockdownSecret.trim(),
       autoCheckForUpdates,
@@ -446,6 +450,27 @@ export default function ConfigView({
             {staticHostsError && (
               <p className="text-red-600 text-[11px]">{staticHostsError}</p>
             )}
+            <div className="flex items-start gap-2 pt-1">
+              <Checkbox
+                id="staticHostDnsFallback"
+                className="mt-0.5"
+                checked={staticHostDnsFallback}
+                onChange={(e) => setStaticHostDnsFallback(e.target.checked)}
+              />
+              <div className="space-y-0.5">
+                <Label htmlFor="staticHostDnsFallback" className="cursor-pointer">
+                  Fall back to standard DNS when a mapped address is unreachable
+                </Label>
+                <p className="text-neutral-500 text-[11px] leading-snug">
+                  Routes only the listed hostnames through a small local helper
+                  that connects to the mapped address when it responds and
+                  quietly uses normal DNS resolution while it does not,
+                  re-trying the mapped address about once a minute. Useful when
+                  the mapped addresses are reachable only from certain
+                  networks. Changing this setting restarts the launcher.
+                </p>
+              </div>
+            </div>
           </div>
         )}
       </div>

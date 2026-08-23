@@ -100,6 +100,24 @@ API. Microsoft documents browser flags as development-oriented and not
 guaranteed long-term, so the behavior should be tested when deploying a new
 WebView2 Runtime version.
 
+When **Fall back to standard DNS when a mapped address is unreachable** is
+also enabled, the launcher enforces the mappings itself instead of using
+resolver rules: it runs a small forward proxy on `127.0.0.1` (random port,
+loopback only) and starts the browser with `--proxy-pac-url` pointing at a
+generated PAC script that routes only the listed hostnames through the proxy
+— all other traffic stays direct, and the PAC's `DIRECT` fallback keeps pages
+loading even if the proxy itself ever stops answering. For each hostname the
+proxy first attempts a TCP connection to the mapped address with a short
+timeout; if that fails, the same request is completed through normal DNS
+resolution, and the mapped address is then re-tried at most once per minute
+(triggered by traffic, and immediately after the machine resumes from sleep).
+While the mapped address answers, all connections use it until one fails,
+which switches the hostname back to DNS resolution in the same request. This
+suits mappings that are only reachable from certain networks. Requests for
+hostnames that are not listed are refused by the proxy, HTTPS certificates
+are still validated against the hostname exactly as above, and if the proxy
+cannot start the launcher falls back to the strict resolver-rules behavior.
+
 The mixed-content option starts WebView2 with the documented
 [`--unsafely-treat-insecure-origin-as-secure`](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/webview-features-flags#available-webview2-browser-flags)
 switch for the exact origins entered in the dialog. Paste a full HTTP URL if

@@ -81,6 +81,7 @@
 #define REG_VALUE_INSECURE_CONTENT_ORIGINS L"InsecureContentOrigins"
 #define REG_VALUE_STATIC_HOSTS L"UseStaticHostMappings"
 #define REG_VALUE_STATIC_HOST_MAPPINGS L"StaticHostMappings"
+#define REG_VALUE_STATIC_HOST_DNS_FALLBACK L"StaticHostDnsFallback"
 #define REG_VALUE_LOCKDOWN L"LockdownHeader"
 #define REG_VALUE_LOCKDOWN_SECRET L"LockdownSecret"
 #define REG_VALUE_AUTO_UPDATE L"AutoCheckForUpdates"
@@ -153,6 +154,29 @@
 // responding and the WebView has to be rebuilt.
 #define WM_APP_WEBVIEW_RECREATE (WM_APP + 2)
 
+// Static host DNS fallback (see StartStaticHostProxy). A small loopback
+// forward proxy inside the launcher process; the browser reaches it through
+// --proxy-pac-url and the generated PAC script routes only the configured
+// static hostnames to it, so all other traffic stays direct. Per host the
+// proxy prefers the mapped address and falls back to standard DNS while the
+// mapped address is unreachable, re-trying it at most once per interval.
+#define HOST_PROXY_PAC_PATH "/proxy.pac"
+#define HOST_PROXY_MAX_MAPPINGS 256
+#define HOST_PROXY_MAX_TUNNELS 64
+#define HOST_PROXY_LISTEN_BACKLOG 16
+#define HOST_PROXY_HEAD_MAX_BYTES (16 * 1024)
+#define HOST_PROXY_IO_BUFFER_BYTES (16 * 1024)
+// Connect budget for the mapped address, shared by the in-band attempt and
+// the side-car probe so both agree on what "reachable" means. Short, so a
+// page load that races a dead mapped address stays under a second before
+// the DNS fallback takes over.
+#define HOST_PROXY_MAPPED_CONNECT_TIMEOUT_MS 800
+#define HOST_PROXY_DNS_CONNECT_TIMEOUT_MS 10000
+#define HOST_PROXY_PROBE_INTERVAL_MS 60000
+#define HOST_PROXY_HEAD_READ_TIMEOUT_MS 15000
+#define HOST_PROXY_POLL_TICK_MS 1000
+#define HOST_PROXY_SHUTDOWN_WAIT_MS 5000
+
 typedef struct {
     wchar_t url[2048];
     wchar_t windowTitle[256];
@@ -164,6 +188,7 @@ typedef struct {
     wchar_t insecureContentOrigins[2048];
     BOOL useStaticHostMappings;
     wchar_t staticHostMappings[2048];
+    BOOL staticHostDnsFallback;
     BOOL lockdownHeader;
     wchar_t lockdownSecret[256];
     BOOL autoCheckForUpdates;
@@ -255,6 +280,51 @@ static volatile LONG g_updateRequestSequence = 0;
 static HANDLE g_updateCancelEvent = NULL;
 static volatile LONG g_updateSpeedKbps = 0;
 static volatile LONG g_updateProgressPosted = FALSE;
+
+// Static host DNS fallback proxy state.
+typedef enum {
+    HOST_PROXY_UNTESTED = 0,   // mapped address not yet tried this run
+    HOST_PROXY_MAPPED_ACTIVE,  // mapped address answered; keep using it
+    HOST_PROXY_FALLBACK        // mapped address unreachable; use standard DNS
+} HostProxyBreakerState;
+
+typedef struct {
+    char host[254];        // lowercase ASCII hostname
+    char address[64];      // numeric address literal, IPv6 brackets stripped
+    int addressFamily;     // AF_INET or AF_INET6
+    HostProxyBreakerState state;  // guarded by g_hostProxyLock
+    ULONGLONG lastProbeTick;      // tick of the last failed mapped attempt
+    BOOL probeInFlight;           // single-flight guard for side-car probes
+} HostProxyMapping;
+
+// Tunnel nodes are owned by their connection thread: the accept thread links
+// a node into the list (under g_hostProxyLock) before starting the thread,
+// and only the owning thread unlinks, closes and frees it. Everyone else -
+// CloseHostTunnelsForMapping, StopStaticHostProxy - may only shutdown() the
+// sockets of nodes found on the list while holding the lock, which is safe
+// because a linked node cannot be freed concurrently.
+typedef struct HostProxyTunnel {
+    SOCKET client;
+    SOCKET upstream;       // INVALID_SOCKET until connected
+    int mappingIndex;      // index into g_hostProxyMappings, -1 before parse
+    volatile LONG abortRequested;
+    struct HostProxyTunnel* next;
+    struct HostProxyTunnel* prev;
+} HostProxyTunnel;
+
+static BOOL g_winsockInitialized = FALSE;
+// Guards breaker state, probe flags and the tunnel list. Never held across
+// a blocking call (connect/getaddrinfo/send/recv/logging).
+static CRITICAL_SECTION g_hostProxyLock;
+static HostProxyMapping* g_hostProxyMappings = NULL;
+static size_t g_hostProxyMappingCount = 0;
+static SOCKET g_hostProxyListenSocket = INVALID_SOCKET;
+static unsigned short g_hostProxyPort = 0;  // 0 = proxy not running
+static HANDLE g_hostProxyAcceptThread = NULL;
+static volatile LONG g_hostProxyStopping = FALSE;
+static volatile LONG g_hostProxyWorkerCount = 0;  // connection + probe threads
+static HostProxyTunnel* g_hostProxyTunnelList = NULL;
+static char* g_hostProxyPacScript = NULL;
 
 typedef struct {
     WORD major;
@@ -501,6 +571,7 @@ void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     config->insecureContentOrigins[0] = L'\0';
     config->useStaticHostMappings = FALSE;
     config->staticHostMappings[0] = L'\0';
+    config->staticHostDnsFallback = FALSE;
     config->lockdownHeader = FALSE;
     config->lockdownSecret[0] = L'\0';
     config->autoCheckForUpdates = TRUE;
@@ -584,6 +655,9 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
         config->useStaticHostMappings = (c == L'1' || c == L't' || c == L'y');
     } else if (wcscmp(key, L"statichostmappings") == 0) {
         wcscpy_s(config->staticHostMappings, 2048, value);
+    } else if (wcscmp(key, L"statichostdnsfallback") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->staticHostDnsFallback = (c == L'1' || c == L't' || c == L'y');
     } else if (wcscmp(key, L"lockdownheader") == 0) {
         wchar_t c = towlower(value[0]);
         config->lockdownHeader = (c == L'1' || c == L't' || c == L'y');
@@ -705,6 +779,16 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         config->staticHostMappings[2047] = L'\0';
     }
 
+    // Load the DNS-fallback mode for static host mappings (default disabled).
+    DWORD staticHostFallbackVal = 0;
+    dataSize = sizeof(staticHostFallbackVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_STATIC_HOST_DNS_FALLBACK, NULL, &dataType,
+                         (LPBYTE)&staticHostFallbackVal, &dataSize) == ERROR_SUCCESS) {
+        config->staticHostDnsFallback = (staticHostFallbackVal != 0);
+    } else {
+        config->staticHostDnsFallback = FALSE;
+    }
+
     // Load LockdownHeader (default disabled)
     DWORD lockdownVal = 0;
     dataSize = sizeof(lockdownVal);
@@ -811,6 +895,9 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     RegSetValueExW(hKey, REG_VALUE_STATIC_HOST_MAPPINGS, 0, REG_SZ,
                    (const BYTE*)config->staticHostMappings,
                    (DWORD)((wcslen(config->staticHostMappings) + 1) * sizeof(wchar_t)));
+    DWORD staticHostFallbackVal = config->staticHostDnsFallback ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_STATIC_HOST_DNS_FALLBACK, 0, REG_DWORD,
+                   (const BYTE*)&staticHostFallbackVal, sizeof(staticHostFallbackVal));
 
     // Save LockdownHeader
     DWORD lockdownVal = config->lockdownHeader ? 1 : 0;
@@ -2601,17 +2688,18 @@ static void webview_push_init_config(void) {
     // A fixed 16K buffer used to silently truncate the script for large JS
     // hooks, which broke onInit and left the dialog blank.
     const size_t scriptCch =
-        4096 + 512 + 8192 + 8192 + 4096 + 4096 + 512 + 256 + 64 + 768;
+        4096 + 512 + 8192 + 8192 + 4096 + 4096 + 512 + 256 + 64 + 832;
     wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
     if (!script) return;
     int written = swprintf(script, scriptCch,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"staticHostDnsFallback\":%s,\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
         eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false",
         g_config.openNewWindowsExternally ? L"true" : L"false",
         g_config.allowRunningInsecureContent ? L"true" : L"false",
         eInsecureOrigins,
         g_config.useStaticHostMappings ? L"true" : L"false",
         eStaticHosts,
+        g_config.staticHostDnsFallback ? L"true" : L"false",
         g_config.lockdownHeader ? L"true" : L"false",
         eLockdownSecret,
         g_config.autoCheckForUpdates ? L"true" : L"false",
@@ -2870,6 +2958,7 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             g_config.insecureContentOrigins[0] = L'\0';
         }
         BOOL oldUseStaticHostMappings = g_config.useStaticHostMappings;
+        BOOL oldStaticHostDnsFallback = g_config.staticHostDnsFallback;
         wchar_t oldStaticHostMappings[2048];
         wcscpy_s(oldStaticHostMappings, 2048, g_config.staticHostMappings);
         g_config.useStaticHostMappings =
@@ -2878,6 +2967,8 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                                 g_config.staticHostMappings, 2048) == 0) {
             g_config.staticHostMappings[0] = L'\0';
         }
+        g_config.staticHostDnsFallback =
+            json_get_bool(msg, "staticHostDnsFallback", FALSE);
         char lockdownSecret[1024] = {0};
         json_get_string(msg, "lockdownSecret", lockdownSecret, sizeof(lockdownSecret));
         g_config.lockdownHeader = json_get_bool(msg, "lockdownHeader", FALSE);
@@ -2899,6 +2990,7 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             (oldAllowRunningInsecureContent != g_config.allowRunningInsecureContent ||
              wcscmp(oldInsecureContentOrigins, g_config.insecureContentOrigins) != 0 ||
              oldUseStaticHostMappings != g_config.useStaticHostMappings ||
+             oldStaticHostDnsFallback != g_config.staticHostDnsFallback ||
              wcscmp(oldStaticHostMappings, g_config.staticHostMappings) != 0)) {
             // Browser arguments are fixed when the environment is created.
             // Close the dialog first, then restart so the new process creates
@@ -3386,6 +3478,21 @@ static wchar_t* BuildStaticHostBrowserArguments(size_t* mappingCount) {
     if (mappingCount) *mappingCount = 0;
     if (!g_config.useStaticHostMappings) return NULL;
 
+    // DNS-fallback mode: the mappings are enforced by the local fallback
+    // proxy instead of resolver rules; point the browser at its PAC script.
+    // Port 0 means the proxy failed to start - fall through and emit the
+    // strict resolver rules so the mappings still apply.
+    if (g_config.staticHostDnsFallback && g_hostProxyPort != 0) {
+        const size_t argumentCch = 64;
+        wchar_t* arguments = (wchar_t*)malloc(argumentCch * sizeof(wchar_t));
+        if (!arguments) return NULL;
+        swprintf_s(arguments, argumentCch,
+                   L"--proxy-pac-url=http://127.0.0.1:%u" HOST_PROXY_PAC_PATH,
+                   (unsigned)g_hostProxyPort);
+        if (mappingCount) *mappingCount = g_hostProxyMappingCount;
+        return arguments;
+    }
+
     const wchar_t* configured = g_config.staticHostMappings;
     size_t configuredLength = wcslen(configured);
     size_t rulesCapacity = configuredLength * 2 + 1;
@@ -3475,6 +3582,985 @@ static wchar_t* JoinBrowserArguments(LPCWSTR first, LPCWSTR second) {
     }
     if (secondLength > 0) wcscat_s(joined, totalLength + 1, second);
     return joined;
+}
+
+// --- Static host DNS fallback proxy ---
+//
+// When "fall back to standard DNS" is enabled for the static host mappings,
+// the mappings are enforced here instead of through --host-resolver-rules.
+// The browser is pointed at a generated PAC script (served by this listener)
+// that routes only the mapped hostnames through the proxy with a DIRECT
+// fallback, so a dead proxy degrades to plain direct connections. For each
+// mapped hostname the proxy keeps a small circuit breaker: prefer the mapped
+// address, fall back to standard DNS resolution within the same connection
+// when it does not answer, and while fallen back re-try the mapped address
+// at most once per HOST_PROXY_PROBE_INTERVAL_MS via a side-car probe that
+// never delays the request that triggered it.
+
+static BOOL HostProxySendAll(SOCKET s, const char* data, int length) {
+    int sent = 0;
+    while (sent < length) {
+        int chunk = send(s, data + sent, length - sent, 0);
+        if (chunk <= 0) return FALSE;
+        sent += chunk;
+    }
+    return TRUE;
+}
+
+static void HostProxySendSimpleResponse(SOCKET s, const char* status) {
+    char response[128];
+    int length = snprintf(response, sizeof(response),
+                          "HTTP/1.1 %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                          status);
+    if (length > 0) HostProxySendAll(s, response, length);
+}
+
+static void HostProxyServePac(SOCKET client) {
+    if (!g_hostProxyPacScript) {
+        HostProxySendSimpleResponse(client, "404 Not Found");
+        return;
+    }
+    size_t bodyLength = strlen(g_hostProxyPacScript);
+    char header[160];
+    int headerLength = snprintf(header, sizeof(header),
+                                "HTTP/1.1 200 OK\r\n"
+                                "Content-Type: application/x-ns-proxy-autoconfig\r\n"
+                                "Content-Length: %u\r\n"
+                                "Connection: close\r\n\r\n",
+                                (unsigned)bodyLength);
+    if (headerLength > 0 && HostProxySendAll(client, header, headerLength)) {
+        HostProxySendAll(client, g_hostProxyPacScript, (int)bodyLength);
+    }
+}
+
+// Non-blocking connect with a timeout. Completion is detected with select()
+// plus SO_ERROR rather than WSAPoll: WSAPoll on Windows builds before
+// 10 2004 never reports failed connect attempts, which would turn every
+// unreachable mapped address - the exact case this feature handles - into a
+// hang. WSAPoll is only used for established-socket readiness elsewhere.
+static SOCKET HostProxyConnectWithTimeout(const struct addrinfo* address, DWORD timeoutMs) {
+    SOCKET s = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+    u_long nonBlocking = 1;
+    if (ioctlsocket(s, FIONBIO, &nonBlocking) != 0) {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    if (connect(s, address->ai_addr, (int)address->ai_addrlen) != 0) {
+        if (WSAGetLastError() != WSAEWOULDBLOCK) {
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+        fd_set writeSet, exceptSet;
+        FD_ZERO(&writeSet);
+        FD_ZERO(&exceptSet);
+        FD_SET(s, &writeSet);
+        FD_SET(s, &exceptSet);
+        struct timeval timeout;
+        timeout.tv_sec = (long)(timeoutMs / 1000);
+        timeout.tv_usec = (long)((timeoutMs % 1000) * 1000);
+        int selected = select(0, NULL, &writeSet, &exceptSet, &timeout);
+        int soError = 0;
+        int soErrorLength = sizeof(soError);
+        if (selected <= 0 ||
+            getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&soError, &soErrorLength) != 0 ||
+            soError != 0) {
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+    }
+    u_long blocking = 0;
+    if (ioctlsocket(s, FIONBIO, &blocking) != 0) {
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    return s;
+}
+
+// Connect to the configured mapped address. Shared by the in-band attempt
+// and the side-car probe so both agree on what "reachable" means.
+static SOCKET HostProxyConnectMapped(const HostProxyMapping* mapping, unsigned short port) {
+    char portString[8];
+    snprintf(portString, sizeof(portString), "%u", (unsigned)port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = mapping->addressFamily;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    struct addrinfo* result = NULL;
+    if (getaddrinfo(mapping->address, portString, &hints, &result) != 0 || !result) {
+        return INVALID_SOCKET;
+    }
+    SOCKET s = HostProxyConnectWithTimeout(result, HOST_PROXY_MAPPED_CONNECT_TIMEOUT_MS);
+    freeaddrinfo(result);
+    return s;
+}
+
+// Standard system resolution - hosts file, configured DNS and caches all
+// behave exactly as they would for a direct connection.
+static SOCKET HostProxyConnectViaDns(const char* host, unsigned short port) {
+    char portString[8];
+    snprintf(portString, sizeof(portString), "%u", (unsigned)port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    struct addrinfo* results = NULL;
+    if (getaddrinfo(host, portString, &hints, &results) != 0 || !results) {
+        return INVALID_SOCKET;
+    }
+    SOCKET s = INVALID_SOCKET;
+    for (const struct addrinfo* address = results; address; address = address->ai_next) {
+        if (InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE)) break;
+        s = HostProxyConnectWithTimeout(address, HOST_PROXY_DNS_CONNECT_TIMEOUT_MS);
+        if (s != INVALID_SOCKET) break;
+    }
+    freeaddrinfo(results);
+    return s;
+}
+
+// Force the live tunnels of a mapping off their current path so traffic
+// migrates when the breaker flips. Only shuts the sockets down; the owning
+// connection threads notice, exit and clean up (see HostProxyTunnel).
+static void CloseHostTunnelsForMapping(int mappingIndex, HostProxyTunnel* except) {
+    EnterCriticalSection(&g_hostProxyLock);
+    for (HostProxyTunnel* node = g_hostProxyTunnelList; node; node = node->next) {
+        if (node == except || node->mappingIndex != mappingIndex) continue;
+        InterlockedExchange(&node->abortRequested, TRUE);
+        if (node->client != INVALID_SOCKET) shutdown(node->client, SD_BOTH);
+        if (node->upstream != INVALID_SOCKET) shutdown(node->upstream, SD_BOTH);
+    }
+    LeaveCriticalSection(&g_hostProxyLock);
+}
+
+typedef struct {
+    int mappingIndex;
+    unsigned short port;
+} HostProxyProbeTask;
+
+static DWORD WINAPI HostProxyProbeThread(LPVOID param) {
+    HostProxyProbeTask* task = (HostProxyProbeTask*)param;
+    HostProxyMapping* mapping = &g_hostProxyMappings[task->mappingIndex];
+    SOCKET probe = HostProxyConnectMapped(mapping, task->port);
+    BOOL recovered = FALSE;
+    EnterCriticalSection(&g_hostProxyLock);
+    mapping->probeInFlight = FALSE;
+    if (probe != INVALID_SOCKET) {
+        if (!InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE) &&
+            mapping->state == HOST_PROXY_FALLBACK) {
+            mapping->state = HOST_PROXY_MAPPED_ACTIVE;
+            recovered = TRUE;
+        }
+    } else {
+        mapping->lastProbeTick = GetTickCount64();
+    }
+    LeaveCriticalSection(&g_hostProxyLock);
+    if (probe != INVALID_SOCKET) closesocket(probe);
+    if (recovered) {
+        DebugPrint(L"[INFO] Mapped address for '%S' answered; resuming mapped routing\n",
+                   mapping->host);
+        CloseHostTunnelsForMapping(task->mappingIndex, NULL);
+    }
+    free(task);
+    InterlockedDecrement(&g_hostProxyWorkerCount);
+    return 0;
+}
+
+// Side-car probe: fired by a request that arrives while a mapping is fallen
+// back and its cooldown has elapsed. The triggering request proceeds via DNS
+// immediately; only the NEXT connections benefit from a successful probe.
+static void HostProxyStartProbeIfDue(int mappingIndex, unsigned short port) {
+    HostProxyMapping* mapping = &g_hostProxyMappings[mappingIndex];
+    BOOL launch = FALSE;
+    EnterCriticalSection(&g_hostProxyLock);
+    if (mapping->state == HOST_PROXY_FALLBACK && !mapping->probeInFlight &&
+        GetTickCount64() - mapping->lastProbeTick >= HOST_PROXY_PROBE_INTERVAL_MS) {
+        mapping->probeInFlight = TRUE;
+        launch = TRUE;
+    }
+    LeaveCriticalSection(&g_hostProxyLock);
+    if (!launch) return;
+
+    HostProxyProbeTask* task = (HostProxyProbeTask*)malloc(sizeof(*task));
+    HANDLE thread = NULL;
+    if (task) {
+        task->mappingIndex = mappingIndex;
+        task->port = port;
+        InterlockedIncrement(&g_hostProxyWorkerCount);
+        thread = CreateThread(NULL, 0, HostProxyProbeThread, task, 0, NULL);
+        if (!thread) {
+            InterlockedDecrement(&g_hostProxyWorkerCount);
+            free(task);
+        }
+    }
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        // Roll back the single-flight claim or probing would wedge forever.
+        EnterCriticalSection(&g_hostProxyLock);
+        mapping->probeInFlight = FALSE;
+        LeaveCriticalSection(&g_hostProxyLock);
+    }
+}
+
+// The circuit breaker. Establishes the upstream connection for one request,
+// never dropping it: when the mapped address fails the same connection is
+// retried through standard DNS before giving up. Only connect-phase results
+// move the breaker - mid-stream closes are normal (keep-alive teardown) and
+// must not trip it.
+static SOCKET HostProxyEstablishUpstream(HostProxyTunnel* tunnel, int mappingIndex,
+                                         unsigned short port) {
+    HostProxyMapping* mapping = &g_hostProxyMappings[mappingIndex];
+    EnterCriticalSection(&g_hostProxyLock);
+    tunnel->mappingIndex = mappingIndex;
+    HostProxyBreakerState state = mapping->state;
+    LeaveCriticalSection(&g_hostProxyLock);
+
+    SOCKET upstream = INVALID_SOCKET;
+    if (state == HOST_PROXY_FALLBACK) {
+        HostProxyStartProbeIfDue(mappingIndex, port);
+        upstream = HostProxyConnectViaDns(mapping->host, port);
+    } else {
+        upstream = HostProxyConnectMapped(mapping, port);
+        if (upstream != INVALID_SOCKET) {
+            BOOL announced = FALSE;
+            EnterCriticalSection(&g_hostProxyLock);
+            if (mapping->state != HOST_PROXY_MAPPED_ACTIVE) {
+                mapping->state = HOST_PROXY_MAPPED_ACTIVE;
+                announced = TRUE;
+            }
+            LeaveCriticalSection(&g_hostProxyLock);
+            if (announced) {
+                DebugPrint(L"[INFO] Static host '%S' using mapped address\n", mapping->host);
+            }
+        } else {
+            BOOL wasActive;
+            EnterCriticalSection(&g_hostProxyLock);
+            wasActive = (mapping->state == HOST_PROXY_MAPPED_ACTIVE);
+            mapping->state = HOST_PROXY_FALLBACK;
+            mapping->lastProbeTick = GetTickCount64();
+            LeaveCriticalSection(&g_hostProxyLock);
+            DebugPrint(L"[WARNING] Mapped address for '%S' unreachable; using DNS resolution\n",
+                       mapping->host);
+            if (wasActive) CloseHostTunnelsForMapping(mappingIndex, tunnel);
+            upstream = HostProxyConnectViaDns(mapping->host, port);
+        }
+    }
+    if (upstream != INVALID_SOCKET) {
+        EnterCriticalSection(&g_hostProxyLock);
+        tunnel->upstream = upstream;
+        LeaveCriticalSection(&g_hostProxyLock);
+        // An eviction that raced the connect above may have missed the new
+        // socket; make sure it observes the abort immediately.
+        if (InterlockedCompareExchange(&tunnel->abortRequested, FALSE, FALSE)) {
+            shutdown(upstream, SD_BOTH);
+        }
+    }
+    return upstream;
+}
+
+static int FindHostProxyMapping(const char* host) {
+    for (size_t i = 0; i < g_hostProxyMappingCount; i++) {
+        if (strcmp(g_hostProxyMappings[i].host, host) == 0) return (int)i;
+    }
+    return -1;
+}
+
+// Reads until the blank line ending the request head. Bytes that arrive
+// beyond the head (early tunnel data, a request body prefix) are kept in the
+// buffer - *totalRead past *headLength - and must be forwarded, not dropped.
+// Returns 0 on success, 1 on an oversized head, 2 on timeout/close/abort.
+static int HostProxyReadRequestHead(HostProxyTunnel* tunnel, char* buffer, int capacity,
+                                    int* headLength, int* totalRead) {
+    int received = 0;
+    int scanned = 0;
+    ULONGLONG deadline = GetTickCount64() + HOST_PROXY_HEAD_READ_TIMEOUT_MS;
+    *headLength = 0;
+    *totalRead = 0;
+    for (;;) {
+        for (int i = scanned; i < received; i++) {
+            if (buffer[i] != '\n' || i < 1) continue;
+            // A blank line ends the head: either a bare LF or a CRLF, no
+            // matter how the preceding line was terminated.
+            if (buffer[i - 1] == '\n' ||
+                (i >= 2 && buffer[i - 1] == '\r' && buffer[i - 2] == '\n')) {
+                *headLength = i + 1;
+                *totalRead = received;
+                return 0;
+            }
+        }
+        scanned = (received > 3) ? received - 3 : 0;
+        if (received >= capacity - 1) return 1;
+        if (InterlockedCompareExchange(&tunnel->abortRequested, FALSE, FALSE) ||
+            InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE)) {
+            return 2;
+        }
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return 2;
+        ULONGLONG remaining = deadline - now;
+        INT wait = (remaining < HOST_PROXY_POLL_TICK_MS)
+                       ? (INT)remaining : HOST_PROXY_POLL_TICK_MS;
+        WSAPOLLFD pollFd;
+        pollFd.fd = tunnel->client;
+        pollFd.events = POLLRDNORM;
+        pollFd.revents = 0;
+        int pollResult = WSAPoll(&pollFd, 1, wait);
+        if (pollResult < 0) return 2;
+        if (pollResult == 0) continue;
+        int chunk = recv(tunnel->client, buffer + received, capacity - 1 - received, 0);
+        if (chunk <= 0) return 2;
+        received += chunk;
+    }
+}
+
+typedef struct {
+    char method[16];
+    char host[254];
+    unsigned short port;
+    BOOL isConnect;
+    BOOL isOriginForm;
+    const char* path;     // absolute-form: path+query start within the head
+    int pathLength;
+    const char* headers;  // first byte after the request line
+} HostProxyRequest;
+
+static BOOL HostProxyParseAuthority(const char* authority, int length, BOOL requirePort,
+                                    unsigned short defaultPort, char* host,
+                                    size_t hostSize, unsigned short* port) {
+    if (length <= 0) return FALSE;
+    // Reject userinfo outright; browsers never send it to a proxy.
+    for (int i = 0; i < length; i++) {
+        if (authority[i] == '@') return FALSE;
+    }
+    const char* hostBegin = authority;
+    const char* hostEnd = NULL;
+    const char* portBegin = NULL;
+    if (authority[0] == '[') {
+        const char* closeBracket = (const char*)memchr(authority, ']', (size_t)length);
+        if (!closeBracket || closeBracket == authority + 1) return FALSE;
+        hostBegin = authority + 1;
+        hostEnd = closeBracket;
+        if (closeBracket + 1 < authority + length) {
+            if (closeBracket[1] != ':') return FALSE;
+            portBegin = closeBracket + 2;
+        }
+    } else {
+        const char* colon = (const char*)memchr(authority, ':', (size_t)length);
+        if (colon) {
+            hostEnd = colon;
+            portBegin = colon + 1;
+        } else {
+            hostEnd = authority + length;
+        }
+    }
+    size_t hostLength = (size_t)(hostEnd - hostBegin);
+    if (hostLength == 0 || hostLength >= hostSize) return FALSE;
+    for (size_t i = 0; i < hostLength; i++) {
+        char c = hostBegin[i];
+        if ((unsigned char)c >= 0x80) return FALSE;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        host[i] = c;
+    }
+    host[hostLength] = '\0';
+    if (portBegin) {
+        const char* end = authority + length;
+        if (portBegin >= end) return FALSE;
+        unsigned long value = 0;
+        for (const char* p = portBegin; p < end; p++) {
+            if (*p < '0' || *p > '9') return FALSE;
+            value = value * 10 + (unsigned long)(*p - '0');
+            if (value > 65535) return FALSE;
+        }
+        if (value == 0) return FALSE;
+        *port = (unsigned short)value;
+    } else {
+        if (requirePort) return FALSE;
+        *port = defaultPort;
+    }
+    return TRUE;
+}
+
+// Parses a NUL-terminated request head into its routing-relevant pieces:
+// CONNECT authority-form, plain-HTTP absolute-form, or origin-form (used
+// only for the PAC endpoint). Anything else is rejected.
+static BOOL HostProxyParseRequestHead(const char* head, HostProxyRequest* request) {
+    memset(request, 0, sizeof(*request));
+    const char* lineEnd = strchr(head, '\n');
+    if (!lineEnd) return FALSE;
+    request->headers = lineEnd + 1;
+    const char* requestLineEnd = lineEnd;
+    if (requestLineEnd > head && requestLineEnd[-1] == '\r') requestLineEnd--;
+    const char* methodEnd = (const char*)memchr(head, ' ', (size_t)(requestLineEnd - head));
+    if (!methodEnd) return FALSE;
+    size_t methodLength = (size_t)(methodEnd - head);
+    if (methodLength == 0 || methodLength >= sizeof(request->method)) return FALSE;
+    memcpy(request->method, head, methodLength);
+    request->method[methodLength] = '\0';
+    const char* target = methodEnd + 1;
+    if (target >= requestLineEnd) return FALSE;
+    const char* targetEnd = (const char*)memchr(target, ' ', (size_t)(requestLineEnd - target));
+    if (!targetEnd || targetEnd == target) return FALSE;
+    int targetLength = (int)(targetEnd - target);
+
+    if (strcmp(request->method, "CONNECT") == 0) {
+        request->isConnect = TRUE;
+        // Authority-form; browsers always include the port here.
+        return HostProxyParseAuthority(target, targetLength, TRUE, 0, request->host,
+                                       sizeof(request->host), &request->port);
+    }
+    if (target[0] == '/') {
+        request->isOriginForm = TRUE;
+        request->path = target;
+        request->pathLength = targetLength;
+        return TRUE;
+    }
+    if (targetLength > 7 && _strnicmp(target, "http://", 7) == 0) {
+        const char* authority = target + 7;
+        int authorityLength = targetLength - 7;
+        int authorityEnd = 0;
+        while (authorityEnd < authorityLength && authority[authorityEnd] != '/' &&
+               authority[authorityEnd] != '?') {
+            authorityEnd++;
+        }
+        if (!HostProxyParseAuthority(authority, authorityEnd, FALSE, 80, request->host,
+                                     sizeof(request->host), &request->port)) {
+            return FALSE;
+        }
+        request->path = authority + authorityEnd;
+        request->pathLength = authorityLength - authorityEnd;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+// Rebuilds an absolute-form plain-HTTP head as an origin-form request with
+// close-delimited framing: the request line is rewritten to the path, the
+// hop-by-hop headers are dropped, and "Connection: close" is forced so the
+// origin server ends the exchange (the proxy does not parse responses).
+static char* HostProxyRewriteAbsoluteHead(const HostProxyRequest* request,
+                                          int* rewrittenLength) {
+    size_t capacity = HOST_PROXY_HEAD_MAX_BYTES + 128;
+    char* rewritten = (char*)malloc(capacity);
+    if (!rewritten) return NULL;
+    int written = snprintf(rewritten, capacity, "%s %s%.*s HTTP/1.1\r\n",
+                           request->method,
+                           (request->pathLength == 0 || request->path[0] == '?') ? "/" : "",
+                           request->pathLength, request->path);
+    if (written < 0) {
+        free(rewritten);
+        return NULL;
+    }
+    const char* cursor = request->headers;
+    while (*cursor) {
+        const char* nextLine = strchr(cursor, '\n');
+        const char* lineEnd = nextLine ? nextLine : cursor + strlen(cursor);
+        const char* trimmedEnd = lineEnd;
+        if (trimmedEnd > cursor && trimmedEnd[-1] == '\r') trimmedEnd--;
+        if (trimmedEnd == cursor) break;  // blank line: end of the headers
+        size_t lineLength = (size_t)(trimmedEnd - cursor);
+        if (!(lineLength >= 6 && _strnicmp(cursor, "Proxy-", 6) == 0) &&
+            !(lineLength >= 11 && _strnicmp(cursor, "Connection:", 11) == 0) &&
+            !(lineLength >= 10 && _strnicmp(cursor, "Keep-Alive", 10) == 0)) {
+            if ((size_t)written + lineLength + 2 >= capacity) {
+                free(rewritten);
+                return NULL;
+            }
+            memcpy(rewritten + written, cursor, lineLength);
+            written += (int)lineLength;
+            rewritten[written++] = '\r';
+            rewritten[written++] = '\n';
+        }
+        if (!nextLine) break;
+        cursor = nextLine + 1;
+    }
+    static const char terminator[] = "Connection: close\r\n\r\n";
+    size_t terminatorLength = sizeof(terminator) - 1;
+    if ((size_t)written + terminatorLength >= capacity) {
+        free(rewritten);
+        return NULL;
+    }
+    memcpy(rewritten + written, terminator, terminatorLength);
+    written += (int)terminatorLength;
+    *rewrittenLength = written;
+    return rewritten;
+}
+
+// Blind bidirectional byte pump. Deliberately touches no breaker state: a
+// dying tunnel is normal (keep-alive teardown, page navigation) and must
+// not be mistaken for an unreachable mapped address.
+static void HostProxyPumpTunnel(HostProxyTunnel* tunnel, const char* leftover,
+                                int leftoverLength) {
+    char* buffer = (char*)malloc(HOST_PROXY_IO_BUFFER_BYTES);
+    if (!buffer) return;
+    if (leftoverLength > 0 &&
+        !HostProxySendAll(tunnel->upstream, leftover, leftoverLength)) {
+        free(buffer);
+        return;
+    }
+    BOOL clientOpen = TRUE;
+    BOOL upstreamOpen = TRUE;
+    while (clientOpen || upstreamOpen) {
+        if (InterlockedCompareExchange(&tunnel->abortRequested, FALSE, FALSE) ||
+            InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE)) {
+            break;
+        }
+        WSAPOLLFD fds[2];
+        int fdCount = 0;
+        int clientIndex = -1;
+        int upstreamIndex = -1;
+        if (clientOpen) {
+            fds[fdCount].fd = tunnel->client;
+            fds[fdCount].events = POLLRDNORM;
+            fds[fdCount].revents = 0;
+            clientIndex = fdCount++;
+        }
+        if (upstreamOpen) {
+            fds[fdCount].fd = tunnel->upstream;
+            fds[fdCount].events = POLLRDNORM;
+            fds[fdCount].revents = 0;
+            upstreamIndex = fdCount++;
+        }
+        int pollResult = WSAPoll(fds, (ULONG)fdCount, HOST_PROXY_POLL_TICK_MS);
+        if (pollResult < 0) break;
+        if (pollResult == 0) continue;
+        if (clientIndex >= 0 && fds[clientIndex].revents) {
+            if (fds[clientIndex].revents & POLLRDNORM) {
+                int got = recv(tunnel->client, buffer, HOST_PROXY_IO_BUFFER_BYTES, 0);
+                if (got <= 0) {
+                    clientOpen = FALSE;
+                    shutdown(tunnel->upstream, SD_SEND);
+                } else if (!HostProxySendAll(tunnel->upstream, buffer, got)) {
+                    break;
+                }
+            } else {
+                clientOpen = FALSE;
+                shutdown(tunnel->upstream, SD_SEND);
+            }
+        }
+        if (upstreamIndex >= 0 && fds[upstreamIndex].revents) {
+            if (fds[upstreamIndex].revents & POLLRDNORM) {
+                int got = recv(tunnel->upstream, buffer, HOST_PROXY_IO_BUFFER_BYTES, 0);
+                if (got <= 0) {
+                    upstreamOpen = FALSE;
+                    shutdown(tunnel->client, SD_SEND);
+                } else if (!HostProxySendAll(tunnel->client, buffer, got)) {
+                    break;
+                }
+            } else {
+                upstreamOpen = FALSE;
+                shutdown(tunnel->client, SD_SEND);
+            }
+        }
+    }
+    free(buffer);
+}
+
+static DWORD WINAPI HostProxyConnectionThread(LPVOID param) {
+    HostProxyTunnel* tunnel = (HostProxyTunnel*)param;
+    char* head = (char*)malloc(HOST_PROXY_HEAD_MAX_BYTES);
+    char* rewrittenHead = NULL;
+    int headLength = 0;
+    int totalRead = 0;
+    int rewrittenLength = 0;
+
+    if (!head) goto cleanup;
+    {
+        int readResult = HostProxyReadRequestHead(tunnel, head, HOST_PROXY_HEAD_MAX_BYTES,
+                                                  &headLength, &totalRead);
+        if (readResult == 1) {
+            HostProxySendSimpleResponse(tunnel->client, "400 Bad Request");
+            goto cleanup;
+        }
+        if (readResult != 0) goto cleanup;
+    }
+    {
+        // NUL-terminate the head for parsing; the byte at headLength is the
+        // start of any early tunnel data and is restored before forwarding.
+        char savedByte = head[headLength];
+        head[headLength] = '\0';
+        HostProxyRequest request;
+        BOOL parsed = HostProxyParseRequestHead(head, &request);
+
+        if (parsed && request.isOriginForm) {
+            if (strcmp(request.method, "GET") == 0 &&
+                request.pathLength == (int)(sizeof(HOST_PROXY_PAC_PATH) - 1) &&
+                strncmp(request.path, HOST_PROXY_PAC_PATH,
+                        (size_t)request.pathLength) == 0) {
+                HostProxyServePac(tunnel->client);
+            } else {
+                HostProxySendSimpleResponse(tunnel->client, "404 Not Found");
+            }
+            goto cleanup;
+        }
+        if (!parsed) {
+            HostProxySendSimpleResponse(tunnel->client, "400 Bad Request");
+            goto cleanup;
+        }
+
+        int mappingIndex = FindHostProxyMapping(request.host);
+        if (mappingIndex < 0) {
+            // Only the configured static hostnames are proxied; refusing
+            // everything else keeps the listener from being an open proxy.
+            HostProxySendSimpleResponse(tunnel->client, "403 Forbidden");
+            goto cleanup;
+        }
+
+        if (!request.isConnect) {
+            rewrittenHead = HostProxyRewriteAbsoluteHead(&request, &rewrittenLength);
+            if (!rewrittenHead) {
+                HostProxySendSimpleResponse(tunnel->client, "400 Bad Request");
+                goto cleanup;
+            }
+        }
+
+        head[headLength] = savedByte;
+
+        SOCKET upstream = HostProxyEstablishUpstream(tunnel, mappingIndex, request.port);
+        if (upstream == INVALID_SOCKET) {
+            HostProxySendSimpleResponse(tunnel->client, "502 Bad Gateway");
+            goto cleanup;
+        }
+
+        if (request.isConnect) {
+            static const char established[] = "HTTP/1.1 200 Connection Established\r\n\r\n";
+            if (!HostProxySendAll(tunnel->client, established,
+                                  (int)(sizeof(established) - 1))) {
+                goto cleanup;
+            }
+        } else {
+            if (!HostProxySendAll(upstream, rewrittenHead, rewrittenLength)) goto cleanup;
+        }
+        HostProxyPumpTunnel(tunnel, head + headLength, totalRead - headLength);
+    }
+
+cleanup:
+    EnterCriticalSection(&g_hostProxyLock);
+    if (tunnel->prev) tunnel->prev->next = tunnel->next;
+    else g_hostProxyTunnelList = tunnel->next;
+    if (tunnel->next) tunnel->next->prev = tunnel->prev;
+    LeaveCriticalSection(&g_hostProxyLock);
+    if (tunnel->client != INVALID_SOCKET) closesocket(tunnel->client);
+    if (tunnel->upstream != INVALID_SOCKET) closesocket(tunnel->upstream);
+    free(tunnel);
+    free(head);
+    free(rewrittenHead);
+    InterlockedDecrement(&g_hostProxyWorkerCount);
+    return 0;
+}
+
+static DWORD WINAPI HostProxyAcceptThread(LPVOID param) {
+    (void)param;
+    for (;;) {
+        struct sockaddr_storage peer;
+        int peerLength = sizeof(peer);
+        SOCKET client = accept(g_hostProxyListenSocket, (struct sockaddr*)&peer,
+                               &peerLength);
+        if (client == INVALID_SOCKET) {
+            if (InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE)) break;
+            int error = WSAGetLastError();
+            if (error == WSAECONNRESET || error == WSAEINTR) continue;
+            if (error == WSAENOBUFS || error == WSAEMFILE) {
+                // Transient resource exhaustion (typical shortly after a
+                // resume): keep the listener alive rather than abandoning
+                // the mapped path until the next launcher restart.
+                Sleep(100);
+                continue;
+            }
+            DebugPrint(L"[ERROR] Static host proxy accept failed (%d); listener stopped\n",
+                       error);
+            break;
+        }
+        // The listener is bound to 127.0.0.1 so remote peers cannot reach
+        // it; drop anything unexpected anyway.
+        BOOL loopback = FALSE;
+        if (peer.ss_family == AF_INET) {
+            loopback = (((struct sockaddr_in*)&peer)->sin_addr.s_addr ==
+                        htonl(INADDR_LOOPBACK));
+        }
+        if (!loopback ||
+            InterlockedCompareExchange(&g_hostProxyWorkerCount, 0, 0) >=
+                HOST_PROXY_MAX_TUNNELS) {
+            // Over capacity: refuse; the PAC's DIRECT fallback keeps loads
+            // working while the browser backs off.
+            closesocket(client);
+            continue;
+        }
+        HostProxyTunnel* tunnel = (HostProxyTunnel*)calloc(1, sizeof(*tunnel));
+        if (!tunnel) {
+            closesocket(client);
+            continue;
+        }
+        tunnel->client = client;
+        tunnel->upstream = INVALID_SOCKET;
+        tunnel->mappingIndex = -1;
+        EnterCriticalSection(&g_hostProxyLock);
+        tunnel->next = g_hostProxyTunnelList;
+        if (g_hostProxyTunnelList) g_hostProxyTunnelList->prev = tunnel;
+        g_hostProxyTunnelList = tunnel;
+        LeaveCriticalSection(&g_hostProxyLock);
+        InterlockedIncrement(&g_hostProxyWorkerCount);
+        HANDLE thread = CreateThread(NULL, 0, HostProxyConnectionThread, tunnel, 0, NULL);
+        if (!thread) {
+            EnterCriticalSection(&g_hostProxyLock);
+            if (tunnel->prev) tunnel->prev->next = tunnel->next;
+            else g_hostProxyTunnelList = tunnel->next;
+            if (tunnel->next) tunnel->next->prev = tunnel->prev;
+            LeaveCriticalSection(&g_hostProxyLock);
+            InterlockedDecrement(&g_hostProxyWorkerCount);
+            closesocket(client);
+            free(tunnel);
+            continue;
+        }
+        CloseHandle(thread);
+    }
+    return 0;
+}
+
+// Builds the runtime mapping table from the same configuration string (and
+// with the same all-or-nothing validation) as the strict resolver rules.
+static BOOL ParseStaticHostProxyMappings(void) {
+    HostProxyMapping* mappings =
+        (HostProxyMapping*)calloc(HOST_PROXY_MAX_MAPPINGS, sizeof(HostProxyMapping));
+    if (!mappings) return FALSE;
+
+    size_t count = 0;
+    const wchar_t* cursor = g_config.staticHostMappings;
+    while (*cursor) {
+        while (*cursor && IsOriginListSeparator(*cursor)) cursor++;
+        if (!*cursor) break;
+
+        const wchar_t* begin = cursor;
+        while (*cursor && !IsOriginListSeparator(*cursor)) cursor++;
+        size_t tokenLength = (size_t)(cursor - begin);
+        wchar_t token[2048];
+        if (tokenLength == 0 || tokenLength >= sizeof(token) / sizeof(token[0])) {
+            free(mappings);
+            return FALSE;
+        }
+        wmemcpy(token, begin, tokenLength);
+        token[tokenLength] = L'\0';
+
+        const wchar_t* separator = NULL;
+        if (!IsValidStaticHostMapping(token, &separator)) {
+            free(mappings);
+            return FALSE;
+        }
+        if (count >= HOST_PROXY_MAX_MAPPINGS) break;
+
+        HostProxyMapping* mapping = &mappings[count];
+        size_t hostLength = (size_t)(separator - token);
+        if (hostLength >= sizeof(mapping->host)) {
+            free(mappings);
+            return FALSE;
+        }
+        for (size_t i = 0; i < hostLength; i++) {
+            wchar_t c = token[i];
+            if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+            mapping->host[i] = (char)c;
+        }
+        mapping->host[hostLength] = '\0';
+
+        const wchar_t* address = separator + 1;
+        size_t addressLength = wcslen(address);
+        BOOL ipv6 = (address[0] == L'[');
+        if (ipv6) {
+            address++;
+            addressLength -= 2;
+        }
+        if (addressLength == 0 || addressLength >= sizeof(mapping->address)) {
+            free(mappings);
+            return FALSE;
+        }
+        for (size_t i = 0; i < addressLength; i++) {
+            mapping->address[i] = (char)address[i];
+        }
+        mapping->address[addressLength] = '\0';
+        mapping->addressFamily = ipv6 ? AF_INET6 : AF_INET;
+        mapping->state = HOST_PROXY_UNTESTED;
+        mapping->lastProbeTick = 0;
+        mapping->probeInFlight = FALSE;
+
+        // Duplicate hostname: first entry wins, matching resolver rules.
+        BOOL duplicate = FALSE;
+        for (size_t i = 0; i < count; i++) {
+            if (strcmp(mappings[i].host, mapping->host) == 0) {
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (duplicate) memset(mapping, 0, sizeof(*mapping));
+        else count++;
+    }
+
+    if (count == 0) {
+        free(mappings);
+        return FALSE;
+    }
+    g_hostProxyMappings = mappings;
+    g_hostProxyMappingCount = count;
+    return TRUE;
+}
+
+static char* BuildHostProxyPacScript(void) {
+    size_t capacity = 192;
+    for (size_t i = 0; i < g_hostProxyMappingCount; i++) {
+        capacity += strlen(g_hostProxyMappings[i].host) + 32;
+    }
+    char* script = (char*)malloc(capacity);
+    if (!script) return NULL;
+    int written = snprintf(script, capacity,
+                           "function FindProxyForURL(url, host) {\n"
+                           "  host = host.toLowerCase();\n"
+                           "  if (");
+    if (written < 0) {
+        free(script);
+        return NULL;
+    }
+    for (size_t i = 0; i < g_hostProxyMappingCount; i++) {
+        int chunk = snprintf(script + written, capacity - (size_t)written,
+                             "%shost == \"%s\"", i > 0 ? " ||\n      " : "",
+                             g_hostProxyMappings[i].host);
+        if (chunk < 0 || (size_t)written + (size_t)chunk >= capacity) {
+            free(script);
+            return NULL;
+        }
+        written += chunk;
+    }
+    int chunk = snprintf(script + written, capacity - (size_t)written,
+                         ")\n    return \"PROXY 127.0.0.1:%u; DIRECT\";\n"
+                         "  return \"DIRECT\";\n}\n",
+                         (unsigned)g_hostProxyPort);
+    if (chunk < 0 || (size_t)written + (size_t)chunk >= capacity) {
+        free(script);
+        return NULL;
+    }
+    return script;
+}
+
+// Starts the fallback proxy: parse the mapping table, bind an ephemeral
+// loopback port (queried back so the PAC URL can embed it), build the PAC
+// script and spawn the accept loop. Fails soft - the caller falls back to
+// the strict resolver rules and the feature degrades to today's behavior.
+static BOOL StartStaticHostProxy(void) {
+    if (!g_winsockInitialized) {
+        DebugPrint(L"[WARNING] Static host fallback proxy unavailable: Winsock init failed\n");
+        return FALSE;
+    }
+    if (!ParseStaticHostProxyMappings()) {
+        DebugPrint(L"[WARNING] Static host fallback proxy disabled: no valid mappings\n");
+        return FALSE;
+    }
+    InitializeCriticalSection(&g_hostProxyLock);
+    g_hostProxyListenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (g_hostProxyListenSocket == INVALID_SOCKET) goto fail;
+    {
+        struct sockaddr_in bindAddress;
+        memset(&bindAddress, 0, sizeof(bindAddress));
+        bindAddress.sin_family = AF_INET;
+        bindAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bindAddress.sin_port = 0;
+        if (bind(g_hostProxyListenSocket, (struct sockaddr*)&bindAddress,
+                 sizeof(bindAddress)) != 0) {
+            goto fail;
+        }
+        int addressLength = sizeof(bindAddress);
+        if (getsockname(g_hostProxyListenSocket, (struct sockaddr*)&bindAddress,
+                        &addressLength) != 0) {
+            goto fail;
+        }
+        g_hostProxyPort = ntohs(bindAddress.sin_port);
+    }
+    if (g_hostProxyPort == 0) goto fail;
+    if (listen(g_hostProxyListenSocket, HOST_PROXY_LISTEN_BACKLOG) != 0) goto fail;
+    g_hostProxyPacScript = BuildHostProxyPacScript();
+    if (!g_hostProxyPacScript) goto fail;
+    g_hostProxyAcceptThread = CreateThread(NULL, 0, HostProxyAcceptThread, NULL, 0, NULL);
+    if (!g_hostProxyAcceptThread) goto fail;
+    DebugPrint(L"[INFO] Static host fallback proxy listening on 127.0.0.1:%u (%u mapping(s))\n",
+               (unsigned)g_hostProxyPort, (unsigned)g_hostProxyMappingCount);
+    return TRUE;
+
+fail:
+    DebugPrint(L"[WARNING] Static host fallback proxy failed to start (%d)\n",
+               WSAGetLastError());
+    if (g_hostProxyListenSocket != INVALID_SOCKET) {
+        closesocket(g_hostProxyListenSocket);
+        g_hostProxyListenSocket = INVALID_SOCKET;
+    }
+    free(g_hostProxyPacScript);
+    g_hostProxyPacScript = NULL;
+    free(g_hostProxyMappings);
+    g_hostProxyMappings = NULL;
+    g_hostProxyMappingCount = 0;
+    DeleteCriticalSection(&g_hostProxyLock);
+    g_hostProxyPort = 0;
+    return FALSE;
+}
+
+// Bounded shutdown: unblock the accept loop by closing its socket, shut
+// down every live tunnel, then wait for the worker count to drain. If a
+// worker somehow fails to exit in time the shared state is deliberately
+// leaked instead of freed under a live thread - the process is exiting.
+static void StopStaticHostProxy(void) {
+    if (g_hostProxyPort == 0 && g_hostProxyListenSocket == INVALID_SOCKET) return;
+    InterlockedExchange(&g_hostProxyStopping, TRUE);
+    if (g_hostProxyListenSocket != INVALID_SOCKET) {
+        closesocket(g_hostProxyListenSocket);
+        g_hostProxyListenSocket = INVALID_SOCKET;
+    }
+    BOOL acceptThreadExited = TRUE;
+    if (g_hostProxyAcceptThread) {
+        acceptThreadExited =
+            (WaitForSingleObject(g_hostProxyAcceptThread,
+                                 HOST_PROXY_SHUTDOWN_WAIT_MS) == WAIT_OBJECT_0);
+        CloseHandle(g_hostProxyAcceptThread);
+        g_hostProxyAcceptThread = NULL;
+    }
+    EnterCriticalSection(&g_hostProxyLock);
+    for (HostProxyTunnel* node = g_hostProxyTunnelList; node; node = node->next) {
+        InterlockedExchange(&node->abortRequested, TRUE);
+        if (node->client != INVALID_SOCKET) shutdown(node->client, SD_BOTH);
+        if (node->upstream != INVALID_SOCKET) shutdown(node->upstream, SD_BOTH);
+    }
+    LeaveCriticalSection(&g_hostProxyLock);
+    DWORD waited = 0;
+    while (InterlockedCompareExchange(&g_hostProxyWorkerCount, 0, 0) > 0 &&
+           waited < HOST_PROXY_SHUTDOWN_WAIT_MS) {
+        Sleep(50);
+        waited += 50;
+    }
+    if (acceptThreadExited &&
+        InterlockedCompareExchange(&g_hostProxyWorkerCount, 0, 0) == 0) {
+        DeleteCriticalSection(&g_hostProxyLock);
+        free(g_hostProxyMappings);
+        g_hostProxyMappings = NULL;
+        g_hostProxyMappingCount = 0;
+        free(g_hostProxyPacScript);
+        g_hostProxyPacScript = NULL;
+    } else {
+        DebugPrint(L"[WARNING] Static host proxy thread did not exit in time\n");
+    }
+    g_hostProxyPort = 0;
+}
+
+// Power-resume hook: whatever the breaker believed before a suspend is
+// stale, so let the first request after resume re-probe immediately instead
+// of waiting out a cooldown started before the machine went down. Mappings
+// still on the mapped address self-correct on their next in-band connect.
+static void HostProxyExpireFallbackCooldowns(void) {
+    if (g_hostProxyPort == 0) return;
+    ULONGLONG now = GetTickCount64();
+    EnterCriticalSection(&g_hostProxyLock);
+    for (size_t i = 0; i < g_hostProxyMappingCount; i++) {
+        if (g_hostProxyMappings[i].state == HOST_PROXY_FALLBACK) {
+            g_hostProxyMappings[i].lastProbeTick =
+                (now > HOST_PROXY_PROBE_INTERVAL_MS)
+                    ? now - HOST_PROXY_PROBE_INTERVAL_MS : 0;
+        }
+    }
+    LeaveCriticalSection(&g_hostProxyLock);
 }
 
 // Plain-C implementation of the base WebView2 environment-options COM
@@ -6040,6 +7126,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 InterlockedExchange(&g_powerResumePending, TRUE);
                 InterlockedExchange(&g_presentationUnverified, TRUE);
                 g_powerKickCount = 0;
+                // Whatever the fallback proxy believed about mapped-address
+                // reachability is stale across a suspend; re-probe on the
+                // first request instead of waiting out the cooldown.
+                HostProxyExpireFallbackCooldowns();
                 SetTimer(hwnd, ID_TIMER_POWER_RESUME, POWER_RESUME_KICK_DELAY_MS, NULL);
             }
             return TRUE;
@@ -6243,6 +7333,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
+    // Winsock is only exercised by the static host fallback proxy, but the
+    // init is cheap and unconditional so mapping validation (InetPtonW) and
+    // the proxy share one lifetime.
+    WSADATA wsaData;
+    g_winsockInitialized = (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
+
     if (!load_webview2_loader()) {
         MessageBoxW(NULL,
             L"Failed to load WebView2.\n\n"
@@ -6297,6 +7393,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             return 0;
         }
         wcscpy_s(g_initialUrl, 2048, g_config.url);
+    }
+
+    // Start the static host fallback proxy before the main window exists:
+    // WM_CREATE builds the WebView2 environment, and the PAC URL embedded in
+    // its browser arguments needs the proxy's port. The proxy then persists
+    // untouched across WebView rebuilds. If it cannot start, the strict
+    // resolver rules are emitted instead (see BuildStaticHostBrowserArguments).
+    if (g_config.useStaticHostMappings && g_config.staticHostDnsFallback) {
+        if (!StartStaticHostProxy()) {
+            DebugPrint(L"[WARNING] Falling back to strict static host mappings\n");
+        }
     }
 
     // Register invisible owner window class (prevents taskbar appearance)
@@ -6384,7 +7491,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         UnregisterBrowserExitedFromCurrentEnv();
         g_webViewEnv->lpVtbl->Release(g_webViewEnv);
     }
-    
+
+    // The browser process has been told to close, so no new proxy
+    // connections are coming; drain the fallback proxy and Winsock last.
+    StopStaticHostProxy();
+    if (g_winsockInitialized) WSACleanup();
+
     // Clean up tray icon and its resources
     if (g_nid.hIcon) {
         DestroyIcon(g_nid.hIcon);
