@@ -144,6 +144,9 @@ export default function ConfigView({
 }: Props) {
   const [windowTitle, setWindowTitle] = useState(config.windowTitle);
   const [url, setUrl] = useState(config.url);
+  const [startMaximized, setStartMaximized] = useState(
+    config.startMaximized ?? false
+  );
   const [onHideJs, setOnHideJs] = useState(config.onHideJs);
   const [onShowJs, setOnShowJs] = useState(config.onShowJs);
   const [sleepWhenInactive, setSleepWhenInactive] = useState(
@@ -367,6 +370,7 @@ export default function ConfigView({
     saveSettings({
       url: trimmedUrl,
       windowTitle,
+      startMaximized,
       onHideJs,
       onShowJs,
       sleepWhenInactive,
@@ -428,6 +432,24 @@ export default function ConfigView({
         {urlError && (
           <p className="text-red-600 text-[11px]">{urlError}</p>
         )}
+      </div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="startMaximized"
+          className="mt-0.5"
+          checked={startMaximized}
+          onChange={(e) => setStartMaximized(e.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="startMaximized" className="cursor-pointer">
+            Open main window maximized
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Fills the available desktop whenever the window opens. Leave off to
+            open it centered at 90% of the work area.
+          </p>
+        </div>
       </div>
 
       <div className="space-y-1">

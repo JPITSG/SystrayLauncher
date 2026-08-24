@@ -73,6 +73,7 @@
 #define REG_KEY_PATH L"SOFTWARE\\JPIT\\SystrayLauncher"
 #define REG_VALUE_URL L"URL"
 #define REG_VALUE_TITLE L"WindowTitle"
+#define REG_VALUE_START_MAXIMIZED L"StartMaximized"
 #define REG_VALUE_ONHIDEJS L"OnHideJS"
 #define REG_VALUE_ONSHOWJS L"OnShowJS"
 #define REG_VALUE_SLEEP L"SleepWhenInactive"
@@ -184,6 +185,7 @@
 typedef struct {
     wchar_t url[2048];
     wchar_t windowTitle[256];
+    BOOL startMaximized;
     wchar_t onHideJs[4096];
     wchar_t onShowJs[4096];
     BOOL sleepWhenInactive;
@@ -573,6 +575,7 @@ typedef struct {
 void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     wcscpy_s(config->url, 2048, L"https://www.google.com/");
     wcscpy_s(config->windowTitle, 256, L"Systray Launcher");
+    config->startMaximized = FALSE;
     config->onHideJs[0] = L'\0';
     config->onShowJs[0] = L'\0';
     config->sleepWhenInactive = FALSE;
@@ -645,6 +648,9 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
         wcscpy_s(config->url, 2048, value);
     } else if (wcscmp(key, L"windowtitle") == 0) {
         wcscpy_s(config->windowTitle, 256, value);
+    } else if (wcscmp(key, L"startmaximized") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->startMaximized = (c == L'1' || c == L't' || c == L'y');
     } else if (wcscmp(key, L"onhidejs") == 0) {
         wcscpy_s(config->onHideJs, 4096, value);
     } else if (wcscmp(key, L"onshowjs") == 0) {
@@ -686,7 +692,8 @@ void CreateDefaultIni(const wchar_t* iniPath) {
     const wchar_t* content = L"# SystrayLauncher Configuration File\n"
                              L"# Lines starting with # or ; are comments\n\n"
                              L"url=https://www.google.com/\n\n"
-                             L"windowtitle=Systray Launcher\n";
+                             L"windowtitle=Systray Launcher\n"
+                             L"startmaximized=false\n";
     FILE* file = NULL;
     _wfopen_s(&file, iniPath, L"w, ccs=UTF-8");
     if (file) {
@@ -716,6 +723,17 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     dataSize = sizeof(config->windowTitle);
     if (RegQueryValueExW(hKey, REG_VALUE_TITLE, NULL, &dataType, (LPBYTE)config->windowTitle, &dataSize) != ERROR_SUCCESS) {
         wcscpy_s(config->windowTitle, 256, L"Systray Launcher");
+    }
+
+    // Load maximized-window preference (default disabled, preserving the
+    // centered 90%-of-work-area behavior used by earlier versions).
+    DWORD startMaximizedVal = 0;
+    dataSize = sizeof(startMaximizedVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_START_MAXIMIZED, NULL, &dataType,
+                         (LPBYTE)&startMaximizedVal, &dataSize) == ERROR_SUCCESS) {
+        config->startMaximized = (startMaximizedVal != 0);
+    } else {
+        config->startMaximized = FALSE;
     }
 
     // Load OnHideJS
@@ -869,6 +887,11 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     // Save Window Title
     RegSetValueExW(hKey, REG_VALUE_TITLE, 0, REG_SZ,
                    (const BYTE*)config->windowTitle, (DWORD)((wcslen(config->windowTitle) + 1) * sizeof(wchar_t)));
+
+    // Save maximized-window preference.
+    DWORD startMaximizedVal = config->startMaximized ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_START_MAXIMIZED, 0, REG_DWORD,
+                   (const BYTE*)&startMaximizedVal, sizeof(startMaximizedVal));
 
     // Save OnHideJS
     RegSetValueExW(hKey, REG_VALUE_ONHIDEJS, 0, REG_SZ,
@@ -2804,8 +2827,9 @@ static void webview_push_init_config(void) {
     wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
     if (!script) return;
     int written = swprintf(script, scriptCch,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"staticHostDnsFallback\":%s,\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
-        eUrl, eTitle, eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false",
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"startMaximized\":%s,\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"staticHostDnsFallback\":%s,\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
+        eUrl, eTitle, g_config.startMaximized ? L"true" : L"false",
+        eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false",
         g_config.openNewWindowsExternally ? L"true" : L"false",
         g_config.allowRunningInsecureContent ? L"true" : L"false",
         eInsecureOrigins,
@@ -3058,6 +3082,7 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         MultiByteToWideChar(CP_UTF8, 0, title, -1, g_config.windowTitle, 256);
         MultiByteToWideChar(CP_UTF8, 0, hideJs, -1, g_config.onHideJs, 4096);
         MultiByteToWideChar(CP_UTF8, 0, showJs, -1, g_config.onShowJs, 4096);
+        g_config.startMaximized = json_get_bool(msg, "startMaximized", FALSE);
         g_config.sleepWhenInactive = json_get_bool(msg, "sleepWhenInactive", FALSE);
         g_config.openNewWindowsExternally = json_get_bool(msg, "openNewWindowsExternally", FALSE);
         BOOL oldAllowRunningInsecureContent = g_config.allowRunningInsecureContent;
@@ -6831,7 +6856,9 @@ static BOOL IsClientAreaUniformColor(HWND hwnd) {
     return uniform;
 }
 
-// Compute the centered, 90%-of-work-area rectangle used for the main window.
+// Compute the main window's configured rectangle. Maximized windows are
+// pre-sized to the work area so the hidden WebView lays out close to its final
+// dimensions; Windows applies the exact maximized frame when the window opens.
 static void GetTargetWindowRect(int* x, int* y, int* w, int* h) {
     RECT workArea;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
@@ -6839,8 +6866,9 @@ static void GetTargetWindowRect(int* x, int* y, int* w, int* h) {
     int workWidth = workArea.right - workArea.left;
     int workHeight = workArea.bottom - workArea.top;
 
-    int windowWidth = (int)(workWidth * WINDOW_SIZE_PERCENTAGE);
-    int windowHeight = (int)(workHeight * WINDOW_SIZE_PERCENTAGE);
+    double scale = g_config.startMaximized ? 1.0 : WINDOW_SIZE_PERCENTAGE;
+    int windowWidth = (int)(workWidth * scale);
+    int windowHeight = (int)(workHeight * scale);
 
     *w = windowWidth;
     *h = windowHeight;
@@ -6861,9 +6889,17 @@ void ShowMainWindow(void) {
     int x, y, windowWidth, windowHeight;
     GetTargetWindowRect(&x, &y, &windowWidth, &windowHeight);
 
-    SetWindowPos(g_hwnd, HWND_TOP, x, y, windowWidth, windowHeight,
-                 SWP_SHOWWINDOW | SWP_FRAMECHANGED);
-    ShowWindow(g_hwnd, SW_RESTORE);
+    if (g_config.startMaximized) {
+        ShowWindow(g_hwnd, SW_MAXIMIZE);
+        SetWindowPos(g_hwnd, HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+    } else {
+        // Restore first in case the previous opening was maximized, then
+        // enforce the configured centered size before Windows paints again.
+        ShowWindow(g_hwnd, SW_RESTORE);
+        SetWindowPos(g_hwnd, HWND_TOP, x, y, windowWidth, windowHeight,
+                     SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+    }
     SetForegroundWindow(g_hwnd);
 
     ActivateMainWebView();
@@ -6891,7 +6927,14 @@ void ShowMainWindow(void) {
     StartVisibilityTimer(g_hwnd);
     UpdateJsVisibilityState(g_hwnd);
 
-    DebugPrint(L"[INFO] Main window shown at %dx%d, size %dx%d\n", x, y, windowWidth, windowHeight);
+    RECT shownRect;
+    if (GetWindowRect(g_hwnd, &shownRect)) {
+        DebugPrint(L"[INFO] Main window shown at %ldx%ld, size %ldx%ld%s\n",
+                   shownRect.left, shownRect.top,
+                   shownRect.right - shownRect.left,
+                   shownRect.bottom - shownRect.top,
+                   g_config.startMaximized ? L" (maximized)" : L"");
+    }
 }
 
 void HideMainWindow(void) {
