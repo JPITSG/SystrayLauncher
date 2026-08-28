@@ -6758,16 +6758,18 @@ static void ResetTargetPageIfNeeded(void) {
     if (SUCCEEDED(hr) && currentUrl) {
         if (wcscmp(currentUrl, g_initialUrl) != 0) {
             g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
-            DebugPrint(L"[INFO] Reset URL to initial on show: %s (was: %s)\n", g_initialUrl, currentUrl);
+            DebugPrint(L"[INFO] Reset URL to configured target: %s (was: %s)\n",
+                       g_initialUrl, currentUrl);
         } else {
-            DebugPrint(L"[INFO] URL unchanged, skipping navigation on show\n");
+            DebugPrint(L"[INFO] URL already at configured target; skipping navigation\n");
         }
         CoTaskMemFree(currentUrl);
         return;
     }
 
     g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
-    DebugPrint(L"[INFO] Reset URL to initial on show (couldn't check current): %s\n", g_initialUrl);
+    DebugPrint(L"[INFO] Reset URL to configured target (couldn't check current): %s\n",
+               g_initialUrl);
 }
 
 // Reset the hidden page to the configured URL without showing anything: wake
@@ -7390,7 +7392,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_TRAYICON:
             switch (lParam) {
                 case WM_MOUSEMOVE: PrewarmMainWebView(); break;
-                case WM_LBUTTONDBLCLK: ShowMainWindow(); break;
+                case WM_LBUTTONDBLCLK:
+                    // A tray double-click is both Open and Home: return to the
+                    // configured target even when the window is already up.
+                    // ShowMainWindow consumes this request immediately when
+                    // the WebView is ready, or preserves it across a rebuild.
+                    InterlockedExchange(&g_resetUrlOnNextShow, TRUE);
+                    ShowMainWindow();
+                    break;
                 case WM_RBUTTONUP: ShowContextMenu(hwnd); break;
             }
             return 0;

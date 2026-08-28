@@ -4,7 +4,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 
 ## Features
 
-- **System Tray Integration** - Runs in the system tray; double-click to open, close/minimize to hide
+- **System Tray Integration** - Runs in the system tray; double-click to open and return to the configured URL, close/minimize to hide
 - **WebView2 Browser** - Uses Microsoft Edge WebView2 for modern web compatibility
 - **Configurable** - Set custom URL, window title, and JavaScript hooks via GUI
 - **JavaScript Hooks** - Execute custom JavaScript when the window is shown or hidden (useful for pausing/resuming web app activity)
