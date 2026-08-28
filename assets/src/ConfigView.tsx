@@ -147,6 +147,12 @@ export default function ConfigView({
   const [startMaximized, setStartMaximized] = useState(
     config.startMaximized ?? false
   );
+  const [returnToTargetOnDoubleClick, setReturnToTargetOnDoubleClick] = useState(
+    config.returnToTargetOnDoubleClick ?? true
+  );
+  const [showInTaskbar, setShowInTaskbar] = useState(
+    config.showInTaskbar ?? false
+  );
   const [onHideJs, setOnHideJs] = useState(config.onHideJs);
   const [onShowJs, setOnShowJs] = useState(config.onShowJs);
   const [sleepWhenInactive, setSleepWhenInactive] = useState(
@@ -371,6 +377,8 @@ export default function ConfigView({
       url: trimmedUrl,
       windowTitle,
       startMaximized,
+      returnToTargetOnDoubleClick,
+      showInTaskbar,
       onHideJs,
       onShowJs,
       sleepWhenInactive,
@@ -448,6 +456,47 @@ export default function ConfigView({
           <p className="text-neutral-500 text-[11px] leading-snug">
             Fills the available desktop whenever the window opens. Leave off to
             open it centered at 90% of the work area.
+          </p>
+        </div>
+      </div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="showInTaskbar"
+          className="mt-0.5"
+          checked={showInTaskbar}
+          onChange={(e) => setShowInTaskbar(e.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label htmlFor="showInTaskbar" className="cursor-pointer">
+            Show main window in the taskbar
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Adds a taskbar button while the main window is open. Leave off to
+            keep the launcher tray-only. Changing this setting restarts the
+            launcher.
+          </p>
+        </div>
+      </div>
+
+      <div className="flex items-start gap-2 pt-1">
+        <Checkbox
+          id="returnToTargetOnDoubleClick"
+          className="mt-0.5"
+          checked={returnToTargetOnDoubleClick}
+          onChange={(e) => setReturnToTargetOnDoubleClick(e.target.checked)}
+        />
+        <div className="space-y-0.5">
+          <Label
+            htmlFor="returnToTargetOnDoubleClick"
+            className="cursor-pointer"
+          >
+            Return to configured URL on tray double-click
+          </Label>
+          <p className="text-neutral-500 text-[11px] leading-snug">
+            Returns to the configured URL when you double-click the tray icon,
+            including while the main window is already open. Leave off to only
+            open or focus the current page.
           </p>
         </div>
       </div>

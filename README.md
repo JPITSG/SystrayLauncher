@@ -4,7 +4,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 
 ## Features
 
-- **System Tray Integration** - Runs in the system tray; double-click to open and return to the configured URL, close/minimize to hide
+- **System Tray Integration** - Runs in the system tray; double-click to open and optionally return to the configured URL, close/minimize to hide
 - **WebView2 Browser** - Uses Microsoft Edge WebView2 for modern web compatibility
 - **Configurable** - Set custom URL, window title, and JavaScript hooks via GUI
 - **JavaScript Hooks** - Execute custom JavaScript when the window is shown or hidden (useful for pausing/resuming web app activity)
@@ -40,6 +40,8 @@ Settings available in the Configure dialog:
 | Window Title | Base title shown with the configured URL hostname when available, plus a loading indicator during navigation |
 | URL | The web page to load |
 | Open main window maximized | Fills the available desktop whenever the main window opens. Disabled by default; when disabled, the window opens centered at 90% of the work area. |
+| Show main window in the taskbar | Adds a taskbar button while the main window is open. Disabled by default to preserve tray-only behavior; changing it restarts the launcher. |
+| Return to configured URL on tray double-click | When enabled, double-clicking the tray icon returns the main window to the configured URL even if the window is already open. Disable it to open or focus the window without changing the current page. Enabled by default. |
 | JavaScript on Hide | JS executed when window is fully covered or hidden |
 | JavaScript on Show | JS executed when window becomes visible |
 | Resolve listed hostnames to static IP addresses | Bypasses normal DNS for explicitly listed hostnames inside the main web container. Enter one `hostname:IP` mapping per line (for example, `device.local:192.168.1.20`). The option is disabled by default and restarts the launcher when changed. |
@@ -198,7 +200,7 @@ The application uses a single icon file (`icon.ico`) that appears in multiple lo
 |----------|-------------|
 | System Tray | Small icon in the notification area (16x16 or 32x32 depending on DPI) |
 | Window Title Bar | Icon shown in the top-left corner of the main window |
-| Taskbar | Icon displayed when the window is visible |
+| Taskbar | Optional icon displayed while the main window is visible when **Show main window in the taskbar** is enabled |
 | Alt-Tab Switcher | Icon shown when cycling through windows |
 
 ### Replacing the Icon

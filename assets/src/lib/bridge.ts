@@ -2,6 +2,8 @@ export interface ConfigData {
   url: string;
   windowTitle: string;
   startMaximized: boolean;
+  returnToTargetOnDoubleClick: boolean;
+  showInTaskbar: boolean;
   onHideJs: string;
   onShowJs: string;
   sleepWhenInactive: boolean;
@@ -96,6 +98,8 @@ export function saveSettings(config: ConfigData) {
       url: config.url,
       windowTitle: config.windowTitle,
       startMaximized: config.startMaximized,
+      returnToTargetOnDoubleClick: config.returnToTargetOnDoubleClick,
+      showInTaskbar: config.showInTaskbar,
       onHideJs: config.onHideJs,
       onShowJs: config.onShowJs,
       sleepWhenInactive: config.sleepWhenInactive,

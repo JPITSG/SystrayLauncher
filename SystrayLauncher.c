@@ -74,6 +74,8 @@
 #define REG_VALUE_URL L"URL"
 #define REG_VALUE_TITLE L"WindowTitle"
 #define REG_VALUE_START_MAXIMIZED L"StartMaximized"
+#define REG_VALUE_RETURN_TO_TARGET_ON_DOUBLE_CLICK L"ReturnToTargetOnDoubleClick"
+#define REG_VALUE_SHOW_IN_TASKBAR L"ShowInTaskbar"
 #define REG_VALUE_ONHIDEJS L"OnHideJS"
 #define REG_VALUE_ONSHOWJS L"OnShowJS"
 #define REG_VALUE_SLEEP L"SleepWhenInactive"
@@ -186,6 +188,8 @@ typedef struct {
     wchar_t url[2048];
     wchar_t windowTitle[256];
     BOOL startMaximized;
+    BOOL returnToTargetOnDoubleClick;
+    BOOL showInTaskbar;
     wchar_t onHideJs[4096];
     wchar_t onShowJs[4096];
     BOOL sleepWhenInactive;
@@ -210,7 +214,8 @@ typedef enum {
 // Globals
 static Configuration g_config;
 static HWND g_hwnd = NULL;
-static HWND g_hwndOwner = NULL;  // Invisible owner window to prevent taskbar appearance
+// Invisible owner used when the main window should stay out of the taskbar.
+static HWND g_hwndOwner = NULL;
 static ICoreWebView2Controller* g_webViewController = NULL;
 static ICoreWebView2* g_webView = NULL;
 static ICoreWebView2Environment* g_webViewEnv = NULL;
@@ -576,6 +581,8 @@ void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     wcscpy_s(config->url, 2048, L"https://www.google.com/");
     wcscpy_s(config->windowTitle, 256, L"Systray Launcher");
     config->startMaximized = FALSE;
+    config->returnToTargetOnDoubleClick = TRUE;
+    config->showInTaskbar = FALSE;
     config->onHideJs[0] = L'\0';
     config->onShowJs[0] = L'\0';
     config->sleepWhenInactive = FALSE;
@@ -651,6 +658,13 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
     } else if (wcscmp(key, L"startmaximized") == 0) {
         wchar_t c = towlower(value[0]);
         config->startMaximized = (c == L'1' || c == L't' || c == L'y');
+    } else if (wcscmp(key, L"returntotargetondoubleclick") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->returnToTargetOnDoubleClick =
+            (c == L'1' || c == L't' || c == L'y');
+    } else if (wcscmp(key, L"showintaskbar") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->showInTaskbar = (c == L'1' || c == L't' || c == L'y');
     } else if (wcscmp(key, L"onhidejs") == 0) {
         wcscpy_s(config->onHideJs, 4096, value);
     } else if (wcscmp(key, L"onshowjs") == 0) {
@@ -693,7 +707,9 @@ void CreateDefaultIni(const wchar_t* iniPath) {
                              L"# Lines starting with # or ; are comments\n\n"
                              L"url=https://www.google.com/\n\n"
                              L"windowtitle=Systray Launcher\n"
-                             L"startmaximized=false\n";
+                             L"startmaximized=false\n"
+                             L"returntotargetondoubleclick=true\n"
+                             L"showintaskbar=false\n";
     FILE* file = NULL;
     _wfopen_s(&file, iniPath, L"w, ccs=UTF-8");
     if (file) {
@@ -734,6 +750,29 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         config->startMaximized = (startMaximizedVal != 0);
     } else {
         config->startMaximized = FALSE;
+    }
+
+    // The preceding release always returned to the configured target on a tray
+    // double-click, so preserve that behavior when the value is absent.
+    DWORD returnToTargetVal = 1;
+    dataSize = sizeof(returnToTargetVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_RETURN_TO_TARGET_ON_DOUBLE_CLICK,
+                         NULL, &dataType, (LPBYTE)&returnToTargetVal,
+                         &dataSize) == ERROR_SUCCESS) {
+        config->returnToTargetOnDoubleClick = (returnToTargetVal != 0);
+    } else {
+        config->returnToTargetOnDoubleClick = TRUE;
+    }
+
+    // Existing installations use an invisible owner to suppress the taskbar
+    // button, so the new preference remains disabled when the value is absent.
+    DWORD showInTaskbarVal = 0;
+    dataSize = sizeof(showInTaskbarVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_SHOW_IN_TASKBAR, NULL, &dataType,
+                         (LPBYTE)&showInTaskbarVal, &dataSize) == ERROR_SUCCESS) {
+        config->showInTaskbar = (showInTaskbarVal != 0);
+    } else {
+        config->showInTaskbar = FALSE;
     }
 
     // Load OnHideJS
@@ -892,6 +931,15 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     DWORD startMaximizedVal = config->startMaximized ? 1 : 0;
     RegSetValueExW(hKey, REG_VALUE_START_MAXIMIZED, 0, REG_DWORD,
                    (const BYTE*)&startMaximizedVal, sizeof(startMaximizedVal));
+
+    DWORD returnToTargetVal = config->returnToTargetOnDoubleClick ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_RETURN_TO_TARGET_ON_DOUBLE_CLICK, 0,
+                   REG_DWORD, (const BYTE*)&returnToTargetVal,
+                   sizeof(returnToTargetVal));
+
+    DWORD showInTaskbarVal = config->showInTaskbar ? 1 : 0;
+    RegSetValueExW(hKey, REG_VALUE_SHOW_IN_TASKBAR, 0, REG_DWORD,
+                   (const BYTE*)&showInTaskbarVal, sizeof(showInTaskbarVal));
 
     // Save OnHideJS
     RegSetValueExW(hKey, REG_VALUE_ONHIDEJS, 0, REG_SZ,
@@ -2823,12 +2871,14 @@ static void webview_push_init_config(void) {
     // A fixed 16K buffer used to silently truncate the script for large JS
     // hooks, which broke onInit and left the dialog blank.
     const size_t scriptCch =
-        4096 + 512 + 8192 + 8192 + 4096 + 4096 + 512 + 256 + 64 + 832;
+        4096 + 512 + 8192 + 8192 + 4096 + 4096 + 512 + 256 + 64 + 1024;
     wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
     if (!script) return;
     int written = swprintf(script, scriptCch,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"startMaximized\":%s,\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"staticHostDnsFallback\":%s,\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"startMaximized\":%s,\"returnToTargetOnDoubleClick\":%s,\"showInTaskbar\":%s,\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"staticHostDnsFallback\":%s,\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
         eUrl, eTitle, g_config.startMaximized ? L"true" : L"false",
+        g_config.returnToTargetOnDoubleClick ? L"true" : L"false",
+        g_config.showInTaskbar ? L"true" : L"false",
         eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false",
         g_config.openNewWindowsExternally ? L"true" : L"false",
         g_config.allowRunningInsecureContent ? L"true" : L"false",
@@ -3078,11 +3128,15 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         json_get_string(msg, "staticHostMappings", staticHosts,
                         sizeof(staticHosts));
 
+        BOOL oldShowInTaskbar = g_config.showInTaskbar;
         MultiByteToWideChar(CP_UTF8, 0, url, -1, g_config.url, 2048);
         MultiByteToWideChar(CP_UTF8, 0, title, -1, g_config.windowTitle, 256);
         MultiByteToWideChar(CP_UTF8, 0, hideJs, -1, g_config.onHideJs, 4096);
         MultiByteToWideChar(CP_UTF8, 0, showJs, -1, g_config.onShowJs, 4096);
         g_config.startMaximized = json_get_bool(msg, "startMaximized", FALSE);
+        g_config.returnToTargetOnDoubleClick =
+            json_get_bool(msg, "returnToTargetOnDoubleClick", TRUE);
+        g_config.showInTaskbar = json_get_bool(msg, "showInTaskbar", FALSE);
         g_config.sleepWhenInactive = json_get_bool(msg, "sleepWhenInactive", FALSE);
         g_config.openNewWindowsExternally = json_get_bool(msg, "openNewWindowsExternally", FALSE);
         BOOL oldAllowRunningInsecureContent = g_config.allowRunningInsecureContent;
@@ -3128,11 +3182,12 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
              wcscmp(oldInsecureContentOrigins, g_config.insecureContentOrigins) != 0 ||
              oldUseStaticHostMappings != g_config.useStaticHostMappings ||
              oldStaticHostDnsFallback != g_config.staticHostDnsFallback ||
-             wcscmp(oldStaticHostMappings, g_config.staticHostMappings) != 0)) {
-            // Browser arguments are fixed when the environment is created.
-            // Close the dialog first, then restart so the new process creates
-            // the main WebView with the updated network settings.
-            DebugPrint(L"[INFO] Browser environment setting changed; restarting launcher\n");
+             wcscmp(oldStaticHostMappings, g_config.staticHostMappings) != 0 ||
+             oldShowInTaskbar != g_config.showInTaskbar)) {
+            // Browser arguments and main-window ownership are established at
+            // startup. Close the dialog first, then restart so the new process
+            // creates them with the updated settings.
+            DebugPrint(L"[INFO] Startup-only setting changed; restarting launcher\n");
             PostMessage(g_hwnd, WM_COMMAND, ID_TRAY_MENU_RESTART, 0);
         }
     } else if (strcmp(action, "close") == 0) {
@@ -7393,11 +7448,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             switch (lParam) {
                 case WM_MOUSEMOVE: PrewarmMainWebView(); break;
                 case WM_LBUTTONDBLCLK:
-                    // A tray double-click is both Open and Home: return to the
-                    // configured target even when the window is already up.
-                    // ShowMainWindow consumes this request immediately when
-                    // the WebView is ready, or preserves it across a rebuild.
-                    InterlockedExchange(&g_resetUrlOnNextShow, TRUE);
+                    if (g_config.returnToTargetOnDoubleClick) {
+                        // In Home mode, request the configured target even when
+                        // the window is already up. ShowMainWindow consumes the
+                        // request now or preserves it across a WebView rebuild.
+                        InterlockedExchange(&g_resetUrlOnNextShow, TRUE);
+                    }
                     ShowMainWindow();
                     break;
                 case WM_RBUTTONUP: ShowContextMenu(hwnd); break;
@@ -7640,7 +7696,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Register invisible owner window class (prevents taskbar appearance)
+    // Register the invisible owner class used when the taskbar button is off.
     WNDCLASSEXW ownerWc = {0};
     ownerWc.cbSize = sizeof(ownerWc);
     ownerWc.lpfnWndProc = DefWindowProcW;
@@ -7648,7 +7704,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ownerWc.lpszClassName = L"SystrayLauncherOwner";
     RegisterClassExW(&ownerWc);
 
-    // Create invisible owner window
+    // Create the invisible owner; it remains unused in taskbar-button mode.
     g_hwndOwner = CreateWindowExW(0, L"SystrayLauncherOwner", L"",
                                   WS_POPUP, 0, 0, 0, 0,
                                   NULL, NULL, hInstance, NULL);
@@ -7674,10 +7730,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
     
-    // Create main window with invisible owner (prevents taskbar appearance)
-    g_hwnd = CreateWindowExW(0, L"SystrayLauncherClass", g_config.windowTitle,
+    // An unowned WS_EX_APPWINDOW receives a taskbar button. The default keeps
+    // the invisible owner used by earlier releases, which remains tray-only.
+    DWORD mainWindowExStyle = g_config.showInTaskbar ? WS_EX_APPWINDOW : 0;
+    HWND mainWindowOwner = g_config.showInTaskbar ? NULL : g_hwndOwner;
+    g_hwnd = CreateWindowExW(mainWindowExStyle, L"SystrayLauncherClass",
+                            g_config.windowTitle,
                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                            1024, 768, g_hwndOwner, NULL, hInstance, NULL);
+                            1024, 768, mainWindowOwner, NULL, hInstance, NULL);
     if (!g_hwnd) {
         MessageBoxW(NULL, L"Failed to create window", L"Error", MB_OK | MB_ICONERROR);
         return 1;
