@@ -472,8 +472,9 @@ export default function ConfigView({
             Show main window in the taskbar
           </Label>
           <p className="text-neutral-500 text-[11px] leading-snug">
-            Adds a taskbar button while the main window is open. Leave off to
-            keep the launcher tray-only. Changing this setting restarts the
+            Adds a taskbar button while the main window is open; minimizing
+            keeps it in the taskbar. Leave off for tray-only behavior, where
+            minimizing hides the window. Changing this setting restarts the
             launcher.
           </p>
         </div>

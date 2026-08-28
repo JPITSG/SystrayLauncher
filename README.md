@@ -4,7 +4,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 
 ## Features
 
-- **System Tray Integration** - Runs in the system tray; double-click to open and optionally return to the configured URL, close/minimize to hide
+- **System Tray Integration** - Runs in the system tray; double-click to open and optionally return to the configured URL, close to hide, and optionally minimize to the taskbar
 - **WebView2 Browser** - Uses Microsoft Edge WebView2 for modern web compatibility
 - **Configurable** - Set custom URL, window title, and JavaScript hooks via GUI
 - **JavaScript Hooks** - Execute custom JavaScript when the window is shown or hidden (useful for pausing/resuming web app activity)
@@ -40,7 +40,7 @@ Settings available in the Configure dialog:
 | Window Title | Base title shown with the configured URL hostname when available, plus a loading indicator during navigation |
 | URL | The web page to load |
 | Open main window maximized | Fills the available desktop whenever the main window opens. Disabled by default; when disabled, the window opens centered at 90% of the work area. |
-| Show main window in the taskbar | Adds a taskbar button while the main window is open. Disabled by default to preserve tray-only behavior; changing it restarts the launcher. |
+| Show main window in the taskbar | Adds a taskbar button while the main window is open and minimizes the window there normally. Disabled by default; when disabled, minimizing hides the window to the tray. Changing this setting restarts the launcher. |
 | Return to configured URL on tray double-click | When enabled, double-clicking the tray icon returns the main window to the configured URL even if the window is already open. Disable it to open or focus the window without changing the current page. Enabled by default. |
 | JavaScript on Hide | JS executed when window is fully covered or hidden |
 | JavaScript on Show | JS executed when window becomes visible |

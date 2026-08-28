@@ -264,6 +264,8 @@ static volatile LONG g_framePongSeen = FALSE;
 static int g_healthTicks = 0;       // probing ticks with a live WebView
 static int g_healthTotalTicks = 0;  // lifetime of this poll (safety cap)
 static BOOL g_healthHealed = FALSE; // one rebuild per open
+// UI-thread state used to distinguish a taskbar restore from ordinary resizes.
+static BOOL g_mainWindowMinimized = FALSE;
 static ULONGLONG g_rebuildBurstStartTick = 0;
 static LONG g_rebuildBurstCount = 0;
 static BOOL g_mainNavigationLoading = TRUE;
@@ -7208,13 +7210,31 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
             return 0;
             
-        case WM_SIZE:
+        case WM_SIZE: {
+            BOOL restoredFromTaskbar = g_mainWindowMinimized;
             if (wParam == SIZE_MINIMIZED) {
+                g_mainWindowMinimized = TRUE;
+                StopVisibilityTimer(hwnd);
+                KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
+                UpdateJsVisibilityState(hwnd);
                 DeactivateMainWebView();
             } else if (IsWindowVisible(hwnd)) {
+                g_mainWindowMinimized = FALSE;
                 ActivateMainWebView();
+                if (restoredFromTaskbar) {
+                    // A restore through the taskbar bypasses ShowMainWindow,
+                    // so resume the same visibility and health lifecycle here.
+                    StartVisibilityTimer(hwnd);
+                    UpdateJsVisibilityState(hwnd);
+                    g_healthHealed = FALSE;
+                    ArmMainHealthCheck();
+                    DebugPrint(L"[INFO] Main window restored from taskbar\n");
+                }
+            } else {
+                g_mainWindowMinimized = FALSE;
             }
             return 0;
+        }
             
         case WM_DISPLAYCHANGE:
             DebugPrint(L"[INFO] Display change event received...\n");
@@ -7412,8 +7432,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             
         case WM_SYSCOMMAND:
             if ((wParam & 0xFFF0) == SC_MINIMIZE) {
-                HideMainWindow();
-                return 0;
+                if (!g_config.showInTaskbar) {
+                    HideMainWindow();
+                    return 0;
+                }
+                // Taskbar mode uses normal Windows minimization. DefWindowProc
+                // sends WM_SIZE/SIZE_MINIMIZED, which settles the WebView state.
             }
             break;
             
