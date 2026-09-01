@@ -104,6 +104,8 @@
 #define REG_CAPABILITIES_REFERENCE L"Software\\JPIT\\SystrayLauncher\\Capabilities"
 #define REG_MAILTO_PROGID L"SystrayLauncher.mailto"
 #define REG_MAILTO_PROGID_PATH L"Software\\Classes\\" REG_MAILTO_PROGID
+#define REG_APPLICATION_PATH \
+    L"Software\\Classes\\Applications\\SystrayLauncher.exe"
 
 #define ID_TIMER_INITIAL_HIDE_JS 2
 #define INITIAL_HIDE_JS_DELAY_MS 2000
@@ -1143,9 +1145,18 @@ static BOOL RemoveMailtoHandlerRegistration(void) {
                                 REG_REGISTERED_APPLICATIONS_PATH, 0,
                                 KEY_SET_VALUE, &registeredApps);
     if (result == ERROR_SUCCESS) {
-        result = RegDeleteValueW(registeredApps, APP_NAME);
-        if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND) {
-            success = FALSE;
+        // Remove both the current friendly registered name and the canonical
+        // name used by 1.0.20 so upgrading does not leave a duplicate entry.
+        const wchar_t* registeredNames[] = {
+            APP_DISPLAY_NAME_WSTRING,
+            APP_NAME
+        };
+        for (size_t i = 0;
+             i < sizeof(registeredNames) / sizeof(registeredNames[0]); i++) {
+            result = RegDeleteValueW(registeredApps, registeredNames[i]);
+            if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND) {
+                success = FALSE;
+            }
         }
         RegCloseKey(registeredApps);
     } else if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) {
@@ -1158,6 +1169,10 @@ static BOOL RemoveMailtoHandlerRegistration(void) {
     }
     if (!DeleteRegistryTreeIfPresent(HKEY_CURRENT_USER,
                                      REG_MAILTO_PROGID_PATH)) {
+        success = FALSE;
+    }
+    if (!DeleteRegistryTreeIfPresent(HKEY_CURRENT_USER,
+                                     REG_APPLICATION_PATH)) {
         success = FALSE;
     }
     return success;
@@ -1212,19 +1227,45 @@ static BOOL SetMailtoHandlerRegistration(BOOL enabled) {
         return FALSE;
     }
 
-    BOOL success =
+    // Migrate the canonical RegisteredApplications value written by 1.0.20.
+    // The capability's ApplicationName must match its registered value name,
+    // otherwise Windows can retain a second filename-based entry.
+    BOOL legacyNameRemoved = TRUE;
+    HKEY registeredApps = NULL;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER,
+                                REG_REGISTERED_APPLICATIONS_PATH, 0,
+                                KEY_SET_VALUE, &registeredApps);
+    if (result == ERROR_SUCCESS) {
+        result = RegDeleteValueW(registeredApps, APP_NAME);
+        if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND) {
+            legacyNameRemoved = FALSE;
+        }
+        RegCloseKey(registeredApps);
+    } else if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) {
+        legacyNameRemoved = FALSE;
+    }
+
+    BOOL success = legacyNameRemoved &&
         SetRegistryString(HKEY_CURRENT_USER, REG_MAILTO_PROGID_PATH, NULL,
-                          L"SystrayLauncher email link") &&
+                          L"System Tray Launcher email link") &&
         SetRegistryString(HKEY_CURRENT_USER, REG_MAILTO_PROGID_PATH,
                           L"URL Protocol", L"") &&
+        SetRegistryString(HKEY_CURRENT_USER, REG_MAILTO_PROGID_PATH,
+                          L"FriendlyTypeName",
+                          L"System Tray Launcher email link") &&
         SetRegistryString(HKEY_CURRENT_USER,
                           REG_MAILTO_PROGID_PATH L"\\DefaultIcon", NULL,
                           icon) &&
         SetRegistryString(HKEY_CURRENT_USER,
                           REG_MAILTO_PROGID_PATH L"\\shell\\open\\command",
                           NULL, command) &&
+        SetRegistryString(HKEY_CURRENT_USER, REG_APPLICATION_PATH,
+                          L"FriendlyAppName", APP_DISPLAY_NAME_WSTRING) &&
+        SetRegistryString(HKEY_CURRENT_USER,
+                          REG_APPLICATION_PATH L"\\DefaultIcon", NULL,
+                          icon) &&
         SetRegistryString(HKEY_CURRENT_USER, REG_CAPABILITIES_PATH,
-                          L"ApplicationName", APP_NAME) &&
+                          L"ApplicationName", APP_DISPLAY_NAME_WSTRING) &&
         SetRegistryString(
             HKEY_CURRENT_USER, REG_CAPABILITIES_PATH,
             L"ApplicationDescription",
@@ -1235,7 +1276,8 @@ static BOOL SetMailtoHandlerRegistration(BOOL enabled) {
                           REG_CAPABILITIES_PATH L"\\UrlAssociations",
                           L"mailto", REG_MAILTO_PROGID) &&
         SetRegistryString(HKEY_CURRENT_USER,
-                          REG_REGISTERED_APPLICATIONS_PATH, APP_NAME,
+                          REG_REGISTERED_APPLICATIONS_PATH,
+                          APP_DISPLAY_NAME_WSTRING,
                           REG_CAPABILITIES_REFERENCE);
 
     if (!success) {
@@ -1252,7 +1294,7 @@ static MailtoDefaultAppsOpenResult OpenMailtoDefaultAppsSettings(void) {
     HWND owner = g_cfgHwnd ? g_cfgHwnd : g_hwnd;
     HINSTANCE result = ShellExecuteW(
         owner, L"open",
-        L"ms-settings:defaultapps?registeredAppUser=SystrayLauncher",
+        L"ms-settings:defaultapps?registeredAppUser=System%20Tray%20Launcher",
         NULL, NULL, SW_SHOWNORMAL);
     if ((INT_PTR)result > 32) return MAILTO_DEFAULT_APPS_APP_PAGE;
 
@@ -3495,11 +3537,11 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                     g_cfgHwnd,
                     settingsResult == MAILTO_DEFAULT_APPS_GENERAL_PAGE
                         ? L"Windows Default Apps is open. Select "
-                          L"SystrayLauncher and assign it to MAILTO links to "
+                          L"System Tray Launcher and assign it to MAILTO links to "
                           L"finish enabling email-link handling."
                         : L"SystrayLauncher is registered for email links, but "
                           L"Windows Settings could not be opened. Open Settings "
-                          L"> Apps > Default apps, select SystrayLauncher, and "
+                          L"> Apps > Default apps, select System Tray Launcher, and "
                           L"assign it to MAILTO links.",
                     APP_NAME, MB_OK | MB_ICONINFORMATION);
             }

@@ -504,7 +504,7 @@ export default function ConfigView({
             <p className="text-neutral-500 text-[11px] leading-snug">
               Registers this app as an option for mailto: links. When first
               enabled and saved, Windows Default Apps opens so you can assign
-              SystrayLauncher to MAILTO links.
+              System Tray Launcher to MAILTO links.
             </p>
           </div>
         </div>
