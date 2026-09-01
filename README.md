@@ -9,6 +9,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 - **Configurable** - Set custom URL, window title, and JavaScript hooks via GUI
 - **JavaScript Hooks** - Execute custom JavaScript when the window is shown or hidden (useful for pausing/resuming web app activity)
 - **External Link Handling** - Optionally open new windows/tabs (`target="_blank"`, `window.open`) in the system default browser instead of a WebView2 popup
+- **Email Link Routing** - Optionally register as a `mailto:` handler and route email links to a configured page in the main window
 - **Static Host Mappings** - Optionally resolve listed hostnames to configured IP addresses inside the embedded browser without changing system DNS
 - **Optional Mixed Content** - Explicitly allow an HTTPS page to load HTTP content from configured legacy origins
 - **Self Update** - Compare embedded local and repository versions in the configuration dialog, install newer builds, or force a reinstall of the same version
@@ -39,6 +40,7 @@ Settings available in the Configure dialog:
 |---------|-------------|
 | Window Title | Base title shown with the configured URL hostname when available, plus a loading indicator during navigation |
 | URL | The web page to load |
+| Handle email links with SystrayLauncher | Registers SystrayLauncher as an available `mailto:` handler and opens every email link at the configured email-link destination URL. Disabled by default. Windows requires the user to select SystrayLauncher for MAILTO links in Default Apps. |
 | Open main window maximized | Fills the available desktop whenever the main window opens. Disabled by default; when disabled, the window opens centered at 90% of the work area. |
 | Show main window in the taskbar | Adds a taskbar button while the main window is open and minimizes the window there normally. Disabled by default; when disabled, minimizing hides the window to the tray. Changing this setting restarts the launcher. |
 | Return to configured URL on tray double-click | When enabled, double-clicking the tray icon returns the main window to the configured URL even if the window is already open. Disable it to open or focus the window without changing the current page. Enabled by default. |
@@ -54,6 +56,15 @@ Settings available in the Configure dialog:
 
 The footer displays the application and WebView2 runtime versions together as
 `v<application version> / <WebView2 version>`.
+
+When **Handle email links with SystrayLauncher** changes from disabled to
+enabled and the settings are saved, the launcher registers itself per-user and
+opens Windows Default Apps directly to its application page when the installed
+Windows version supports that link. Select SystrayLauncher for MAILTO there to
+complete the association; if Settings cannot be opened, the launcher displays
+the manual path. Later `mailto:` activations show or focus the main window and
+navigate it to the fixed email-link destination, including when the launcher is
+already running. Disabling the option removes the launcher's registration.
 
 When **Automatically check for updates** is enabled, SystrayLauncher checks at
 startup, whenever the Configure dialog opens, and once every 60 minutes using a

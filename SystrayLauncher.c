@@ -50,6 +50,8 @@
 #define CONFIG_FILENAME L"config.ini"
 #define APP_NAME L"SystrayLauncher"
 #define MUTEX_NAME L"SystrayLauncher_SingleInstance_Mutex_9F8A7B6C"
+#define MAILTO_ACTIVATE_MESSAGE_NAME \
+    L"SystrayLauncher_MailtoActivation_43DDF20A_891B_4C96_A7E2_8E4F46C0A7A1"
 #define TRAY_ICON_ID 100
 #define WM_TRAYICON (WM_APP + 1)
 #define WM_APP_UPDATE_RESULT (WM_APP + 3)
@@ -76,6 +78,8 @@
 #define REG_VALUE_START_MAXIMIZED L"StartMaximized"
 #define REG_VALUE_RETURN_TO_TARGET_ON_DOUBLE_CLICK L"ReturnToTargetOnDoubleClick"
 #define REG_VALUE_SHOW_IN_TASKBAR L"ShowInTaskbar"
+#define REG_VALUE_HANDLE_MAILTO_LINKS L"HandleMailtoLinks"
+#define REG_VALUE_MAILTO_TARGET_URL L"MailtoTargetURL"
 #define REG_VALUE_ONHIDEJS L"OnHideJS"
 #define REG_VALUE_ONSHOWJS L"OnShowJS"
 #define REG_VALUE_SLEEP L"SleepWhenInactive"
@@ -91,6 +95,15 @@
 #define REG_VALUE_IGNORED_UPDATE_VERSION L"IgnoredUpdateVersion"
 #define REG_VALUE_DEBUGLOG L"DebugLog"
 #define REG_VALUE_CONFIGURED L"Configured"
+
+// Per-user Default Apps registration. Registering makes SystrayLauncher an
+// available MAILTO handler; Windows still requires the user to choose it as
+// the default application.
+#define REG_REGISTERED_APPLICATIONS_PATH L"Software\\RegisteredApplications"
+#define REG_CAPABILITIES_PATH REG_KEY_PATH L"\\Capabilities"
+#define REG_CAPABILITIES_REFERENCE L"Software\\JPIT\\SystrayLauncher\\Capabilities"
+#define REG_MAILTO_PROGID L"SystrayLauncher.mailto"
+#define REG_MAILTO_PROGID_PATH L"Software\\Classes\\" REG_MAILTO_PROGID
 
 #define ID_TIMER_INITIAL_HIDE_JS 2
 #define INITIAL_HIDE_JS_DELAY_MS 2000
@@ -190,6 +203,8 @@ typedef struct {
     BOOL startMaximized;
     BOOL returnToTargetOnDoubleClick;
     BOOL showInTaskbar;
+    BOOL handleMailtoLinks;
+    wchar_t mailtoTargetUrl[2048];
     wchar_t onHideJs[4096];
     wchar_t onShowJs[4096];
     BOOL sleepWhenInactive;
@@ -204,6 +219,12 @@ typedef struct {
     BOOL autoCheckForUpdates;
     BOOL debugLogEnabled;
 } Configuration;
+
+typedef enum {
+    MAILTO_DEFAULT_APPS_NOT_OPENED = 0,
+    MAILTO_DEFAULT_APPS_APP_PAGE,
+    MAILTO_DEFAULT_APPS_GENERAL_PAGE
+} MailtoDefaultAppsOpenResult;
 
 typedef enum {
     JS_VISIBILITY_UNKNOWN = -1,
@@ -221,6 +242,7 @@ static ICoreWebView2* g_webView = NULL;
 static ICoreWebView2Environment* g_webViewEnv = NULL;
 static NOTIFYICONDATAW g_nid = {0};
 static UINT g_WM_TASKBARCREATED = 0;
+static UINT g_WM_MAILTO_ACTIVATE = 0;
 static HANDLE g_hMutex = NULL;
 static wchar_t g_iniPath[MAX_PATH];
 static wchar_t g_initialUrl[2048];
@@ -236,6 +258,7 @@ static volatile LONG g_webViewPrewarmActive = FALSE;
 static volatile LONG g_webViewSuspendPending = FALSE;
 static volatile LONG g_webViewSuspended = FALSE;
 static volatile LONG g_resetUrlOnNextShow = FALSE;
+static volatile LONG g_mailtoActivationPending = FALSE;
 static volatile LONG g_sleepWhenInactive = FALSE;
 static volatile LONG g_openNewWindowsExternally = FALSE;
 static volatile LONG g_lockdownHeader = FALSE;
@@ -450,6 +473,12 @@ static BOOL SaveConfigToRegistry(const Configuration* config);
 static BOOL IsFirstLaunch(void);
 static void MarkAsConfigured(void);
 static void ApplyConfiguration(void);
+static BOOL IsValidHttpNavigationUrl(const wchar_t* url);
+static BOOL SetMailtoHandlerRegistration(BOOL enabled);
+static MailtoDefaultAppsOpenResult OpenMailtoDefaultAppsSettings(void);
+static BOOL IsMailtoProtocolInvocation(void);
+static BOOL ForwardMailtoActivationToRunningInstance(void);
+static BOOL ActivateMailtoDestination(void);
 static BOOL load_webview2_loader(void);
 static void ShowConfigWebViewDialog(void);
 
@@ -585,6 +614,8 @@ void LoadConfiguration(const wchar_t* iniPath, Configuration* config) {
     config->startMaximized = FALSE;
     config->returnToTargetOnDoubleClick = TRUE;
     config->showInTaskbar = FALSE;
+    config->handleMailtoLinks = FALSE;
+    config->mailtoTargetUrl[0] = L'\0';
     config->onHideJs[0] = L'\0';
     config->onShowJs[0] = L'\0';
     config->sleepWhenInactive = FALSE;
@@ -667,6 +698,11 @@ void ParseConfigLine(wchar_t* line, Configuration* config) {
     } else if (wcscmp(key, L"showintaskbar") == 0) {
         wchar_t c = towlower(value[0]);
         config->showInTaskbar = (c == L'1' || c == L't' || c == L'y');
+    } else if (wcscmp(key, L"handlemailtolinks") == 0) {
+        wchar_t c = towlower(value[0]);
+        config->handleMailtoLinks = (c == L'1' || c == L't' || c == L'y');
+    } else if (wcscmp(key, L"mailtotargeturl") == 0) {
+        wcscpy_s(config->mailtoTargetUrl, 2048, value);
     } else if (wcscmp(key, L"onhidejs") == 0) {
         wcscpy_s(config->onHideJs, 4096, value);
     } else if (wcscmp(key, L"onshowjs") == 0) {
@@ -711,7 +747,9 @@ void CreateDefaultIni(const wchar_t* iniPath) {
                              L"windowtitle=Systray Launcher\n"
                              L"startmaximized=false\n"
                              L"returntotargetondoubleclick=true\n"
-                             L"showintaskbar=false\n";
+                             L"showintaskbar=false\n"
+                             L"handlemailtolinks=false\n"
+                             L"mailtotargeturl=\n";
     FILE* file = NULL;
     _wfopen_s(&file, iniPath, L"w, ccs=UTF-8");
     if (file) {
@@ -727,7 +765,6 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
     if (result != ERROR_SUCCESS) {
         return FALSE;
     }
-
     DWORD dataSize;
     DWORD dataType;
 
@@ -775,6 +812,27 @@ static BOOL LoadConfigFromRegistry(Configuration* config) {
         config->showInTaskbar = (showInTaskbarVal != 0);
     } else {
         config->showInTaskbar = FALSE;
+    }
+
+    // Email-link handling is opt-in. The destination is kept when disabled so
+    // a user can turn the handler off temporarily without losing it.
+    DWORD handleMailtoVal = 0;
+    dataSize = sizeof(handleMailtoVal);
+    if (RegQueryValueExW(hKey, REG_VALUE_HANDLE_MAILTO_LINKS, NULL, &dataType,
+                         (LPBYTE)&handleMailtoVal, &dataSize) == ERROR_SUCCESS) {
+        config->handleMailtoLinks = (handleMailtoVal != 0);
+    } else {
+        config->handleMailtoLinks = FALSE;
+    }
+
+    config->mailtoTargetUrl[0] = L'\0';
+    dataSize = sizeof(config->mailtoTargetUrl);
+    if (RegQueryValueExW(hKey, REG_VALUE_MAILTO_TARGET_URL, NULL, &dataType,
+                         (LPBYTE)config->mailtoTargetUrl, &dataSize) != ERROR_SUCCESS ||
+        dataType != REG_SZ || dataSize < sizeof(wchar_t)) {
+        config->mailtoTargetUrl[0] = L'\0';
+    } else {
+        config->mailtoTargetUrl[2047] = L'\0';
     }
 
     // Load OnHideJS
@@ -920,6 +978,7 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     if (result != ERROR_SUCCESS) {
         return FALSE;
     }
+    BOOL success = TRUE;
 
     // Save URL
     RegSetValueExW(hKey, REG_VALUE_URL, 0, REG_SZ,
@@ -942,6 +1001,20 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     DWORD showInTaskbarVal = config->showInTaskbar ? 1 : 0;
     RegSetValueExW(hKey, REG_VALUE_SHOW_IN_TASKBAR, 0, REG_DWORD,
                    (const BYTE*)&showInTaskbarVal, sizeof(showInTaskbarVal));
+
+    DWORD handleMailtoVal = config->handleMailtoLinks ? 1 : 0;
+    if (RegSetValueExW(hKey, REG_VALUE_HANDLE_MAILTO_LINKS, 0, REG_DWORD,
+                       (const BYTE*)&handleMailtoVal,
+                       sizeof(handleMailtoVal)) != ERROR_SUCCESS) {
+        success = FALSE;
+    }
+    if (RegSetValueExW(
+            hKey, REG_VALUE_MAILTO_TARGET_URL, 0, REG_SZ,
+            (const BYTE*)config->mailtoTargetUrl,
+            (DWORD)((wcslen(config->mailtoTargetUrl) + 1) *
+                    sizeof(wchar_t))) != ERROR_SUCCESS) {
+        success = FALSE;
+    }
 
     // Save OnHideJS
     RegSetValueExW(hKey, REG_VALUE_ONHIDEJS, 0, REG_SZ,
@@ -1011,7 +1084,7 @@ static BOOL SaveConfigToRegistry(const Configuration* config) {
     RegDeleteValueW(hKey, L"SpellcheckLanguages");
 
     RegCloseKey(hKey);
-    return TRUE;
+    return success;
 }
 
 static BOOL IsFirstLaunch(void) {
@@ -1039,6 +1112,194 @@ static void MarkAsConfigured(void) {
         RegSetValueExW(hKey, REG_VALUE_CONFIGURED, 0, REG_DWORD, (const BYTE*)&configured, sizeof(configured));
         RegCloseKey(hKey);
     }
+}
+
+static BOOL SetRegistryString(HKEY root, const wchar_t* subkey,
+                              const wchar_t* valueName,
+                              const wchar_t* value) {
+    HKEY key = NULL;
+    DWORD disposition = 0;
+    LONG result = RegCreateKeyExW(root, subkey, 0, NULL,
+                                  REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                                  NULL, &key, &disposition);
+    if (result != ERROR_SUCCESS) return FALSE;
+
+    result = RegSetValueExW(key, valueName, 0, REG_SZ, (const BYTE*)value,
+                            (DWORD)((wcslen(value) + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+static BOOL DeleteRegistryTreeIfPresent(HKEY root, const wchar_t* subkey) {
+    LONG result = RegDeleteTreeW(root, subkey);
+    return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND ||
+           result == ERROR_PATH_NOT_FOUND;
+}
+
+static BOOL RemoveMailtoHandlerRegistration(void) {
+    BOOL success = TRUE;
+    HKEY registeredApps = NULL;
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER,
+                                REG_REGISTERED_APPLICATIONS_PATH, 0,
+                                KEY_SET_VALUE, &registeredApps);
+    if (result == ERROR_SUCCESS) {
+        result = RegDeleteValueW(registeredApps, APP_NAME);
+        if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND) {
+            success = FALSE;
+        }
+        RegCloseKey(registeredApps);
+    } else if (result != ERROR_FILE_NOT_FOUND && result != ERROR_PATH_NOT_FOUND) {
+        success = FALSE;
+    }
+
+    if (!DeleteRegistryTreeIfPresent(HKEY_CURRENT_USER,
+                                     REG_CAPABILITIES_PATH)) {
+        success = FALSE;
+    }
+    if (!DeleteRegistryTreeIfPresent(HKEY_CURRENT_USER,
+                                     REG_MAILTO_PROGID_PATH)) {
+        success = FALSE;
+    }
+    return success;
+}
+
+static BOOL IsValidHttpNavigationUrl(const wchar_t* url) {
+    if (!url || !url[0]) return FALSE;
+    for (const wchar_t* current = url; *current; current++) {
+        if (*current <= L' ' || *current == L'\"') return FALSE;
+    }
+
+    URL_COMPONENTS components = {0};
+    wchar_t hostname[256];
+    components.dwStructSize = sizeof(components);
+    components.lpszHostName = hostname;
+    components.dwHostNameLength =
+        (DWORD)(sizeof(hostname) / sizeof(hostname[0]));
+    if (!WinHttpCrackUrl(url, 0, 0, &components) ||
+        (components.nScheme != INTERNET_SCHEME_HTTP &&
+         components.nScheme != INTERNET_SCHEME_HTTPS) ||
+        components.dwHostNameLength == 0 ||
+        components.dwHostNameLength >=
+            sizeof(hostname) / sizeof(hostname[0])) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL SetMailtoHandlerRegistration(BOOL enabled) {
+    if (!enabled) {
+        BOOL removed = RemoveMailtoHandlerRegistration();
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+        return removed;
+    }
+
+    if (!IsValidHttpNavigationUrl(g_config.mailtoTargetUrl)) {
+        RemoveMailtoHandlerRegistration();
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+        return FALSE;
+    }
+
+    wchar_t executablePath[MAX_PATH];
+    DWORD pathLength = GetModuleFileNameW(NULL, executablePath, MAX_PATH);
+    if (pathLength == 0 || pathLength >= MAX_PATH) return FALSE;
+
+    wchar_t command[MAX_PATH + 32];
+    wchar_t icon[MAX_PATH + 8];
+    if (swprintf_s(command, sizeof(command) / sizeof(command[0]),
+                   L"\"%s\" --mailto \"%%1\"", executablePath) < 0 ||
+        swprintf_s(icon, sizeof(icon) / sizeof(icon[0]),
+                   L"\"%s\",0", executablePath) < 0) {
+        return FALSE;
+    }
+
+    BOOL success =
+        SetRegistryString(HKEY_CURRENT_USER, REG_MAILTO_PROGID_PATH, NULL,
+                          L"SystrayLauncher email link") &&
+        SetRegistryString(HKEY_CURRENT_USER, REG_MAILTO_PROGID_PATH,
+                          L"URL Protocol", L"") &&
+        SetRegistryString(HKEY_CURRENT_USER,
+                          REG_MAILTO_PROGID_PATH L"\\DefaultIcon", NULL,
+                          icon) &&
+        SetRegistryString(HKEY_CURRENT_USER,
+                          REG_MAILTO_PROGID_PATH L"\\shell\\open\\command",
+                          NULL, command) &&
+        SetRegistryString(HKEY_CURRENT_USER, REG_CAPABILITIES_PATH,
+                          L"ApplicationName", APP_NAME) &&
+        SetRegistryString(
+            HKEY_CURRENT_USER, REG_CAPABILITIES_PATH,
+            L"ApplicationDescription",
+            L"Opens email links at the configured SystrayLauncher destination.") &&
+        SetRegistryString(HKEY_CURRENT_USER, REG_CAPABILITIES_PATH,
+                          L"ApplicationIcon", icon) &&
+        SetRegistryString(HKEY_CURRENT_USER,
+                          REG_CAPABILITIES_PATH L"\\UrlAssociations",
+                          L"mailto", REG_MAILTO_PROGID) &&
+        SetRegistryString(HKEY_CURRENT_USER,
+                          REG_REGISTERED_APPLICATIONS_PATH, APP_NAME,
+                          REG_CAPABILITIES_REFERENCE);
+
+    if (!success) {
+        RemoveMailtoHandlerRegistration();
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+        return FALSE;
+    }
+
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+    return TRUE;
+}
+
+static MailtoDefaultAppsOpenResult OpenMailtoDefaultAppsSettings(void) {
+    HWND owner = g_cfgHwnd ? g_cfgHwnd : g_hwnd;
+    HINSTANCE result = ShellExecuteW(
+        owner, L"open",
+        L"ms-settings:defaultapps?registeredAppUser=SystrayLauncher",
+        NULL, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)result > 32) return MAILTO_DEFAULT_APPS_APP_PAGE;
+
+    // Older Windows 10 builds may not understand the per-application query;
+    // fall back to the general Default Apps page before asking the user to
+    // navigate there manually.
+    result = ShellExecuteW(owner, L"open", L"ms-settings:defaultapps",
+                           NULL, NULL, SW_SHOWNORMAL);
+    return (INT_PTR)result > 32 ? MAILTO_DEFAULT_APPS_GENERAL_PAGE
+                               : MAILTO_DEFAULT_APPS_NOT_OPENED;
+}
+
+static BOOL IsMailtoProtocolInvocation(void) {
+    int argumentCount = 0;
+    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    if (!arguments) return FALSE;
+
+    BOOL isMailto =
+        argumentCount == 3 && wcscmp(arguments[1], L"--mailto") == 0 &&
+        _wcsnicmp(arguments[2], L"mailto:", 7) == 0;
+    LocalFree(arguments);
+    return isMailto;
+}
+
+static BOOL ForwardMailtoActivationToRunningInstance(void) {
+    if (g_WM_MAILTO_ACTIVATE == 0) return FALSE;
+
+    // The mutex is created before the main window, so allow a process that is
+    // still starting or restarting a short window in which to publish it.
+    for (int attempt = 0; attempt < 30; attempt++) {
+        HWND target = FindWindowW(L"SystrayLauncherClass", NULL);
+        if (target) {
+            DWORD processId = 0;
+            GetWindowThreadProcessId(target, &processId);
+            if (processId != 0) AllowSetForegroundWindow(processId);
+
+            DWORD_PTR activationResult = 0;
+            if (SendMessageTimeoutW(target, g_WM_MAILTO_ACTIVATE, 0, 0,
+                                    SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000,
+                                    &activationResult) != 0 &&
+                activationResult != 0) {
+                return TRUE;
+            }
+        }
+        Sleep(100);
+    }
+    return FALSE;
 }
 
 static BOOL GetConfiguredUrlHostname(wchar_t* hostname, size_t hostnameCount) {
@@ -2855,11 +3116,13 @@ static void cfg_sync_controller_bounds(void) {
 }
 
 static void webview_push_init_config(void) {
-    wchar_t eUrl[4096], eTitle[512], eHide[8192], eShow[8192], eInsecureOrigins[4096];
+    wchar_t eUrl[4096], eTitle[512], eMailtoTargetUrl[4096];
+    wchar_t eHide[8192], eShow[8192], eInsecureOrigins[4096];
     wchar_t eStaticHosts[4096], eLockdownSecret[512], eWebView2Version[256];
     wchar_t eUpdateCompletedVersion[64];
     json_escape_wstring(g_config.url, eUrl, 4096);
     json_escape_wstring(g_config.windowTitle, eTitle, 512);
+    json_escape_wstring(g_config.mailtoTargetUrl, eMailtoTargetUrl, 4096);
     json_escape_wstring(g_config.onHideJs, eHide, 8192);
     json_escape_wstring(g_config.onShowJs, eShow, 8192);
     json_escape_wstring(g_config.insecureContentOrigins, eInsecureOrigins, 4096);
@@ -2873,14 +3136,16 @@ static void webview_push_init_config(void) {
     // A fixed 16K buffer used to silently truncate the script for large JS
     // hooks, which broke onInit and left the dialog blank.
     const size_t scriptCch =
-        4096 + 512 + 8192 + 8192 + 4096 + 4096 + 512 + 256 + 64 + 1024;
+        4096 + 512 + 4096 + 8192 + 8192 + 4096 + 4096 + 512 + 256 + 64 + 1152;
     wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
     if (!script) return;
     int written = swprintf(script, scriptCch,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"startMaximized\":%s,\"returnToTargetOnDoubleClick\":%s,\"showInTaskbar\":%s,\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"staticHostDnsFallback\":%s,\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"startMaximized\":%s,\"returnToTargetOnDoubleClick\":%s,\"showInTaskbar\":%s,\"handleMailtoLinks\":%s,\"mailtoTargetUrl\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"staticHostDnsFallback\":%s,\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
         eUrl, eTitle, g_config.startMaximized ? L"true" : L"false",
         g_config.returnToTargetOnDoubleClick ? L"true" : L"false",
         g_config.showInTaskbar ? L"true" : L"false",
+        g_config.handleMailtoLinks ? L"true" : L"false",
+        eMailtoTargetUrl,
         eHide, eShow, g_config.sleepWhenInactive ? L"true" : L"false",
         g_config.openNewWindowsExternally ? L"true" : L"false",
         g_config.allowRunningInsecureContent ? L"true" : L"false",
@@ -3120,9 +3385,12 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         g_updateConfirmationPending = FALSE;
     } else if (strcmp(action, "saveSettings") == 0) {
         char url[4096] = {0}, title[512] = {0}, hideJs[8192] = {0}, showJs[8192] = {0};
+        char mailtoTargetUrl[8192] = {0};
         char insecureOrigins[8192] = {0}, staticHosts[8192] = {0};
         json_get_string(msg, "url", url, sizeof(url));
         json_get_string(msg, "windowTitle", title, sizeof(title));
+        json_get_string(msg, "mailtoTargetUrl", mailtoTargetUrl,
+                        sizeof(mailtoTargetUrl));
         json_get_string(msg, "onHideJs", hideJs, sizeof(hideJs));
         json_get_string(msg, "onShowJs", showJs, sizeof(showJs));
         json_get_string(msg, "insecureContentOrigins", insecureOrigins,
@@ -3130,15 +3398,24 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
         json_get_string(msg, "staticHostMappings", staticHosts,
                         sizeof(staticHosts));
 
-        BOOL oldShowInTaskbar = g_config.showInTaskbar;
+        Configuration previousConfig = g_config;
+        BOOL oldShowInTaskbar = previousConfig.showInTaskbar;
+        BOOL oldHandleMailtoLinks = previousConfig.handleMailtoLinks;
         MultiByteToWideChar(CP_UTF8, 0, url, -1, g_config.url, 2048);
         MultiByteToWideChar(CP_UTF8, 0, title, -1, g_config.windowTitle, 256);
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                mailtoTargetUrl, -1,
+                                g_config.mailtoTargetUrl, 2048) == 0) {
+            g_config.mailtoTargetUrl[0] = L'\0';
+        }
         MultiByteToWideChar(CP_UTF8, 0, hideJs, -1, g_config.onHideJs, 4096);
         MultiByteToWideChar(CP_UTF8, 0, showJs, -1, g_config.onShowJs, 4096);
         g_config.startMaximized = json_get_bool(msg, "startMaximized", FALSE);
         g_config.returnToTargetOnDoubleClick =
             json_get_bool(msg, "returnToTargetOnDoubleClick", TRUE);
         g_config.showInTaskbar = json_get_bool(msg, "showInTaskbar", FALSE);
+        g_config.handleMailtoLinks =
+            json_get_bool(msg, "handleMailtoLinks", FALSE);
         g_config.sleepWhenInactive = json_get_bool(msg, "sleepWhenInactive", FALSE);
         g_config.openNewWindowsExternally = json_get_bool(msg, "openNewWindowsExternally", FALSE);
         BOOL oldAllowRunningInsecureContent = g_config.allowRunningInsecureContent;
@@ -3173,12 +3450,61 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             json_get_bool(msg, "autoCheckForUpdates", TRUE);
         g_config.debugLogEnabled = json_get_bool(msg, "debugLog", FALSE);
 
-        SaveConfigToRegistry(&g_config);
+        if (g_config.handleMailtoLinks &&
+            !IsValidHttpNavigationUrl(g_config.mailtoTargetUrl)) {
+            g_config = previousConfig;
+            MessageBoxW(g_cfgHwnd,
+                        L"Enter a valid http:// or https:// destination URL "
+                        L"before enabling email-link handling.",
+                        APP_NAME, MB_OK | MB_ICONWARNING);
+            free(msg);
+            return S_OK;
+        }
+
+        if (!SaveConfigToRegistry(&g_config)) {
+            g_config = previousConfig;
+            MessageBoxW(g_cfgHwnd,
+                        L"The settings could not be saved. Please try again.",
+                        APP_NAME, MB_OK | MB_ICONERROR);
+            free(msg);
+            return S_OK;
+        }
+        BOOL mailtoRegistrationUpdated =
+            SetMailtoHandlerRegistration(g_config.handleMailtoLinks);
         MarkAsConfigured();
         ApplyConfiguration();
 
         g_cfgSaved = TRUE;
         PostMessage(g_cfgHwnd, WM_CLOSE, 0, 0);
+
+        if (!mailtoRegistrationUpdated) {
+            MessageBoxW(
+                g_cfgHwnd,
+                g_config.handleMailtoLinks
+                    ? L"The settings were saved, but SystrayLauncher could not "
+                      L"be registered with Windows as an email-link handler. "
+                      L"It will try again the next time it starts."
+                    : L"The settings were saved, but SystrayLauncher's email-link "
+                      L"registration could not be removed. Please try saving again.",
+                APP_NAME, MB_OK | MB_ICONWARNING);
+        } else if (!oldHandleMailtoLinks && g_config.handleMailtoLinks) {
+            MailtoDefaultAppsOpenResult settingsResult =
+                OpenMailtoDefaultAppsSettings();
+            if (settingsResult != MAILTO_DEFAULT_APPS_APP_PAGE) {
+                MessageBoxW(
+                    g_cfgHwnd,
+                    settingsResult == MAILTO_DEFAULT_APPS_GENERAL_PAGE
+                        ? L"Windows Default Apps is open. Select "
+                          L"SystrayLauncher and assign it to MAILTO links to "
+                          L"finish enabling email-link handling."
+                        : L"SystrayLauncher is registered for email links, but "
+                          L"Windows Settings could not be opened. Open Settings "
+                          L"> Apps > Default apps, select SystrayLauncher, and "
+                          L"assign it to MAILTO links.",
+                    APP_NAME, MB_OK | MB_ICONINFORMATION);
+            }
+        }
+
         if (g_hwnd &&
             (oldAllowRunningInsecureContent != g_config.allowRunningInsecureContent ||
              wcscmp(oldInsecureContentOrigins, g_config.insecureContentOrigins) != 0 ||
@@ -5410,7 +5736,15 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
         g_lockdownFilterActive = FALSE;  // fresh WebView has no filters yet
         ApplyLockdownRequestFilter();
 
-        webview2->lpVtbl->Navigate(webview2, g_initialUrl);
+        BOOL mailtoPending =
+            InterlockedExchange(&g_mailtoActivationPending, FALSE) == TRUE;
+        const wchar_t* initialNavigationUrl = g_initialUrl;
+        if (mailtoPending && g_config.handleMailtoLinks &&
+            IsValidHttpNavigationUrl(g_config.mailtoTargetUrl)) {
+            initialNavigationUrl = g_config.mailtoTargetUrl;
+            DebugPrint(L"[INFO] Opening configured email-link destination during WebView startup\n");
+        }
+        webview2->lpVtbl->Navigate(webview2, initialNavigationUrl);
 
         InterlockedExchange(&g_resumeFailureCount, 0);
         InterlockedExchange(&g_isInitialized, TRUE);
@@ -7068,6 +7402,34 @@ void ReloadTargetPage(void) {
     }
 }
 
+static BOOL ActivateMailtoDestination(void) {
+    if (!g_config.handleMailtoLinks ||
+        !IsValidHttpNavigationUrl(g_config.mailtoTargetUrl)) {
+        DebugPrint(L"[WARNING] Ignored MAILTO activation because email-link handling is not configured\n");
+        return FALSE;
+    }
+
+    // Preserve the request while the asynchronous WebView creation path is
+    // still running. Its controller callback consumes this flag and uses the
+    // email destination for the first navigation instead of briefly loading
+    // the primary URL first.
+    InterlockedExchange(&g_mailtoActivationPending, TRUE);
+    ShowMainWindow();
+
+    if (IsWebViewReady()) {
+        HRESULT hr = g_webView->lpVtbl->Navigate(
+            g_webView, g_config.mailtoTargetUrl);
+        if (SUCCEEDED(hr)) {
+            InterlockedExchange(&g_mailtoActivationPending, FALSE);
+            DebugPrint(L"[INFO] Opened configured email-link destination\n");
+        } else {
+            DebugPrint(L"[WARNING] Email-link navigation failed. HRESULT: 0x%08X\n",
+                       hr);
+        }
+    }
+    return TRUE;
+}
+
 void ClearWebViewCacheAndReload(void) {
     if (!g_webView) return;
 
@@ -7529,6 +7891,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             break;
             
         default:
+            if (g_WM_MAILTO_ACTIVATE != 0 &&
+                uMsg == g_WM_MAILTO_ACTIVATE) {
+                return ActivateMailtoDestination() ? 1 : 0;
+            }
             if (uMsg == g_WM_TASKBARCREATED) {
                 // Explorer restarted: re-add the icon. RefreshTrayIcon also
                 // destroys the old HICON, which a bare CreateTrayIcon leaks.
@@ -7619,20 +7985,40 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         &updateHelperHandled, &updateCompleted);
     if (updateHelperHandled) return updateHelperResult;
 
+    BOOL mailtoInvocation = IsMailtoProtocolInvocation();
     g_hInstance = hInstance;
+    g_WM_MAILTO_ACTIVATE = RegisterWindowMessageW(
+        MAILTO_ACTIVATE_MESSAGE_NAME);
     
     // Single instance check. A restarted instance (tray Restart) can arrive
     // while the previous process is still shutting down, so retry briefly
     // before declaring another instance is running.
     g_hMutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
+    DWORD mutexStatus = g_hMutex ? GetLastError() : ERROR_SUCCESS;
+    if (mailtoInvocation && g_hMutex &&
+        mutexStatus == ERROR_ALREADY_EXISTS) {
+        CloseHandle(g_hMutex);
+        g_hMutex = NULL;
+        if (ForwardMailtoActivationToRunningInstance()) return 0;
+
+        MessageBoxW(
+            NULL,
+            L"SystrayLauncher is already running, but it could not accept "
+            L"this email link. Try the link again or open the launcher from "
+            L"the system tray.",
+            APP_NAME, MB_OK | MB_ICONWARNING);
+        return 1;
+    }
+
     for (int attempt = 0;
-         g_hMutex && GetLastError() == ERROR_ALREADY_EXISTS && attempt < 10;
+         g_hMutex && mutexStatus == ERROR_ALREADY_EXISTS && attempt < 10;
          attempt++) {
         CloseHandle(g_hMutex);
         Sleep(250);
         g_hMutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
+        mutexStatus = g_hMutex ? GetLastError() : ERROR_SUCCESS;
     }
-    if (g_hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (g_hMutex && mutexStatus == ERROR_ALREADY_EXISTS) {
         CloseHandle(g_hMutex);
         g_hMutex = NULL;
         MessageBoxW(NULL, L"SystrayLauncher is already running.\n\nCheck your system tray for the application icon.",
@@ -7686,6 +8072,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     InterlockedExchange(&g_lockdownHeader, g_config.lockdownHeader ? TRUE : FALSE);
     InterlockedExchange(&g_debugLogEnabled, g_config.debugLogEnabled ? TRUE : FALSE);
     DebugPrint(L"[INFO] SystrayLauncher starting\n");
+    if (!SetMailtoHandlerRegistration(g_config.handleMailtoLinks)) {
+        DebugPrint(L"[WARNING] Could not synchronize MAILTO handler registration\n");
+    }
 
     // On first launch, show configuration dialog
     if (isFirstLaunch) {
@@ -7707,6 +8096,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             return 0;
         }
         wcscpy_s(g_initialUrl, 2048, g_config.url);
+    }
+
+    BOOL activateMailtoOnStartup =
+        mailtoInvocation && g_config.handleMailtoLinks &&
+        IsValidHttpNavigationUrl(g_config.mailtoTargetUrl);
+    if (mailtoInvocation && !activateMailtoOnStartup) {
+        MessageBoxW(
+            NULL,
+            L"Email-link handling is not enabled or does not have a valid "
+            L"destination URL. Open SystrayLauncher's configuration to set it up.",
+            APP_NAME, MB_OK | MB_ICONINFORMATION);
     }
 
     // Start the static host fallback proxy before the main window exists:
@@ -7766,12 +8166,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBoxW(NULL, L"Failed to create window", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
+    if (g_WM_MAILTO_ACTIVATE != 0) {
+        typedef BOOL (WINAPI *ChangeWindowMessageFilterExFn)(
+            HWND, UINT, DWORD, PCHANGEFILTERSTRUCT);
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        ChangeWindowMessageFilterExFn changeWindowMessageFilterEx =
+            user32 ? (ChangeWindowMessageFilterExFn)GetProcAddress(
+                         user32, "ChangeWindowMessageFilterEx")
+                   : NULL;
+        if (changeWindowMessageFilterEx) {
+            changeWindowMessageFilterEx(g_hwnd, g_WM_MAILTO_ACTIVATE,
+                                        MSGFLT_ALLOW, NULL);
+        }
+    }
     
     // Register for taskbar restart notifications
     g_WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
     
     // Create tray icon (loads embedded icon)
     CreateTrayIcon(g_hwnd);
+
+    if (activateMailtoOnStartup) {
+        ActivateMailtoDestination();
+    }
 
     // A successful replacement starts exactly once with --finish-update.
     // Present its confirmation in the HTML configuration UI after normal

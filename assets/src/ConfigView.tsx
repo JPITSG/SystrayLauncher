@@ -53,6 +53,26 @@ function normalizeHttpOrigins(raw: string): string {
   return origins.join(",");
 }
 
+function validateHttpNavigationUrl(raw: string): string {
+  const value = raw.trim();
+  if (!value) throw new Error("Destination URL cannot be empty.");
+  if (/\s/.test(value)) {
+    throw new Error("Destination URL cannot contain spaces.");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Enter a valid destination URL.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Destination URL must use http:// or https://.");
+  }
+  if (!parsed.hostname) throw new Error("Destination URL needs a hostname.");
+  return value;
+}
+
 function normalizeStaticHostMappings(raw: string): string {
   const entries = raw
     .split(/[\r\n,]+/)
@@ -153,6 +173,12 @@ export default function ConfigView({
   const [showInTaskbar, setShowInTaskbar] = useState(
     config.showInTaskbar ?? false
   );
+  const [handleMailtoLinks, setHandleMailtoLinks] = useState(
+    config.handleMailtoLinks ?? false
+  );
+  const [mailtoTargetUrl, setMailtoTargetUrl] = useState(
+    config.mailtoTargetUrl ?? ""
+  );
   const [onHideJs, setOnHideJs] = useState(config.onHideJs);
   const [onShowJs, setOnShowJs] = useState(config.onShowJs);
   const [sleepWhenInactive, setSleepWhenInactive] = useState(
@@ -217,6 +243,7 @@ export default function ConfigView({
     return () => observer.disconnect();
   }, [twoColumn]);
   const [urlError, setUrlError] = useState("");
+  const [mailtoTargetUrlError, setMailtoTargetUrlError] = useState("");
   const [insecureOriginsError, setInsecureOriginsError] = useState("");
   const [staticHostsError, setStaticHostsError] = useState("");
   const [updateChecking, setUpdateChecking] = useState(
@@ -324,6 +351,18 @@ export default function ConfigView({
       return;
     }
 
+    let normalizedMailtoTargetUrl = mailtoTargetUrl.trim();
+    if (handleMailtoLinks) {
+      try {
+        normalizedMailtoTargetUrl = validateHttpNavigationUrl(mailtoTargetUrl);
+      } catch (error) {
+        setMailtoTargetUrlError(
+          error instanceof Error ? error.message : "Invalid destination URL."
+        );
+        return;
+      }
+    }
+
     let normalizedInsecureOrigins = "";
     if (allowRunningInsecureContent) {
       try {
@@ -371,6 +410,7 @@ export default function ConfigView({
     }
 
     setUrlError("");
+    setMailtoTargetUrlError("");
     setInsecureOriginsError("");
     setStaticHostsError("");
     saveSettings({
@@ -379,6 +419,8 @@ export default function ConfigView({
       startMaximized,
       returnToTargetOnDoubleClick,
       showInTaskbar,
+      handleMailtoLinks,
+      mailtoTargetUrl: normalizedMailtoTargetUrl,
       onHideJs,
       onShowJs,
       sleepWhenInactive,
@@ -439,6 +481,58 @@ export default function ConfigView({
         />
         {urlError && (
           <p className="text-red-600 text-[11px]">{urlError}</p>
+        )}
+      </div>
+
+      <div className="space-y-1 pt-1">
+        <div className="flex items-start gap-2">
+          <Checkbox
+            id="handleMailtoLinks"
+            className="mt-0.5"
+            checked={handleMailtoLinks}
+            onChange={(e) => {
+              setHandleMailtoLinks(e.target.checked);
+              if (!e.target.checked && mailtoTargetUrlError) {
+                setMailtoTargetUrlError("");
+              }
+            }}
+          />
+          <div className="space-y-0.5">
+            <Label htmlFor="handleMailtoLinks" className="cursor-pointer">
+              Handle email links with SystrayLauncher
+            </Label>
+            <p className="text-neutral-500 text-[11px] leading-snug">
+              Registers this app as an option for mailto: links. When first
+              enabled and saved, Windows Default Apps opens so you can assign
+              SystrayLauncher to MAILTO links.
+            </p>
+          </div>
+        </div>
+        {handleMailtoLinks && (
+          <div className="ml-6 space-y-1">
+            <Label htmlFor="mailtoTargetUrl">
+              Email link destination URL
+            </Label>
+            <Input
+              id="mailtoTargetUrl"
+              maxLength={1900}
+              placeholder="https://mail.example.com/"
+              value={mailtoTargetUrl}
+              onChange={(e) => {
+                setMailtoTargetUrl(e.target.value);
+                if (mailtoTargetUrlError) setMailtoTargetUrlError("");
+              }}
+              className={mailtoTargetUrlError ? "border-red-500" : ""}
+            />
+            <p className="text-neutral-500 text-[11px] leading-snug">
+              Every email link opens this fixed page in the main window.
+            </p>
+            {mailtoTargetUrlError && (
+              <p className="text-red-600 text-[11px]">
+                {mailtoTargetUrlError}
+              </p>
+            )}
+          </div>
         )}
       </div>
 

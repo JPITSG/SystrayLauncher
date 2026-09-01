@@ -4,6 +4,8 @@ export interface ConfigData {
   startMaximized: boolean;
   returnToTargetOnDoubleClick: boolean;
   showInTaskbar: boolean;
+  handleMailtoLinks: boolean;
+  mailtoTargetUrl: string;
   onHideJs: string;
   onShowJs: string;
   sleepWhenInactive: boolean;
@@ -100,6 +102,8 @@ export function saveSettings(config: ConfigData) {
       startMaximized: config.startMaximized,
       returnToTargetOnDoubleClick: config.returnToTargetOnDoubleClick,
       showInTaskbar: config.showInTaskbar,
+      handleMailtoLinks: config.handleMailtoLinks,
+      mailtoTargetUrl: config.mailtoTargetUrl,
       onHideJs: config.onHideJs,
       onShowJs: config.onShowJs,
       sleepWhenInactive: config.sleepWhenInactive,
