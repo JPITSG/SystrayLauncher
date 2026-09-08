@@ -143,9 +143,9 @@ export function cancelUpdateCheck() {
   );
 }
 
-export function installUpdate() {
+export function installUpdate(reopenSettings = false) {
   window.chrome.webview.postMessage(
-    JSON.stringify({ action: "installUpdate" })
+    JSON.stringify({ action: "installUpdate", reopenSettings })
   );
 }
 

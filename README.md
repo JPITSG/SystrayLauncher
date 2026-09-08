@@ -80,16 +80,19 @@ ignored version. Checks use the repository's
 The update check downloads the executable to the user's temporary directory
 and compares its embedded Windows file version with the running executable's
 version. While downloading, the button displays
-the current transfer speed and can be clicked again to stop the check and
+the current transfer speed rounded to whole kilobytes per second, such as
+**Checking (100kb/s)...**, and can be clicked again to stop the check and
 remove the partial download. The result dialog displays both version numbers.
 A newer build can be installed normally, while a matching build offers a
 **Force update** action to reinstall it; an older repository build is never
 installed. Installation requests standard Windows UAC approval, safely
 replaces the current executable, and restarts the launcher. After a successful
-update, the restarted launcher opens an HTML confirmation with the newly
-installed version. Dismissing that confirmation leaves the configuration dialog
-open. Cancelling the download, result dialog, or UAC prompt leaves the current
-version running. File size is used only to validate the download and enforce
+update, settings remain closed by default. Select **Reopen settings after
+update** in the version confirmation dialog to reopen settings with an HTML
+confirmation of the newly installed version. Dismissing that confirmation leaves
+settings open. This checkbox starts unchecked for each confirmation and is not a
+saved preference; it does not apply to cancelled or failed updates. Cancelling
+the download, result dialog, or UAC prompt leaves the current version running. File size is used only to validate the download and enforce
 its safety limit.
 
 ## Static Host Mappings
@@ -241,6 +244,14 @@ make
 
 # Output: SystrayLauncher.exe + WebView2Loader.dll in release/
 ```
+
+## Update regression checks
+
+On Linux, `python3 -m unittest discover -s tests -p test_update.py -v` runs
+native speed and updater handoff checks using a host C compiler and mocked
+Windows APIs. After building, `python3 -m unittest discover -s tests -p test_update_ui.py -v` exercises the configuration modal with Python Playwright
+and Chromium (set `CHROMIUM_EXECUTABLE` to use a custom browser).
+These checks do not perform a real update or replace Windows runtime testing.
 
 ## License
 
