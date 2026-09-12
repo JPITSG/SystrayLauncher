@@ -176,22 +176,21 @@
 // used for a mapped hostname changes, so the title can show the new route.
 #define WM_APP_HOST_ROUTE_CHANGED (WM_APP + 5)
 
-// Static host DNS fallback (see StartStaticHostProxy). A small loopback
+// Static host failover (see StartStaticHostProxy). A small loopback
 // forward proxy inside the launcher process; the browser reaches it through
 // --proxy-pac-url and the generated PAC script routes only the configured
 // static hostnames to it, so all other traffic stays direct. Per host the
-// proxy prefers the mapped address and falls back to standard DNS while the
-// mapped address is unreachable, re-trying it at most once per interval.
+// proxy tries mapped addresses in order, optionally falling back to DNS.
+// Earlier addresses are re-tried at most once per interval.
 #define HOST_PROXY_PAC_PATH "/proxy.pac"
 #define HOST_PROXY_MAX_MAPPINGS 256
 #define HOST_PROXY_MAX_TUNNELS 64
 #define HOST_PROXY_LISTEN_BACKLOG 16
 #define HOST_PROXY_HEAD_MAX_BYTES (16 * 1024)
 #define HOST_PROXY_IO_BUFFER_BYTES (16 * 1024)
-// Connect budget for the mapped address, shared by the in-band attempt and
-// the side-car probe so both agree on what "reachable" means. Short, so a
-// page load that races a dead mapped address stays under a second before
-// the DNS fallback takes over.
+// Connect budget per mapped address, shared by the in-band attempt and
+// the side-car probe so both agree on what "reachable" means. Short, so
+// each dead mapped address adds less than a second before the next attempt.
 #define HOST_PROXY_MAPPED_CONNECT_TIMEOUT_MS 800
 #define HOST_PROXY_DNS_CONNECT_TIMEOUT_MS 10000
 #define HOST_PROXY_PROBE_INTERVAL_MS 60000
@@ -319,19 +318,26 @@ static HANDLE g_updateCancelEvent = NULL;
 static volatile LONG g_updateSpeedKbps = 0;
 static volatile LONG g_updateProgressPosted = FALSE;
 
-// Static host DNS fallback proxy state.
+// Static host failover proxy state.
 typedef enum {
-    HOST_PROXY_UNTESTED = 0,   // mapped address not yet tried this run
-    HOST_PROXY_MAPPED_ACTIVE,  // mapped address answered; keep using it
-    HOST_PROXY_FALLBACK        // mapped address unreachable; use standard DNS
+    HOST_PROXY_UNTESTED = 0,   // mapped addresses not yet tried this run
+    HOST_PROXY_MAPPED_ACTIVE,  // one mapped address answered; keep using it
+    HOST_PROXY_FALLBACK        // all mapped addresses failed; DNS if enabled
 } HostProxyBreakerState;
 
 typedef struct {
-    char host[254];        // lowercase ASCII hostname
     char address[64];      // numeric address literal, IPv6 brackets stripped
     int addressFamily;     // AF_INET or AF_INET6
+} HostProxyAddress;
+
+typedef struct {
+    char host[254];        // lowercase ASCII hostname
+    HostProxyAddress* addresses; // immutable, in configuration order
+    size_t addressCount;
     HostProxyBreakerState state;  // guarded by g_hostProxyLock
-    ULONGLONG lastProbeTick;      // tick of the last failed mapped attempt
+    size_t activeAddress;         // addressCount means no mapped route
+    ULONGLONG routeGeneration;    // rejects stale connection/probe results
+    ULONGLONG lastProbeTick;      // last route change or failed recovery probe
     BOOL probeInFlight;           // single-flight guard for side-car probes
     // Address most recently used to reach the host, shown in the window
     // title; starts as the mapped address. Guarded by g_hostProxyLock.
@@ -359,6 +365,7 @@ static BOOL g_winsockInitialized = FALSE;
 static CRITICAL_SECTION g_hostProxyLock;
 static HostProxyMapping* g_hostProxyMappings = NULL;
 static size_t g_hostProxyMappingCount = 0;
+static BOOL g_hostProxyDnsFallback = FALSE; // fixed for this proxy's lifetime
 static SOCKET g_hostProxyListenSocket = INVALID_SOCKET;
 static unsigned short g_hostProxyPort = 0;  // 0 = proxy not running
 static HANDLE g_hostProxyAcceptThread = NULL;
@@ -4079,11 +4086,11 @@ static wchar_t* BuildStaticHostBrowserArguments(size_t* mappingCount) {
     if (mappingCount) *mappingCount = 0;
     if (!g_config.useStaticHostMappings) return NULL;
 
-    // DNS-fallback mode: the mappings are enforced by the local fallback
+    // Ordered-address/DNS-fallback mode: mappings are enforced by the local
     // proxy instead of resolver rules; point the browser at its PAC script.
-    // Port 0 means the proxy failed to start - fall through and emit the
-    // strict resolver rules so the mappings still apply.
-    if (g_config.staticHostDnsFallback && g_hostProxyPort != 0) {
+    // Port 0 means the proxy was not needed or failed to start - fall through
+    // and emit strict resolver rules so the first mapping per host applies.
+    if (g_hostProxyPort != 0) {
         const size_t argumentCch = 64;
         wchar_t* arguments = (wchar_t*)malloc(argumentCch * sizeof(wchar_t));
         if (!arguments) return NULL;
@@ -4185,18 +4192,17 @@ static wchar_t* JoinBrowserArguments(LPCWSTR first, LPCWSTR second) {
     return joined;
 }
 
-// --- Static host DNS fallback proxy ---
+// --- Static host failover proxy ---
 //
-// When "fall back to standard DNS" is enabled for the static host mappings,
-// the mappings are enforced here instead of through --host-resolver-rules.
+// When DNS fallback is enabled or a host has multiple mapped addresses,
+// mappings are enforced here instead of through --host-resolver-rules.
 // The browser is pointed at a generated PAC script (served by this listener)
-// that routes only the mapped hostnames through the proxy with a DIRECT
-// fallback, so a dead proxy degrades to plain direct connections. For each
-// mapped hostname the proxy keeps a small circuit breaker: prefer the mapped
-// address, fall back to standard DNS resolution within the same connection
-// when it does not answer, and while fallen back re-try the mapped address
+// that routes only mapped hostnames through the proxy. Its DIRECT fallback
+// is included only when DNS fallback is enabled. Per hostname, try addresses
+// in order and keep the first that answers. Earlier addresses are re-tried
 // at most once per HOST_PROXY_PROBE_INTERVAL_MS via a side-car probe that
-// never delays the request that triggered it.
+// never delays the request that triggered it. Standard DNS is tried only
+// after every mapped address has failed, and only if explicitly enabled.
 
 static BOOL HostProxySendAll(SOCKET s, const char* data, int length) {
     int sent = 0;
@@ -4280,22 +4286,38 @@ static SOCKET HostProxyConnectWithTimeout(const struct addrinfo* address, DWORD 
 
 // Connect to the configured mapped address. Shared by the in-band attempt
 // and the side-car probe so both agree on what "reachable" means.
-static SOCKET HostProxyConnectMapped(const HostProxyMapping* mapping, unsigned short port) {
+static SOCKET HostProxyConnectMapped(const HostProxyAddress* address, unsigned short port) {
     char portString[8];
     snprintf(portString, sizeof(portString), "%u", (unsigned)port);
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = mapping->addressFamily;
+    hints.ai_family = address->addressFamily;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
     hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
     struct addrinfo* result = NULL;
-    if (getaddrinfo(mapping->address, portString, &hints, &result) != 0 || !result) {
+    if (getaddrinfo(address->address, portString, &hints, &result) != 0 || !result) {
         return INVALID_SOCKET;
     }
     SOCKET s = HostProxyConnectWithTimeout(result, HOST_PROXY_MAPPED_CONNECT_TIMEOUT_MS);
     freeaddrinfo(result);
     return s;
+}
+
+// Shared ordered scan for normal requests and recovery probes. The bounds
+// let a probe check only addresses preferred over the current working one.
+static SOCKET HostProxyConnectMappedRange(const HostProxyMapping* mapping,
+                                          unsigned short port, size_t begin,
+                                          size_t end, size_t* selected) {
+    for (size_t i = begin; i < end; i++) {
+        if (InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE)) break;
+        SOCKET s = HostProxyConnectMapped(&mapping->addresses[i], port);
+        if (s != INVALID_SOCKET) {
+            *selected = i;
+            return s;
+        }
+    }
+    return INVALID_SOCKET;
 }
 
 // Standard system resolution - hosts file, configured DNS and caches all
@@ -4347,90 +4369,100 @@ static void CloseHostTunnelsForMapping(int mappingIndex, HostProxyTunnel* except
     LeaveCriticalSection(&g_hostProxyLock);
 }
 
-// Records the address most recently used to reach a mapped host and nudges
-// the UI thread to refresh the window title when the route actually changed.
-static void HostProxySetCurrentAddress(HostProxyMapping* mapping,
-                                       const char* address) {
-    BOOL changed = FALSE;
-    size_t length;
-    if (!address || !address[0]) return;
-    length = strlen(address);
-    if (length >= sizeof(mapping->currentAddress)) return;
+// Publish a route only if no newer connection/probe has changed it. Returns
+// whether existing tunnels need to migrate; first use does not evict peers.
+static BOOL HostProxyUpdateRoute(HostProxyMapping* mapping, ULONGLONG generation,
+                                 size_t selected, const char* address) {
+    BOOL migrate = FALSE, addressChanged = FALSE;
     EnterCriticalSection(&g_hostProxyLock);
-    if (strcmp(mapping->currentAddress, address) != 0) {
-        memcpy(mapping->currentAddress, address, length + 1);
-        changed = TRUE;
+    if (mapping->routeGeneration == generation &&
+        !InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE)) {
+        HostProxyBreakerState state = selected < mapping->addressCount
+            ? HOST_PROXY_MAPPED_ACTIVE : HOST_PROXY_FALLBACK;
+        if (mapping->state != state || mapping->activeAddress != selected) {
+            migrate = mapping->state != HOST_PROXY_UNTESTED;
+            mapping->state = state;
+            mapping->activeAddress = selected;
+            mapping->routeGeneration++;
+            mapping->lastProbeTick = GetTickCount64();
+        }
+        if (address && address[0] && strlen(address) < sizeof(mapping->currentAddress) &&
+            strcmp(mapping->currentAddress, address) != 0) {
+            strcpy(mapping->currentAddress, address);
+            addressChanged = TRUE;
+        }
     }
     LeaveCriticalSection(&g_hostProxyLock);
-    if (changed && g_hwnd) {
+    if (addressChanged && g_hwnd) {
         PostMessageW(g_hwnd, WM_APP_HOST_ROUTE_CHANGED, 0, 0);
     }
+    return migrate;
 }
 
 typedef struct {
     int mappingIndex;
     unsigned short port;
+    size_t end;
+    ULONGLONG generation;
 } HostProxyProbeTask;
 
 static DWORD WINAPI HostProxyProbeThread(LPVOID param) {
     HostProxyProbeTask* task = (HostProxyProbeTask*)param;
     HostProxyMapping* mapping = &g_hostProxyMappings[task->mappingIndex];
-    SOCKET probe = HostProxyConnectMapped(mapping, task->port);
-    BOOL recovered = FALSE;
+    size_t selected = mapping->addressCount;
+    SOCKET probe = HostProxyConnectMappedRange(mapping, task->port, 0, task->end, &selected);
+    if (probe != INVALID_SOCKET) {
+        closesocket(probe);
+        if (HostProxyUpdateRoute(mapping, task->generation, selected,
+                                  mapping->addresses[selected].address)) {
+            DebugPrint(L"[INFO] Static host '%S' returning to earlier mapped address %S\n",
+                       mapping->host, mapping->addresses[selected].address);
+            CloseHostTunnelsForMapping(task->mappingIndex, NULL);
+        }
+    }
     EnterCriticalSection(&g_hostProxyLock);
     mapping->probeInFlight = FALSE;
-    if (probe != INVALID_SOCKET) {
-        if (!InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE) &&
-            mapping->state == HOST_PROXY_FALLBACK) {
-            mapping->state = HOST_PROXY_MAPPED_ACTIVE;
-            recovered = TRUE;
-        }
-    } else {
+    if (probe == INVALID_SOCKET && mapping->routeGeneration == task->generation) {
         mapping->lastProbeTick = GetTickCount64();
     }
     LeaveCriticalSection(&g_hostProxyLock);
-    if (probe != INVALID_SOCKET) closesocket(probe);
-    if (recovered) {
-        DebugPrint(L"[INFO] Mapped address for '%S' answered; resuming mapped routing\n",
-                   mapping->host);
-        HostProxySetCurrentAddress(mapping, mapping->address);
-        CloseHostTunnelsForMapping(task->mappingIndex, NULL);
-    }
     free(task);
     InterlockedDecrement(&g_hostProxyWorkerCount);
     return 0;
 }
 
-// Side-car probe: fired by a request that arrives while a mapping is fallen
-// back and its cooldown has elapsed. The triggering request proceeds via DNS
-// immediately; only the NEXT connections benefit from a successful probe.
+// Probe earlier addresses while requests continue on the working mapped/DNS
+// route. Without DNS and with no working address, requests retry in-band.
 static void HostProxyStartProbeIfDue(int mappingIndex, unsigned short port) {
     HostProxyMapping* mapping = &g_hostProxyMappings[mappingIndex];
+    HostProxyProbeTask* task = (HostProxyProbeTask*)malloc(sizeof(*task));
+    if (!task) return;
     BOOL launch = FALSE;
     EnterCriticalSection(&g_hostProxyLock);
-    if (mapping->state == HOST_PROXY_FALLBACK && !mapping->probeInFlight &&
+    if (((mapping->state == HOST_PROXY_MAPPED_ACTIVE && mapping->activeAddress > 0) ||
+         (mapping->state == HOST_PROXY_FALLBACK && g_hostProxyDnsFallback)) &&
+        !mapping->probeInFlight &&
         GetTickCount64() - mapping->lastProbeTick >= HOST_PROXY_PROBE_INTERVAL_MS) {
         mapping->probeInFlight = TRUE;
+        task->mappingIndex = mappingIndex;
+        task->port = port;
+        task->end = mapping->activeAddress;
+        task->generation = mapping->routeGeneration;
         launch = TRUE;
     }
     LeaveCriticalSection(&g_hostProxyLock);
-    if (!launch) return;
-
-    HostProxyProbeTask* task = (HostProxyProbeTask*)malloc(sizeof(*task));
-    HANDLE thread = NULL;
-    if (task) {
-        task->mappingIndex = mappingIndex;
-        task->port = port;
-        InterlockedIncrement(&g_hostProxyWorkerCount);
-        thread = CreateThread(NULL, 0, HostProxyProbeThread, task, 0, NULL);
-        if (!thread) {
-            InterlockedDecrement(&g_hostProxyWorkerCount);
-            free(task);
-        }
+    if (!launch) {
+        free(task);
+        return;
     }
+
+    InterlockedIncrement(&g_hostProxyWorkerCount);
+    HANDLE thread = CreateThread(NULL, 0, HostProxyProbeThread, task, 0, NULL);
     if (thread) {
         CloseHandle(thread);
     } else {
+        InterlockedDecrement(&g_hostProxyWorkerCount);
+        free(task);
         // Roll back the single-flight claim or probing would wedge forever.
         EnterCriticalSection(&g_hostProxyLock);
         mapping->probeInFlight = FALSE;
@@ -4438,59 +4470,39 @@ static void HostProxyStartProbeIfDue(int mappingIndex, unsigned short port) {
     }
 }
 
-// The circuit breaker. Establishes the upstream connection for one request,
-// never dropping it: when the mapped address fails the same connection is
-// retried through standard DNS before giving up. Only connect-phase results
-// move the breaker - mid-stream closes are normal (keep-alive teardown) and
-// must not trip it.
+// Retry the same request through the remaining mapped addresses in order,
+// then (only if enabled) standard DNS. Only TCP connect failures trigger
+// failover; TLS/HTTP errors and normal mid-stream closes must not trip it.
 static SOCKET HostProxyEstablishUpstream(HostProxyTunnel* tunnel, int mappingIndex,
                                          unsigned short port) {
     HostProxyMapping* mapping = &g_hostProxyMappings[mappingIndex];
     EnterCriticalSection(&g_hostProxyLock);
     tunnel->mappingIndex = mappingIndex;
     HostProxyBreakerState state = mapping->state;
+    size_t begin = state == HOST_PROXY_MAPPED_ACTIVE ? mapping->activeAddress : 0;
+    ULONGLONG generation = mapping->routeGeneration;
     LeaveCriticalSection(&g_hostProxyLock);
 
+    HostProxyStartProbeIfDue(mappingIndex, port);
+    size_t selected = mapping->addressCount;
+    char usedAddress[64] = "";
     SOCKET upstream = INVALID_SOCKET;
-    if (state == HOST_PROXY_FALLBACK) {
-        char dnsAddress[64];
-        HostProxyStartProbeIfDue(mappingIndex, port);
+    if (state != HOST_PROXY_FALLBACK || !g_hostProxyDnsFallback) {
+        upstream = HostProxyConnectMappedRange(mapping, port, begin,
+                                                mapping->addressCount, &selected);
+        if (upstream != INVALID_SOCKET) {
+            strcpy(usedAddress, mapping->addresses[selected].address);
+        }
+    }
+    if (upstream == INVALID_SOCKET && g_hostProxyDnsFallback &&
+        !InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE)) {
         upstream = HostProxyConnectViaDns(mapping->host, port,
-                                          dnsAddress, sizeof(dnsAddress));
-        if (upstream != INVALID_SOCKET) {
-            HostProxySetCurrentAddress(mapping, dnsAddress);
-        }
-    } else {
-        upstream = HostProxyConnectMapped(mapping, port);
-        if (upstream != INVALID_SOCKET) {
-            BOOL announced = FALSE;
-            EnterCriticalSection(&g_hostProxyLock);
-            if (mapping->state != HOST_PROXY_MAPPED_ACTIVE) {
-                mapping->state = HOST_PROXY_MAPPED_ACTIVE;
-                announced = TRUE;
-            }
-            LeaveCriticalSection(&g_hostProxyLock);
-            if (announced) {
-                DebugPrint(L"[INFO] Static host '%S' using mapped address\n", mapping->host);
-            }
-            HostProxySetCurrentAddress(mapping, mapping->address);
-        } else {
-            BOOL wasActive;
-            EnterCriticalSection(&g_hostProxyLock);
-            wasActive = (mapping->state == HOST_PROXY_MAPPED_ACTIVE);
-            mapping->state = HOST_PROXY_FALLBACK;
-            mapping->lastProbeTick = GetTickCount64();
-            LeaveCriticalSection(&g_hostProxyLock);
-            DebugPrint(L"[WARNING] Mapped address for '%S' unreachable; using DNS resolution\n",
-                       mapping->host);
-            if (wasActive) CloseHostTunnelsForMapping(mappingIndex, tunnel);
-            char dnsAddress[64];
-            upstream = HostProxyConnectViaDns(mapping->host, port,
-                                              dnsAddress, sizeof(dnsAddress));
-            if (upstream != INVALID_SOCKET) {
-                HostProxySetCurrentAddress(mapping, dnsAddress);
-            }
-        }
+                                          usedAddress, sizeof(usedAddress));
+    }
+    if (HostProxyUpdateRoute(mapping, generation, selected, usedAddress)) {
+        DebugPrint(L"[INFO] Static host '%S' switched route (%S)\n", mapping->host,
+                   usedAddress[0] ? usedAddress : "no reachable address");
+        CloseHostTunnelsForMapping(mappingIndex, tunnel);
     }
     if (upstream != INVALID_SOCKET) {
         EnterCriticalSection(&g_hostProxyLock);
@@ -4926,8 +4938,8 @@ static DWORD WINAPI HostProxyAcceptThread(LPVOID param) {
         if (!loopback ||
             InterlockedCompareExchange(&g_hostProxyWorkerCount, 0, 0) >=
                 HOST_PROXY_MAX_TUNNELS) {
-            // Over capacity: refuse; the PAC's DIRECT fallback keeps loads
-            // working while the browser backs off.
+            // Over capacity: refuse. When DNS fallback is enabled, the
+            // PAC's DIRECT fallback can keep loads working during backoff.
             closesocket(client);
             continue;
         }
@@ -4962,6 +4974,11 @@ static DWORD WINAPI HostProxyAcceptThread(LPVOID param) {
     return 0;
 }
 
+static void FreeHostProxyMappings(HostProxyMapping* mappings, size_t count) {
+    for (size_t i = 0; i < count; i++) free(mappings[i].addresses);
+    free(mappings);
+}
+
 // Builds the runtime mapping table from the same configuration string (and
 // with the same all-or-nothing validation) as the strict resolver rules.
 static BOOL ParseStaticHostProxyMappings(void) {
@@ -4970,6 +4987,7 @@ static BOOL ParseStaticHostProxyMappings(void) {
     if (!mappings) return FALSE;
 
     size_t count = 0;
+    size_t addressCount = 0;
     const wchar_t* cursor = g_config.staticHostMappings;
     while (*cursor) {
         while (*cursor && IsOriginListSeparator(*cursor)) cursor++;
@@ -4980,31 +4998,26 @@ static BOOL ParseStaticHostProxyMappings(void) {
         size_t tokenLength = (size_t)(cursor - begin);
         wchar_t token[2048];
         if (tokenLength == 0 || tokenLength >= sizeof(token) / sizeof(token[0])) {
-            free(mappings);
-            return FALSE;
+            goto fail;
         }
         wmemcpy(token, begin, tokenLength);
         token[tokenLength] = L'\0';
 
         const wchar_t* separator = NULL;
         if (!IsValidStaticHostMapping(token, &separator)) {
-            free(mappings);
-            return FALSE;
+            goto fail;
         }
-        if (count >= HOST_PROXY_MAX_MAPPINGS) break;
 
-        HostProxyMapping* mapping = &mappings[count];
+        char host[254];
+        HostProxyAddress candidate = {0};
         size_t hostLength = (size_t)(separator - token);
-        if (hostLength >= sizeof(mapping->host)) {
-            free(mappings);
-            return FALSE;
-        }
+        if (hostLength >= sizeof(host)) goto fail;
         for (size_t i = 0; i < hostLength; i++) {
             wchar_t c = token[i];
             if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
-            mapping->host[i] = (char)c;
+            host[i] = (char)c;
         }
-        mapping->host[hostLength] = '\0';
+        host[hostLength] = '\0';
 
         const wchar_t* address = separator + 1;
         size_t addressLength = wcslen(address);
@@ -5013,40 +5026,61 @@ static BOOL ParseStaticHostProxyMappings(void) {
             address++;
             addressLength -= 2;
         }
-        if (addressLength == 0 || addressLength >= sizeof(mapping->address)) {
-            free(mappings);
-            return FALSE;
-        }
+        if (addressLength == 0 || addressLength >= sizeof(candidate.address)) goto fail;
         for (size_t i = 0; i < addressLength; i++) {
-            mapping->address[i] = (char)address[i];
+            candidate.address[i] = (char)address[i];
         }
-        mapping->address[addressLength] = '\0';
-        mapping->addressFamily = ipv6 ? AF_INET6 : AF_INET;
-        mapping->state = HOST_PROXY_UNTESTED;
-        mapping->lastProbeTick = 0;
-        mapping->probeInFlight = FALSE;
-        memcpy(mapping->currentAddress, mapping->address,
-               sizeof(mapping->currentAddress));
+        candidate.addressFamily = ipv6 ? AF_INET6 : AF_INET;
+        // Canonicalize equivalent IPv6 spellings before deduplicating.
+        IN6_ADDR numeric;
+        if (InetPtonA(candidate.addressFamily, candidate.address, &numeric) != 1 ||
+            !InetNtopA(candidate.addressFamily, &numeric, candidate.address,
+                       sizeof(candidate.address))) goto fail;
 
-        // Duplicate hostname: first entry wins, matching resolver rules.
+        size_t index = 0;
+        while (index < count && strcmp(mappings[index].host, host) != 0) index++;
+        if (index == count) {
+            if (count >= HOST_PROXY_MAX_MAPPINGS) goto fail;
+            strcpy(mappings[count].host, host);
+            count++;
+        }
+        HostProxyMapping* mapping = &mappings[index];
         BOOL duplicate = FALSE;
-        for (size_t i = 0; i < count; i++) {
-            if (strcmp(mappings[i].host, mapping->host) == 0) {
+        for (size_t i = 0; i < mapping->addressCount; i++) {
+            if (strcmp(mapping->addresses[i].address, candidate.address) == 0) {
                 duplicate = TRUE;
                 break;
             }
         }
-        if (duplicate) memset(mapping, 0, sizeof(*mapping));
-        else count++;
+        if (duplicate) continue;
+        if (addressCount >= HOST_PROXY_MAX_MAPPINGS) goto fail;
+        HostProxyAddress* addresses = (HostProxyAddress*)realloc(mapping->addresses,
+            (mapping->addressCount + 1) * sizeof(*addresses));
+        if (!addresses) goto fail;
+        mapping->addresses = addresses;
+        mapping->addresses[mapping->addressCount++] = candidate;
+        addressCount++;
+        if (mapping->addressCount == 1) {
+            strcpy(mapping->currentAddress, candidate.address);
+        }
     }
 
-    if (count == 0) {
-        free(mappings);
-        return FALSE;
-    }
+    if (count == 0) goto fail;
     g_hostProxyMappings = mappings;
     g_hostProxyMappingCount = count;
     return TRUE;
+
+fail:
+    FreeHostProxyMappings(mappings, count);
+    return FALSE;
+}
+
+static BOOL HostProxyRequired(void) {
+    if (g_hostProxyDnsFallback) return TRUE;
+    for (size_t i = 0; i < g_hostProxyMappingCount; i++) {
+        if (g_hostProxyMappings[i].addressCount > 1) return TRUE;
+    }
+    return FALSE;
 }
 
 static char* BuildHostProxyPacScript(void) {
@@ -5075,9 +5109,10 @@ static char* BuildHostProxyPacScript(void) {
         written += chunk;
     }
     int chunk = snprintf(script + written, capacity - (size_t)written,
-                         ")\n    return \"PROXY 127.0.0.1:%u; DIRECT\";\n"
+                         ")\n    return \"PROXY 127.0.0.1:%u%s\";\n"
                          "  return \"DIRECT\";\n}\n",
-                         (unsigned)g_hostProxyPort);
+                         (unsigned)g_hostProxyPort,
+                         g_hostProxyDnsFallback ? "; DIRECT" : "");
     if (chunk < 0 || (size_t)written + (size_t)chunk >= capacity) {
         free(script);
         return NULL;
@@ -5085,10 +5120,10 @@ static char* BuildHostProxyPacScript(void) {
     return script;
 }
 
-// Starts the fallback proxy: parse the mapping table, bind an ephemeral
+// Starts the failover proxy when needed: parse the table, bind an ephemeral
 // loopback port (queried back so the PAC URL can embed it), build the PAC
 // script and spawn the accept loop. Fails soft - the caller falls back to
-// the strict resolver rules and the feature degrades to today's behavior.
+// strict resolver rules (only the first address per hostname is then used).
 static BOOL StartStaticHostProxy(void) {
     if (!g_winsockInitialized) {
         DebugPrint(L"[WARNING] Static host fallback proxy unavailable: Winsock init failed\n");
@@ -5097,6 +5132,15 @@ static BOOL StartStaticHostProxy(void) {
     if (!ParseStaticHostProxyMappings()) {
         DebugPrint(L"[WARNING] Static host fallback proxy disabled: no valid mappings\n");
         return FALSE;
+    }
+    g_hostProxyDnsFallback = g_config.staticHostDnsFallback;
+    if (!HostProxyRequired()) {
+        // Keep the existing direct resolver-rules path for single-address
+        // mappings without DNS fallback; no proxy is needed in that case.
+        FreeHostProxyMappings(g_hostProxyMappings, g_hostProxyMappingCount);
+        g_hostProxyMappings = NULL;
+        g_hostProxyMappingCount = 0;
+        return TRUE;
     }
     InitializeCriticalSection(&g_hostProxyLock);
     g_hostProxyListenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -5137,7 +5181,7 @@ fail:
     }
     free(g_hostProxyPacScript);
     g_hostProxyPacScript = NULL;
-    free(g_hostProxyMappings);
+    FreeHostProxyMappings(g_hostProxyMappings, g_hostProxyMappingCount);
     g_hostProxyMappings = NULL;
     g_hostProxyMappingCount = 0;
     DeleteCriticalSection(&g_hostProxyLock);
@@ -5180,7 +5224,7 @@ static void StopStaticHostProxy(void) {
     if (acceptThreadExited &&
         InterlockedCompareExchange(&g_hostProxyWorkerCount, 0, 0) == 0) {
         DeleteCriticalSection(&g_hostProxyLock);
-        free(g_hostProxyMappings);
+        FreeHostProxyMappings(g_hostProxyMappings, g_hostProxyMappingCount);
         g_hostProxyMappings = NULL;
         g_hostProxyMappingCount = 0;
         free(g_hostProxyPacScript);
@@ -5194,13 +5238,13 @@ static void StopStaticHostProxy(void) {
 // Power-resume hook: whatever the breaker believed before a suspend is
 // stale, so let the first request after resume re-probe immediately instead
 // of waiting out a cooldown started before the machine went down. Mappings
-// still on the mapped address self-correct on their next in-band connect.
+// still on the first mapped address self-correct on their next connect.
 static void HostProxyExpireFallbackCooldowns(void) {
     if (g_hostProxyPort == 0) return;
     ULONGLONG now = GetTickCount64();
     EnterCriticalSection(&g_hostProxyLock);
     for (size_t i = 0; i < g_hostProxyMappingCount; i++) {
-        if (g_hostProxyMappings[i].state == HOST_PROXY_FALLBACK) {
+        if (g_hostProxyMappings[i].activeAddress > 0) {
             g_hostProxyMappings[i].lastProbeTick =
                 (now > HOST_PROXY_PROBE_INTERVAL_MS)
                     ? now - HOST_PROXY_PROBE_INTERVAL_MS : 0;
@@ -8177,7 +8221,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // its browser arguments needs the proxy's port. The proxy then persists
     // untouched across WebView rebuilds. If it cannot start, the strict
     // resolver rules are emitted instead (see BuildStaticHostBrowserArguments).
-    if (g_config.useStaticHostMappings && g_config.staticHostDnsFallback) {
+    if (g_config.useStaticHostMappings) {
         if (!StartStaticHostProxy()) {
             DebugPrint(L"[WARNING] Falling back to strict static host mappings\n");
         }

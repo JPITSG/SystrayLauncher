@@ -116,6 +116,45 @@ class UpdateUiTests(unittest.TestCase):
         expect(dialog.get_by_role('button', name='Update', exact=True)).to_have_count(0)
         expect(dialog.get_by_role('button', name='Force update', exact=True)).to_have_count(0)
 
+    def test_static_hosts_order_and_save_reload(self):
+        self.page.get_by_label('Resolve listed hostnames to static IP addresses', exact=True).check()
+        mappings = self.page.get_by_label('Static host mappings', exact=True)
+        mappings.fill('DOMAIN.com:1.2.3.4\nother.test:127.0.0.1\n'
+                      'domain.com:3.4.5.6,domain.com:1.2.3.4\n'
+                      'domain.com:[2001:0DB8:0:0::1]\ndomain.com:[2001:db8::1]')
+        fallback = self.page.get_by_label(
+            'Fall back to standard DNS when all mapped addresses are unreachable', exact=True)
+        expect(fallback).not_to_be_checked()
+        expected = ('domain.com:1.2.3.4,other.test:127.0.0.1,'
+                    'domain.com:3.4.5.6,domain.com:[2001:db8::1]')
+        for checked in [True, False]:
+            fallback.set_checked(checked)
+            self.page.get_by_role('button', name='Save', exact=True).click()
+            saved = self.last_message('saveSettings')
+            self.assertIsNotNone(saved)
+            self.assertEqual(saved['staticHostMappings'], expected)
+            self.assertEqual(saved['staticHostDnsFallback'], checked)
+            self.assertTrue(saved['useStaticHostMappings'])
+        # Recreate the dialog with the saved config, as after restarting.
+        self.page.evaluate('window.onInit(null)')
+        expect(mappings).to_have_count(0)
+        self.page.evaluate('config => window.onInit({config, webView2Version: "test"})', saved)
+        expect(self.page.get_by_label('Static host mappings', exact=True)).to_have_value(
+            expected.replace(',', '\n'))
+        expect(self.page.get_by_label(
+            'Fall back to standard DNS when all mapped addresses are unreachable', exact=True)
+        ).not_to_be_checked()
+
+    def test_static_hosts_still_reject_invalid_entries(self):
+        self.page.get_by_label('Resolve listed hostnames to static IP addresses', exact=True).check()
+        mappings = self.page.get_by_label('Static host mappings', exact=True)
+        for invalid in ['domain.com:not-an-ip', 'domain.com:999.1.1.1',
+                        'domain.com:2001:db8::1', 'bad/host:1.2.3.4']:
+            mappings.fill(f'domain.com:1.2.3.4\n{invalid}')
+            self.page.get_by_role('button', name='Save', exact=True).click()
+            self.assertIsNone(self.last_message('saveSettings'))
+            expect(mappings).to_have_class(re.compile('border-red-500'))
+
 
 if __name__ == '__main__':
     unittest.main()

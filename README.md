@@ -98,8 +98,7 @@ its safety limit.
 ## Static Host Mappings
 
 When **Resolve listed hostnames to static IP addresses** is enabled, the main
-WebView2 environment starts with Chromium `--host-resolver-rules` generated
-from the exact mappings entered in the dialog. For example,
+WebView2 environment uses the exact mappings entered in the dialog. For example,
 `device.local:192.168.1.20` makes requests for `device.local` connect to
 `192.168.1.20` without modifying the Windows hosts file or affecting Edge and
 other applications. The configuration dialog uses a separate WebView2
@@ -113,34 +112,53 @@ in brackets, such as `device.local:[2001:db8::20]`. A configured HTTP proxy can
 resolve destination hostnames itself, so these local mappings are intended for
 direct connections.
 
+Enter one `hostname:IP` mapping per line or separate mappings with commas.
+Repeat a hostname with different addresses to define its failover order:
+
+```text
+example.com:192.0.2.10
+example.com:198.51.100.20
+```
+
+The launcher tries `192.0.2.10` first, then `198.51.100.20` if the first TCP
+connection fails. If **Fall back to standard DNS when all mapped addresses
+are unreachable** is checked, normal DNS is tried only after both fail.
+With fallback unchecked, failure of all listed addresses fails the request
+without trying DNS. The order is preserved for each hostname even if entries
+for different hostnames are interleaved; identical mappings are deduplicated.
+
 When the configured URL's hostname is one of the mapped entries, the main
 window title shows the address currently used for it after the hostname, for
-example `device.local (192.168.1.20)`. With the DNS fallback option below this
-switches live between the mapped address and the DNS-resolved address as the
-route changes.
+example `device.local (192.168.1.20)`. With multiple addresses or DNS fallback,
+this switches live to the address actually used as the route changes.
 
 This feature uses a Chromium browser switch rather than a stable WebView2 DNS
 API. Microsoft documents browser flags as development-oriented and not
 guaranteed long-term, so the behavior should be tested when deploying a new
 WebView2 Runtime version.
 
-When **Fall back to standard DNS when a mapped address is unreachable** is
-also enabled, the launcher enforces the mappings itself instead of using
-resolver rules: it runs a small forward proxy on `127.0.0.1` (random port,
+For single-address mappings without DNS fallback, the launcher uses Chromium
+`--host-resolver-rules`. When a hostname has multiple addresses or DNS fallback
+is enabled, it instead runs a small forward proxy on `127.0.0.1` (random port,
 loopback only) and starts the browser with `--proxy-pac-url` pointing at a
 generated PAC script that routes only the listed hostnames through the proxy
-— all other traffic stays direct, and the PAC's `DIRECT` fallback keeps pages
-loading even if the proxy itself ever stops answering. For each hostname the
-proxy first attempts a TCP connection to the mapped address with a short
-timeout; if that fails, the same request is completed through normal DNS
-resolution, and the mapped address is then re-tried at most once per minute
-(triggered by traffic, and immediately after the machine resumes from sleep).
-While the mapped address answers, all connections use it until one fails,
-which switches the hostname back to DNS resolution in the same request. This
-suits mappings that are only reachable from certain networks. Requests for
-hostnames that are not listed are refused by the proxy, HTTPS certificates
+— all other traffic stays direct. The PAC includes a `DIRECT` rescue route
+for a nonresponsive proxy only when DNS fallback is checked. The proxy gives
+each mapped address an 800 ms TCP connection timeout before trying the next.
+TLS certificate errors and HTTP errors do not trigger address failover.
+
+The first reachable address is reused until a connection fails, at which point
+the remaining addresses are tried in order within the same request. While
+using a later address or DNS, earlier addresses are probed in order at most
+once per minute, triggered by traffic, and immediately after resume from
+sleep. Probes do not delay requests on the current route; when a preferred
+address recovers, existing tunnels are closed so new connections return to
+it. If DNS fallback is off and no address works, the next request retries
+the full list. This suits mappings reachable only from certain networks.
+Requests for hostnames that are not listed are refused by the proxy, HTTPS certificates
 are still validated against the hostname exactly as above, and if the proxy
-cannot start the launcher falls back to the strict resolver-rules behavior.
+cannot start the launcher falls back to strict resolver rules using only the
+first address for each hostname (without ordered retries or DNS fallback).
 
 The mixed-content option starts WebView2 with the documented
 [`--unsafely-treat-insecure-origin-as-secure`](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/webview-features-flags#available-webview2-browser-flags)

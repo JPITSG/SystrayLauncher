@@ -79,7 +79,7 @@ function normalizeStaticHostMappings(raw: string): string {
     .map((entry) => entry.trim())
     .filter(Boolean);
   const mappings: string[] = [];
-  const mappedAddresses = new Map<string, string>();
+  const seenMappings = new Set<string>();
 
   for (const entry of entries) {
     const separator = entry.indexOf(":");
@@ -144,13 +144,10 @@ function normalizeStaticHostMappings(raw: string): string {
       address = octets.map((octet) => String(Number(octet))).join(".");
     }
 
-    const previousAddress = mappedAddresses.get(hostname);
-    if (previousAddress && previousAddress !== address) {
-      throw new Error(`Hostname is mapped more than once: ${hostname}`);
-    }
-    if (!previousAddress) {
-      mappedAddresses.set(hostname, address);
-      mappings.push(`${hostname}:${address}`);
+    const mapping = `${hostname}:${address}`;
+    if (!seenMappings.has(mapping)) {
+      seenMappings.add(mapping);
+      mappings.push(mapping);
     }
   }
 
@@ -663,9 +660,11 @@ export default function ConfigView({
               className={staticHostsError ? "border-red-500" : ""}
             />
             <p className="text-neutral-500 text-[11px] leading-snug">
-              One hostname:IP mapping per line or comma-separated. HTTPS
-              certificates are still checked against the hostname. List each
-              subdomain separately; wrap IPv6 addresses in brackets.
+              One hostname:IP mapping per line or comma-separated. Repeat a
+              hostname with different IPs to try them in listed order. Earlier
+              addresses are re-tried about once a minute while using a later
+              address. HTTPS certificates are still checked against the hostname.
+              List each subdomain separately; wrap IPv6 addresses in brackets.
             </p>
             {staticHostsError && (
               <p className="text-red-600 text-[11px]">{staticHostsError}</p>
@@ -679,13 +678,13 @@ export default function ConfigView({
               />
               <div className="space-y-0.5">
                 <Label htmlFor="staticHostDnsFallback" className="cursor-pointer">
-                  Fall back to standard DNS when a mapped address is unreachable
+                  Fall back to standard DNS when all mapped addresses are unreachable
                 </Label>
                 <p className="text-neutral-500 text-[11px] leading-snug">
                   Routes only the listed hostnames through a small local helper
-                  that connects to the mapped address when it responds and
-                  quietly uses normal DNS resolution while it does not,
-                  re-trying the mapped address about once a minute. Useful when
+                  that tries each hostname's mapped addresses in listed order,
+                  then uses normal DNS resolution only if none respond,
+                  re-trying mapped addresses about once a minute. Useful when
                   the mapped addresses are reachable only from certain
                   networks. Changing this setting restarts the launcher.
                 </p>
