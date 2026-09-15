@@ -110,7 +110,7 @@
 #define ID_TIMER_INITIAL_HIDE_JS 2
 #define INITIAL_HIDE_JS_DELAY_MS 2000
 #define ID_TIMER_VISIBILITY_CHECK 3
-#define VISIBILITY_CHECK_INTERVAL_MS 250
+#define VISIBILITY_CHECK_INTERVAL_MS 10000
 #define ID_TIMER_CFG_SHOW_FALLBACK 4
 #define CFG_SHOW_FALLBACK_DELAY_MS 350
 #define ID_TIMER_WEBVIEW_PREWARM 5
@@ -6908,7 +6908,7 @@ static void DeactivateMainWebView(void) {
     // still in flight — suspending mid-navigation freezes the load half-done
     // and its completion event may never arrive (the eventual completion
     // re-runs the settle-then-suspend path). The steady-state hidden ticks
-    // used to cancel both within 250 ms.
+    // used to cancel both on the next tick.
     if (sleepEnabled && preloaded && !recovery && !prewarming &&
         !g_mainNavigationLoading) {
         InterlockedExchange(&g_webViewPrewarmActive, FALSE);
@@ -7734,7 +7734,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 // Initial JS sync. Occlusion polling is only useful while the
                 // window is shown (ShowMainWindow starts it): a hidden window
                 // cannot become visible on its own, so polling it would burn
-                // EnumWindows/DWM/WebView calls 4x per second forever.
+                // EnumWindows/DWM/WebView calls every tick forever.
                 UpdateJsVisibilityState(hwnd);
                 if (IsWindowVisible(hwnd)) {
                     StartVisibilityTimer(hwnd);
