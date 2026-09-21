@@ -111,6 +111,8 @@
 #define INITIAL_HIDE_JS_DELAY_MS 2000
 #define ID_TIMER_VISIBILITY_CHECK 3
 #define VISIBILITY_CHECK_INTERVAL_MS 10000
+#define VISIBILITY_WAKE_DELAY_MS 50
+#define MAX_VISIBILITY_PROCESSES 64
 #define ID_TIMER_CFG_SHOW_FALLBACK 4
 #define CFG_SHOW_FALLBACK_DELAY_MS 350
 #define ID_TIMER_WEBVIEW_PREWARM 5
@@ -123,14 +125,9 @@
 // is reset to the configured URL in the background - still hidden - so the
 // next open starts fresh without a visible navigation.
 #define URL_RESET_AFTER_HIDE_MS 60000
-// On-open health verification (see ArmMainHealthCheck): every 100 ms the
-// page is asked for a frame heartbeat while the window stays up; a verdict
-// falls after 1 s. The lifetime cap only bounds the wait for an in-flight
-// rebuild to come up.
+// One frame request and one timeout per verification attempt, never a poll.
 #define ID_TIMER_HEALTH_CHECK 10
-#define HEALTH_CHECK_INTERVAL_MS 100
-#define HEALTH_CHECK_VERDICT_TICKS 10
-#define HEALTH_CHECK_LIFETIME_TICKS 600
+#define HEALTH_CHECK_TIMEOUT_MS 3000
 #define MAIN_WINDOW_TITLE_CCH 768
 #define ID_TIMER_POWER_RESUME 8
 #define POWER_RESUME_KICK_DELAY_MS 2000
@@ -152,10 +149,10 @@
 #define AUTO_UPDATE_INTERVAL_MS (60u * 60u * 1000u)
 #define NAV_TITLE_WATCHDOG_MS 60000
 
-// After a suspend-resume failure the resume is retried on every activation
-// tick (4x/s); if it keeps failing this long the runtime is torn down and
-// rebuilt instead.
-#define RESUME_FAILURE_RECREATE_THRESHOLD 12
+// Bounded recovery, independent of the visibility check cadence.
+#define ID_TIMER_WEBVIEW_RESUME_RETRY 13
+#define WEBVIEW_RESUME_RETRY_MS 1000
+#define RESUME_FAILURE_RECREATE_THRESHOLD 3
 
 // Rate limit for automatic WebView rebuilds after unexpected browser-process
 // deaths, so a crash-looping runtime cannot spin rebuilds forever. A manual
@@ -175,6 +172,7 @@
 // Posted by the fallback proxy's worker threads when the address actually
 // used for a mapped hostname changes, so the title can show the new route.
 #define WM_APP_HOST_ROUTE_CHANGED (WM_APP + 5)
+#define WM_APP_VISIBILITY_WAKE (WM_APP + 6)
 
 // Static host failover (see StartStaticHostProxy). A small loopback
 // forward proxy inside the launcher process; the browser reaches it through
@@ -258,6 +256,15 @@ static volatile LONG g_webViewDesiredVisible = FALSE;
 static volatile LONG g_webViewPrewarmActive = FALSE;
 static volatile LONG g_webViewSuspendPending = FALSE;
 static volatile LONG g_webViewSuspended = FALSE;
+static UINT64 g_suspendRequestId = 0;
+static UINT64 g_livenessRequestId = 0;
+static UINT64 g_webViewGeneration = 0;
+static ULONGLONG g_prewarmLastHoverTick = 0;
+static int g_controllerVisible = -1;
+static RECT g_controllerBounds;
+static BOOL g_controllerBoundsKnown = FALSE;
+static BOOL g_webViewSettlePending = FALSE;
+static ULONGLONG g_preloadSettleDeadline = 0;
 static volatile LONG g_resetUrlOnNextShow = FALSE;
 static volatile LONG g_mailtoActivationPending = FALSE;
 static volatile LONG g_sleepWhenInactive = FALSE;
@@ -285,15 +292,27 @@ static int g_powerKickCount = 0;
 // runs (see ArmMainHealthCheck).
 static volatile LONG g_presentationUnverified = FALSE;
 static volatile LONG g_framePongSeen = FALSE;
-static int g_healthTicks = 0;       // probing ticks with a live WebView
-static int g_healthTotalTicks = 0;  // lifetime of this poll (safety cap)
+static UINT64 g_frameProbeId = 0;
+static BOOL g_healthCheckPending = FALSE;
+static ULONGLONG g_healthCheckDeadline = 0;
+static BOOL g_healthKicked = FALSE;
 static BOOL g_healthHealed = FALSE; // one rebuild per open
+static BOOL g_visibilityTracking = FALSE;
+static BOOL g_visibilityHooksAvailable = FALSE;
+static UINT g_visibilityCheckDelay = 0;
+static HWINEVENTHOOK g_visibilityHooks[8];
+static struct {
+    DWORD processId;
+    HWINEVENTHOOK hook;
+} g_visibilityLocationHooks[MAX_VISIBILITY_PROCESSES];
+static size_t g_visibilityLocationHookCount = 0;
 // UI-thread state used to distinguish a taskbar restore from ordinary resizes.
 static BOOL g_mainWindowMinimized = FALSE;
 static ULONGLONG g_rebuildBurstStartTick = 0;
 static LONG g_rebuildBurstCount = 0;
 static BOOL g_mainNavigationLoading = TRUE;
 static UINT64 g_mainNavigationId = 0;
+static ULONGLONG g_mainNavigationDeadline = 0;
 static EventRegistrationToken g_browserExitedToken;
 static BOOL g_browserExitedRegistered = FALSE;
 static HINSTANCE g_hInstance;
@@ -453,16 +472,20 @@ void ExecuteJavaScript(const wchar_t* js);
 static BOOL IsWebViewReady(void);
 static BOOL IsWindowActuallyVisible(HWND hwnd);
 static void UpdateJsVisibilityState(HWND hwnd);
-static void StartVisibilityTimer(HWND hwnd);
-static void StopVisibilityTimer(HWND hwnd);
+static void StartVisibilityTracking(HWND hwnd);
+static void StopVisibilityTracking(HWND hwnd);
+static void QueueVisibilityCheck(BOOL urgent);
 static void ActivateMainWebView(void);
 static void DeactivateMainWebView(void);
 static void ResumeMainWebViewRuntime(void);
-static void SetMainWebViewControllerVisible(BOOL visible);
+static BOOL SetMainWebViewControllerVisible(BOOL visible);
 static void PrewarmMainWebView(void);
 static void ResetTargetPageIfNeeded(void);
 static void ResetTargetPageInBackground(void);
 static void ArmMainHealthCheck(void);
+static void StopMainHealthCheck(void);
+static void CheckMainWebViewHealth(HWND hwnd);
+static void PrepareMainWebViewNavigation(void);
 static void KickMainWebViewComposition(void);
 static void OnMainNavigationCompleted(void);
 static void BeginMainNavigationTitle(HWND hwnd, UINT64 navigationId);
@@ -563,6 +586,7 @@ typedef struct {
 typedef struct {
     ICoreWebView2ExecuteScriptCompletedHandlerVtbl* lpVtbl;
     LONG refCount;
+    UINT64 requestId;
 } LivenessPingHandler;
 
 // WebView suspend completion handler
@@ -580,6 +604,7 @@ HRESULT STDMETHODCALLTYPE TrySuspendCompletedHandler_Invoke(
 typedef struct {
     ICoreWebView2TrySuspendCompletedHandlerVtbl* lpVtbl;
     LONG refCount;
+    UINT64 requestId;
 } TrySuspendCompletedHandler;
 
 // Navigation starting handler (drives the animated native window title)
@@ -1514,6 +1539,7 @@ static void BeginMainNavigationTitle(HWND hwnd, UINT64 navigationId) {
 
     // Every sign of navigation progress re-arms the lost-completion backstop
     // (see ID_TIMER_NAV_TITLE_WATCHDOG).
+    g_mainNavigationDeadline = GetTickCount64() + NAV_TITLE_WATCHDOG_MS;
     SetTimer(hwnd, ID_TIMER_NAV_TITLE_WATCHDOG, NAV_TITLE_WATCHDOG_MS, NULL);
 
     if (g_mainNavigationLoading && navigationId != 0 &&
@@ -1558,6 +1584,7 @@ static void ApplyConfiguration(void) {
 
     // Sync the "sleep when inactive" setting
     InterlockedExchange(&g_sleepWhenInactive, g_config.sleepWhenInactive ? TRUE : FALSE);
+    if (g_hwnd) StartVisibilityTracking(g_hwnd);
 
     // Sync the new-window handling setting (read live by the handler, so a
     // toggle applies without restarting the WebView)
@@ -1590,6 +1617,7 @@ static void ApplyConfiguration(void) {
     // presents the new page without a visible navigation.
     if (g_webView && g_hwnd) {
         if (IsWindowVisible(g_hwnd)) {
+            PrepareMainWebViewNavigation();
             g_webView->lpVtbl->Navigate(g_webView, g_config.url);
         } else {
             ResetTargetPageInBackground();
@@ -1599,13 +1627,7 @@ static void ApplyConfiguration(void) {
     // Re-apply the correct active/sleep state for the (possibly changed)
     // setting: disabling sleep while hidden wakes the runtime back up;
     // enabling it suspends the already-loaded page.
-    if (g_hwnd && IsWebViewReady()) {
-        if (IsWindowActuallyVisible(g_hwnd)) {
-            ActivateMainWebView();
-        } else {
-            DeactivateMainWebView();
-        }
-    }
+    if (g_hwnd) UpdateJsVisibilityState(g_hwnd);
 }
 
 // Dynamic WebView2 loader extraction
@@ -5553,9 +5575,10 @@ static HRESULT STDMETHODCALLTYPE BrowserExitedHandler_Invoke(
     ICoreWebView2BrowserProcessExitedEventHandler* This,
     ICoreWebView2Environment* sender,
     ICoreWebView2BrowserProcessExitedEventArgs* args) {
-    (void)This; (void)sender; (void)args;
+    (void)This; (void)args;
+    if (sender != g_webViewEnv) return S_OK;
     DebugPrint(L"[INFO] WebView2 browser process exited\n");
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_WEBVIEW_RECREATE, 0, 0);
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_WEBVIEW_RECREATE, (WPARAM)g_webViewGeneration, 0);
     return S_OK;
 }
 
@@ -5611,6 +5634,7 @@ static void UnregisterBrowserExitedFromCurrentEnv(void) {
 static void HandleUnexpectedBrowserExit(HWND hwnd) {
     if (InterlockedCompareExchange(&g_webViewCreatePending, TRUE, TRUE) == TRUE) return;
 
+    ++g_webViewGeneration;
     DebugPrint(L"[WARNING] WebView2 browser gone or unresponsive; rebuilding\n");
 
     KillTimer(hwnd, ID_TIMER_INITIAL_HIDE_JS);
@@ -5618,6 +5642,18 @@ static void HandleUnexpectedBrowserExit(HWND hwnd) {
     KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
     KillTimer(hwnd, ID_TIMER_POWER_RESUME);
     KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
+    KillTimer(hwnd, ID_TIMER_WEBVIEW_RESUME_RETRY);
+    KillTimer(hwnd, ID_TIMER_NAV_TITLE_WATCHDOG);
+    StopMainHealthCheck();
+    ++g_suspendRequestId;
+    ++g_livenessRequestId;
+    g_controllerVisible = -1;
+    g_controllerBoundsKnown = FALSE;
+    g_webViewSettlePending = FALSE;
+    g_mainNavigationLoading = TRUE;
+    g_mainNavigationId = 0;
+    InterlockedExchange(&g_webViewDesiredActive, FALSE);
+    InterlockedExchange(&g_webViewDesiredVisible, FALSE);
 
     InterlockedExchange(&g_isInitialized, FALSE);
     InterlockedExchange(&g_initialPreloadComplete, FALSE);
@@ -5631,20 +5667,18 @@ static void HandleUnexpectedBrowserExit(HWND hwnd) {
     g_jsVisibility = JS_VISIBILITY_UNKNOWN;
     g_lockdownFilterActive = FALSE;  // filters die with the WebView instance
 
-    if (g_webView) {
-        g_webView->lpVtbl->Release(g_webView);
-        g_webView = NULL;
-    }
-    if (g_webViewController) {
-        g_webViewController->lpVtbl->Close(g_webViewController);
-        g_webViewController->lpVtbl->Release(g_webViewController);
-        g_webViewController = NULL;
-    }
-    if (g_webViewEnv) {
-        UnregisterBrowserExitedFromCurrentEnv();
-        g_webViewEnv->lpVtbl->Release(g_webViewEnv);
-        g_webViewEnv = NULL;
-    }
+    // Detach before Close/Release can deliver any reentrant old callbacks.
+    ICoreWebView2* oldWebView = g_webView;
+    ICoreWebView2Controller* oldController = g_webViewController;
+    ICoreWebView2Environment* oldEnvironment = g_webViewEnv;
+    UnregisterBrowserExitedFromCurrentEnv();
+    g_webView = NULL;
+    g_webViewController = NULL;
+    g_webViewEnv = NULL;
+    if (oldController) oldController->lpVtbl->Close(oldController);
+    if (oldWebView) oldWebView->lpVtbl->Release(oldWebView);
+    if (oldController) oldController->lpVtbl->Release(oldController);
+    if (oldEnvironment) oldEnvironment->lpVtbl->Release(oldEnvironment);
 
     ULONGLONG now = GetTickCount64();
     if (g_rebuildBurstStartTick == 0 ||
@@ -5810,7 +5844,7 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
         // Pre-size the (still hidden) window to the size it will have when
         // shown, so the preload lays out and renders at the final dimensions
         // and the first open needs no reflow.
-        if (!initiallyVisible) {
+        if (!IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
             int wx, wy, ww, wh;
             GetTargetWindowRect(&wx, &wy, &ww, &wh);
             SetWindowPos(hwnd, NULL, wx, wy, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -5825,7 +5859,9 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
         // documented way to keep a WebView "warm" — the page loads and renders
         // off-screen so it is ready to display instantly. We only turn
         // rendering off (IsVisible = FALSE) at the moment we suspend for sleep.
-        controller->lpVtbl->put_IsVisible(controller, TRUE);
+        g_controllerVisible = -1;
+        g_controllerBoundsKnown = FALSE;
+        SetMainWebViewControllerVisible(TRUE);
 
         // Settle the sleep state only once navigations finish so we never
         // suspend a half-loaded page (see OnMainNavigationCompleted and the
@@ -5850,12 +5886,12 @@ HRESULT STDMETHODCALLTYPE ControllerCompletedHandler_Invoke(
             initialNavigationUrl = g_config.mailtoTargetUrl;
             DebugPrint(L"[INFO] Opening configured email-link destination during WebView startup\n");
         }
-        webview2->lpVtbl->Navigate(webview2, initialNavigationUrl);
-
         InterlockedExchange(&g_resumeFailureCount, 0);
         InterlockedExchange(&g_isInitialized, TRUE);
         InterlockedExchange(&g_webViewDesiredVisible, TRUE);
-        ResumeMainWebViewRuntime();
+        PrepareMainWebViewNavigation();
+        webview2->lpVtbl->Navigate(webview2, initialNavigationUrl);
+        StartVisibilityTracking(hwnd);
 
         if (initiallyVisible && InterlockedExchange(&g_resetUrlOnNextShow, FALSE) == TRUE) {
             ResetTargetPageIfNeeded();
@@ -5990,7 +6026,8 @@ ULONG STDMETHODCALLTYPE TrySuspendCompletedHandler_Release(
 HRESULT STDMETHODCALLTYPE TrySuspendCompletedHandler_Invoke(
     ICoreWebView2TrySuspendCompletedHandler* This,
     HRESULT errorCode, BOOL result) {
-    (void)This;
+    TrySuspendCompletedHandler* handler = (TrySuspendCompletedHandler*)This;
+    if (handler->requestId != g_suspendRequestId || !IsWebViewReady()) return S_OK;
     InterlockedExchange(&g_webViewSuspendPending, FALSE);
 
     if (SUCCEEDED(errorCode) && result) {
@@ -6012,8 +6049,8 @@ HRESULT STDMETHODCALLTYPE TrySuspendCompletedHandler_Invoke(
     return S_OK;
 }
 
-// Liveness ping handler: any answer at all (even an error code) proves the
-// runtime is still talking to us. No answer within POWER_RESUME_LIVENESS_MS
+// Liveness ping handler: only a successful answer from the current attempt
+// proves the runtime is still talking to us. No answer within POWER_RESUME_LIVENESS_MS
 // means it is wedged; CheckMainWebViewLiveness handles that case.
 HRESULT STDMETHODCALLTYPE LivenessPingHandler_QueryInterface(
     ICoreWebView2ExecuteScriptCompletedHandler* This,
@@ -6045,8 +6082,11 @@ ULONG STDMETHODCALLTYPE LivenessPingHandler_Release(
 HRESULT STDMETHODCALLTYPE LivenessPingHandler_Invoke(
     ICoreWebView2ExecuteScriptCompletedHandler* This,
     HRESULT errorCode, LPCWSTR resultObjectAsJson) {
-    (void)This; (void)errorCode; (void)resultObjectAsJson;
-    InterlockedExchange(&g_webViewPingOutstanding, FALSE);
+    (void)resultObjectAsJson;
+    LivenessPingHandler* handler = (LivenessPingHandler*)This;
+    if (handler->requestId == g_livenessRequestId && SUCCEEDED(errorCode)) {
+        InterlockedExchange(&g_webViewPingOutstanding, FALSE);
+    }
     return S_OK;
 }
 
@@ -6081,8 +6121,9 @@ HRESULT STDMETHODCALLTYPE NavStartingHandler_Invoke(
     ICoreWebView2NavigationStartingEventHandler* This,
     ICoreWebView2* sender, ICoreWebView2NavigationStartingEventArgs* args) {
     (void)This;
-    (void)sender;
+    if (sender != g_webView) return S_OK;
 
+    PrepareMainWebViewNavigation();
     UINT64 navigationId = 0;
     if (args) args->lpVtbl->get_NavigationId(args, &navigationId);
     DebugPrint(L"[INFO] Main navigation %I64u starting\n", navigationId);
@@ -6149,7 +6190,7 @@ HRESULT STDMETHODCALLTYPE NavCompletedHandler_Invoke(
     ICoreWebView2NavigationCompletedEventHandler* This,
     ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) {
     (void)This;
-    (void)sender;
+    if (sender != g_webView) return S_OK;
 
     UINT64 navigationId = 0;
     BOOL navigationIdKnown =
@@ -6326,7 +6367,8 @@ static ULONG STDMETHODCALLTYPE ProcessFailedHandler_Release(
 static HRESULT STDMETHODCALLTYPE ProcessFailedHandler_Invoke(
     ICoreWebView2ProcessFailedEventHandler* This,
     ICoreWebView2* sender, ICoreWebView2ProcessFailedEventArgs* args) {
-    (void)This; (void)sender;
+    (void)This;
+    if (sender != g_webView) return S_OK;
 
     COREWEBVIEW2_PROCESS_FAILED_KIND kind =
         COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED;
@@ -6338,7 +6380,7 @@ static HRESULT STDMETHODCALLTYPE ProcessFailedHandler_Invoke(
             // Everything behind the controller is gone; rebuild from scratch
             // (the BrowserProcessExited event posts the same message, the
             // handler dedupes).
-            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_WEBVIEW_RECREATE, 0, 0);
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_WEBVIEW_RECREATE, (WPARAM)g_webViewGeneration, 0);
             break;
 
         case COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED:
@@ -6346,7 +6388,7 @@ static HRESULT STDMETHODCALLTYPE ProcessFailedHandler_Invoke(
             // The browser process is fine; only the page died. Reload it in
             // place, falling back to a fresh navigation.
             if (g_webView) {
-                ResumeMainWebViewRuntime();
+                PrepareMainWebViewNavigation();
                 if (FAILED(g_webView->lpVtbl->Reload(g_webView))) {
                     ReloadTargetPage();
                 }
@@ -6423,12 +6465,18 @@ static ULONG STDMETHODCALLTYPE MainMsgHandler_Release(
 static HRESULT STDMETHODCALLTYPE MainMsgHandler_Invoke(
     ICoreWebView2WebMessageReceivedEventHandler* This,
     ICoreWebView2* sender, ICoreWebView2WebMessageReceivedEventArgs* args) {
-    (void)This; (void)sender;
+    (void)This;
+    if (sender != g_webView || !g_healthCheckPending) return S_OK;
 
     LPWSTR msg = NULL;
     if (SUCCEEDED(args->lpVtbl->TryGetWebMessageAsString(args, &msg)) && msg) {
-        if (wcscmp(msg, L"SystrayLauncher.framePong") == 0) {
+        wchar_t expected[80];
+        swprintf_s(expected, 80, L"SystrayLauncher.framePong.%I64u", g_frameProbeId);
+        if (wcscmp(msg, expected) == 0) {
             InterlockedExchange(&g_framePongSeen, TRUE);
+            if (!InterlockedCompareExchange(&g_presentationUnverified, FALSE, FALSE)) {
+                StopMainHealthCheck();
+            }
         }
         CoTaskMemFree(msg);
     }
@@ -6781,31 +6829,37 @@ static ICoreWebView2_3* QueryMainWebView3(void) {
 }
 
 static void SyncMainWebViewBounds(void) {
-    if (!g_webViewController || !g_hwnd) return;
+    if (!g_webViewController || !g_hwnd || IsIconic(g_hwnd)) return;
 
     RECT bounds;
-    GetClientRect(g_hwnd, &bounds);
-    g_webViewController->lpVtbl->put_Bounds(g_webViewController, bounds);
+    if (!GetClientRect(g_hwnd, &bounds)) return;
+    if (g_controllerBoundsKnown && EqualRect(&bounds, &g_controllerBounds)) return;
+    if (SUCCEEDED(g_webViewController->lpVtbl->put_Bounds(g_webViewController, bounds))) {
+        g_controllerBounds = bounds;
+        g_controllerBoundsKnown = TRUE;
+    }
 }
 
-static void SetMainWebViewControllerVisible(BOOL visible) {
-    if (!g_webViewController) return;
+static BOOL SetMainWebViewControllerVisible(BOOL visible) {
+    if (!g_webViewController) return FALSE;
+    if (visible) SyncMainWebViewBounds();
+    if (g_controllerVisible == visible) return TRUE;
 
-    if (visible) {
-        SyncMainWebViewBounds();
+    HRESULT hr = g_webViewController->lpVtbl->put_IsVisible(g_webViewController, visible);
+    g_controllerVisible = SUCCEEDED(hr) ? visible : -1;
+    if (FAILED(hr)) {
+        DebugPrint(L"[WARNING] WebView2 visibility change to %d failed: 0x%08X\n", visible, hr);
     }
-    g_webViewController->lpVtbl->put_IsVisible(g_webViewController, visible);
+    return SUCCEEDED(hr);
 }
 
 static void ResumeMainWebViewRuntime(void) {
     LONG previousDesired = InterlockedExchange(&g_webViewDesiredActive, TRUE);
     if (!IsWebViewReady() || !g_webViewController) return;
 
-    BOOL needsResume =
-        previousDesired == FALSE ||
+    BOOL needsResume = previousDesired == FALSE || g_resumeFailureCount != 0 ||
         InterlockedCompareExchange(&g_webViewSuspendPending, FALSE, FALSE) == TRUE ||
         InterlockedCompareExchange(&g_webViewSuspended, FALSE, FALSE) == TRUE;
-
     if (!needsResume) return;
 
     ICoreWebView2_3* webView3 = QueryMainWebView3();
@@ -6813,63 +6867,60 @@ static void ResumeMainWebViewRuntime(void) {
 
     HRESULT hr = webView3->lpVtbl->Resume(webView3);
     webView3->lpVtbl->Release(webView3);
-
     if (SUCCEEDED(hr)) {
+        // A cancelled suspend may still deliver its completion. It must not
+        // overwrite a later suspend, navigation, or replacement WebView.
+        ++g_suspendRequestId;
         InterlockedExchange(&g_webViewSuspendPending, FALSE);
         InterlockedExchange(&g_webViewSuspended, FALSE);
         InterlockedExchange(&g_resumeFailureCount, 0);
+        if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_WEBVIEW_RESUME_RETRY);
         return;
     }
 
-    // Keep the suspended flags set so every later activation retries the
-    // resume. A runtime that stays unresumable (seen after the machine comes
-    // back from hibernation) gets torn down and rebuilt instead of leaving a
-    // frozen, white page on screen.
     DebugPrint(L"[WARNING] WebView2 resume failed. HRESULT: 0x%08X\n", hr);
     LONG failures = InterlockedIncrement(&g_resumeFailureCount);
-    if (failures >= RESUME_FAILURE_RECREATE_THRESHOLD && g_hwnd) {
-        InterlockedExchange(&g_resumeFailureCount, 0);
-        PostMessageW(g_hwnd, WM_APP_WEBVIEW_RECREATE, 0, 0);
+    if (g_hwnd) {
+        if (failures >= RESUME_FAILURE_RECREATE_THRESHOLD) {
+            KillTimer(g_hwnd, ID_TIMER_WEBVIEW_RESUME_RETRY);
+            PostMessageW(g_hwnd, WM_APP_WEBVIEW_RECREATE, (WPARAM)g_webViewGeneration, 0);
+        } else {
+            SetTimer(g_hwnd, ID_TIMER_WEBVIEW_RESUME_RETRY, WEBVIEW_RESUME_RETRY_MS, NULL);
+        }
     }
 }
 
 static void SuspendMainWebViewRuntime(void) {
     InterlockedExchange(&g_webViewDesiredActive, FALSE);
-    if (!IsWebViewReady() || !g_webViewController) return;
-
-    if (InterlockedCompareExchange(&g_webViewSuspendPending, FALSE, FALSE) == TRUE ||
-        InterlockedCompareExchange(&g_webViewSuspended, FALSE, FALSE) == TRUE) {
-        return;
-    }
+    if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_WEBVIEW_RESUME_RETRY);
+    InterlockedExchange(&g_resumeFailureCount, 0);
+    if (!IsWebViewReady() || !g_webViewController || g_controllerVisible != FALSE) return;
+    if (g_webViewSuspendPending || g_webViewSuspended) return;
 
     ICoreWebView2_3* webView3 = QueryMainWebView3();
     if (!webView3) return;
-
     TrySuspendCompletedHandler* handler =
         (TrySuspendCompletedHandler*)calloc(1, sizeof(TrySuspendCompletedHandler));
     if (!handler) {
         webView3->lpVtbl->Release(webView3);
         return;
     }
-
     static ICoreWebView2TrySuspendCompletedHandlerVtbl suspendVtbl = {
         TrySuspendCompletedHandler_QueryInterface,
         TrySuspendCompletedHandler_AddRef,
         TrySuspendCompletedHandler_Release,
         TrySuspendCompletedHandler_Invoke
     };
-
     handler->lpVtbl = &suspendVtbl;
     handler->refCount = 1;
-
+    handler->requestId = ++g_suspendRequestId;
     InterlockedExchange(&g_webViewSuspendPending, TRUE);
     HRESULT hr = webView3->lpVtbl->TrySuspend(
         webView3, (ICoreWebView2TrySuspendCompletedHandler*)handler);
-    if (FAILED(hr)) {
+    if (FAILED(hr) && handler->requestId == g_suspendRequestId) {
         InterlockedExchange(&g_webViewSuspendPending, FALSE);
         DebugPrint(L"[WARNING] WebView2 TrySuspend call failed. HRESULT: 0x%08X\n", hr);
     }
-
     handler->lpVtbl->Release((ICoreWebView2TrySuspendCompletedHandler*)handler);
     webView3->lpVtbl->Release(webView3);
 }
@@ -6877,7 +6928,9 @@ static void SuspendMainWebViewRuntime(void) {
 // Bring the WebView to the foreground state: runtime resumed + rendered, and
 // the controller sized to the now-visible host window.
 static void ActivateMainWebView(void) {
+    BOOL wasRendering = g_webViewDesiredVisible;
     InterlockedExchange(&g_webViewPrewarmActive, FALSE);
+    g_webViewSettlePending = FALSE;
     if (g_hwnd) {
         KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM);
         KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PRELOAD);
@@ -6886,6 +6939,10 @@ static void ActivateMainWebView(void) {
     InterlockedExchange(&g_webViewDesiredVisible, TRUE);
     ResumeMainWebViewRuntime();
     SetMainWebViewControllerVisible(TRUE);
+    if (!wasRendering) {
+        g_healthKicked = FALSE;
+        ArmMainHealthCheck();
+    }
 }
 
 // Move the WebView to the background (host window hidden).
@@ -6907,17 +6964,16 @@ static void DeactivateMainWebView(void) {
     // while a tray-hover prewarm is keeping it warm, or while a navigation is
     // still in flight — suspending mid-navigation freezes the load half-done
     // and its completion event may never arrive (the eventual completion
-    // re-runs the settle-then-suspend path). The steady-state hidden ticks
-    // used to cancel both on the next tick.
-    if (sleepEnabled && preloaded && !recovery && !prewarming &&
+    // re-runs the settle-then-suspend path).
+    StopMainHealthCheck();
+    if (sleepEnabled && preloaded && !recovery && !prewarming && !g_webViewSettlePending &&
         !g_mainNavigationLoading) {
         InterlockedExchange(&g_webViewPrewarmActive, FALSE);
         if (g_hwnd) {
             KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM);
         }
         InterlockedExchange(&g_webViewDesiredVisible, FALSE);
-        SetMainWebViewControllerVisible(FALSE);
-        SuspendMainWebViewRuntime();
+        if (SetMainWebViewControllerVisible(FALSE)) SuspendMainWebViewRuntime();
     } else {
         InterlockedExchange(&g_webViewDesiredVisible, TRUE);
         ResumeMainWebViewRuntime();
@@ -6933,23 +6989,28 @@ static void PrewarmMainWebView(void) {
     if (InterlockedCompareExchange(&g_sleepWhenInactive, TRUE, TRUE) != TRUE) return;
 
     // Hovering delivers a continuous WM_MOUSEMOVE stream. While a prewarm is
-    // already active the page is warm; just re-arm the timeout instead of
+    // already active the page is warm; just record the hover time instead of
     // redoing the occlusion scan and cross-process resume/show calls for
     // every mouse move.
     if (InterlockedCompareExchange(&g_webViewPrewarmActive, TRUE, TRUE) == TRUE) {
-        SetTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM, WEBVIEW_PREWARM_MS, NULL);
+        g_prewarmLastHoverTick = GetTickCount64();
         return;
     }
 
     if (!IsWebViewReady()) return;
-    if (IsWindowActuallyVisible(g_hwnd)) return;
+    if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)) return;
 
     InterlockedExchange(&g_webViewPrewarmActive, TRUE);
+    g_prewarmLastHoverTick = GetTickCount64();
     InterlockedExchange(&g_webViewDesiredVisible, TRUE);
     ResumeMainWebViewRuntime();
     SetMainWebViewControllerVisible(TRUE);  // render warm while the host stays hidden
 
-    SetTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM, WEBVIEW_PREWARM_MS, NULL);
+    if (!SetTimer(g_hwnd, ID_TIMER_WEBVIEW_PREWARM, WEBVIEW_PREWARM_MS, NULL)) {
+        InterlockedExchange(&g_webViewPrewarmActive, FALSE);
+        DeactivateMainWebView();
+        return;
+    }
     DebugPrint(L"[INFO] WebView2 prewarmed (warm render) from tray hover for %d ms\n", WEBVIEW_PREWARM_MS);
 }
 
@@ -6959,6 +7020,8 @@ static void PrewarmMainWebView(void) {
 static void SendMainWebViewLivenessPing(void) {
     if (!IsWebViewReady()) return;
     if (InterlockedCompareExchange(&g_webViewPingOutstanding, TRUE, TRUE) == TRUE) return;
+    InterlockedExchange(&g_webViewPingOutstanding, TRUE);
+    ++g_livenessRequestId;
 
     LivenessPingHandler* handler =
         (LivenessPingHandler*)calloc(1, sizeof(LivenessPingHandler));
@@ -6972,6 +7035,7 @@ static void SendMainWebViewLivenessPing(void) {
     };
     handler->lpVtbl = &pingVtbl;
     handler->refCount = 1;
+    handler->requestId = g_livenessRequestId;
 
     InterlockedExchange(&g_webViewPingOutstanding, TRUE);
     HRESULT hr = g_webView->lpVtbl->ExecuteScript(g_webView, L"1",
@@ -7001,8 +7065,11 @@ static void KickMainWebViewComposition(void) {
         g_webViewController->lpVtbl->put_Bounds(g_webViewController, shrunk);
     }
     g_webViewController->lpVtbl->put_Bounds(g_webViewController, bounds);
+    g_controllerBoundsKnown = FALSE;
     g_webViewController->lpVtbl->put_IsVisible(g_webViewController, FALSE);
-    g_webViewController->lpVtbl->put_IsVisible(g_webViewController, TRUE);
+    g_controllerVisible = -1;
+    InterlockedExchange(&g_webViewDesiredVisible, TRUE);
+    SetMainWebViewControllerVisible(TRUE);
     g_webViewController->lpVtbl->NotifyParentWindowPositionChanged(g_webViewController);
 }
 
@@ -7043,15 +7110,13 @@ static void CheckMainWebViewLiveness(HWND hwnd) {
         InterlockedExchange(&g_powerResumePending, FALSE);
         g_powerKickCount = 0;
         DebugPrint(L"[INFO] WebView2 responsive after power resume\n");
-        if (IsWindowActuallyVisible(hwnd)) {
-            ActivateMainWebView();
-        } else {
-            DeactivateMainWebView();
-        }
+        UpdateJsVisibilityState(hwnd);
+        ArmMainHealthCheck();
         return;
     }
 
-    // Allow the next kick to ping again (a late pong is harmless).
+    // Invalidate this attempt before accepting another recovery ping.
+    ++g_livenessRequestId;
     InterlockedExchange(&g_webViewPingOutstanding, FALSE);
 
     if (IsWebViewReady() && g_powerKickCount < POWER_RESUME_MAX_KICKS) {
@@ -7063,123 +7128,233 @@ static void CheckMainWebViewLiveness(HWND hwnd) {
     DebugPrint(L"[WARNING] WebView2 unresponsive after power resume; forcing rebuild\n");
     InterlockedExchange(&g_powerResumePending, FALSE);
     g_powerKickCount = 0;
-    PostMessageW(hwnd, WM_APP_WEBVIEW_RECREATE, 0, 0);
+    PostMessageW(hwnd, WM_APP_WEBVIEW_RECREATE, (WPARAM)g_webViewGeneration, 0);
 }
 
-// Called when a navigation completes. The first completion marks the initial
-// preload as done, after which it is safe to suspend on hide without cutting a
-// page load short.
+// Set the warm/loading state before calling an API that starts navigation;
+// NavigationStarting is asynchronous and can otherwise race with suspension.
+static void PrepareMainWebViewNavigation(void) {
+    StopMainHealthCheck();
+    g_webViewSettlePending = FALSE;
+    if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_WEBVIEW_PRELOAD);
+    InterlockedExchange(&g_initialPreloadComplete, FALSE);
+    BeginMainNavigationTitle(g_hwnd, 0);
+    InterlockedExchange(&g_webViewDesiredVisible, TRUE);
+    ResumeMainWebViewRuntime();
+    SetMainWebViewControllerVisible(TRUE);
+}
+
 static void OnMainNavigationCompleted(void) {
     InterlockedExchange(&g_initialPreloadComplete, TRUE);
 
     if (!g_hwnd) return;
-    if (IsWindowActuallyVisible(g_hwnd)) return;  // shown: stay active
-    if (InterlockedCompareExchange(&g_webViewPrewarmActive, TRUE, TRUE) == TRUE) return;  // hover prewarm in progress
-
-    if (InterlockedCompareExchange(&g_sleepWhenInactive, TRUE, TRUE) == TRUE) {
-        // Let the freshly-loaded page render for a short moment before
-        // suspending, so the suspended snapshot is complete and resumes
-        // instantly when the user opens or hovers.
-        SetTimer(g_hwnd, ID_TIMER_WEBVIEW_PRELOAD, WEBVIEW_PRELOAD_SETTLE_MS, NULL);
-    } else {
-        // Sleep disabled: keep the page warm and running for instant opens.
-        DeactivateMainWebView();
-    }
+    // Protect the entire settle interval against unrelated visibility,
+    // prewarm and recovery callbacks, not just this timer's own callback.
+    g_preloadSettleDeadline = GetTickCount64() + WEBVIEW_PRELOAD_SETTLE_MS;
+    g_webViewSettlePending = g_sleepWhenInactive &&
+        SetTimer(g_hwnd, ID_TIMER_WEBVIEW_PRELOAD, WEBVIEW_PRELOAD_SETTLE_MS, NULL) != 0;
+    StartVisibilityTracking(g_hwnd);
+    UpdateJsVisibilityState(g_hwnd);
+    if (g_jsVisibility == JS_VISIBILITY_SHOWN) ArmMainHealthCheck();
 }
 
-// Data structure for occlusion check enumeration
+// All hooks run out of process on our UI thread. Only top-level window
+// events matter; accessibility objects, carets and renderer children do not.
+static void CALLBACK VisibilityWinEventProc(HWINEVENTHOOK hook, DWORD event,
+        HWND hwnd, LONG objectId, LONG childId, DWORD threadId, DWORD eventTime) {
+    (void)hook; (void)threadId; (void)eventTime;
+    if (!g_visibilityTracking) return;
+    if (event != EVENT_SYSTEM_DESKTOPSWITCH) {
+        if (!hwnd || objectId != OBJID_WINDOW || childId != CHILDID_SELF) return;
+        // A destroyed HWND cannot be queried; it may have been an occluder.
+        if (event != EVENT_OBJECT_DESTROY && GetAncestor(hwnd, GA_ROOT) != hwnd) return;
+    }
+    // Never enumerate windows or call WebView2 from a reentrant WinEvent
+    // callback. A burst shares one timeout; it cannot postpone an uncover.
+    QueueVisibilityCheck(g_jsVisibility != JS_VISIBILITY_SHOWN);
+}
+
+static void ClearVisibilityLocationHooks(void) {
+    for (size_t i = 0; i < g_visibilityLocationHookCount; ++i) {
+        UnhookWinEvent(g_visibilityLocationHooks[i].hook);
+    }
+    g_visibilityLocationHookCount = 0;
+}
+
+static BOOL SyncVisibilityLocationHooks(const DWORD* processIds, size_t count) {
+    for (size_t i = 0; i < g_visibilityLocationHookCount;) {
+        size_t j = 0;
+        while (j < count && processIds[j] != g_visibilityLocationHooks[i].processId) ++j;
+        if (j == count) {
+            UnhookWinEvent(g_visibilityLocationHooks[i].hook);
+            g_visibilityLocationHooks[i] = g_visibilityLocationHooks[--g_visibilityLocationHookCount];
+        } else {
+            ++i;
+        }
+    }
+    BOOL complete = TRUE;
+    for (size_t i = 0; i < count; ++i) {
+        size_t j = 0;
+        while (j < g_visibilityLocationHookCount &&
+               g_visibilityLocationHooks[j].processId != processIds[i]) ++j;
+        if (j != g_visibilityLocationHookCount) continue;
+        HWINEVENTHOOK hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_LOCATIONCHANGE, NULL, VisibilityWinEventProc,
+            processIds[i], 0, WINEVENT_OUTOFCONTEXT);
+        if (!hook) { complete = FALSE; continue; }
+        g_visibilityLocationHooks[g_visibilityLocationHookCount].processId = processIds[i];
+        g_visibilityLocationHooks[g_visibilityLocationHookCount++].hook = hook;
+    }
+    return complete;
+}
+
 typedef struct {
     HWND targetHwnd;
+    RECT targetRect;
     HRGN visibleRgn;
+    HRGN scratchRgn;
+    BOOL reachedTarget;
+    BOOL uncertain;
+    DWORD processIds[MAX_VISIBILITY_PROCESSES];
+    size_t processCount;
 } OcclusionCheckData;
 
-// Callback for EnumWindows - subtracts each window above target from visible region
 static BOOL CALLBACK OcclusionEnumProc(HWND hwnd, LPARAM lParam) {
     OcclusionCheckData* data = (OcclusionCheckData*)lParam;
-
-    // Stop when we reach our own window (windows below us don't occlude us)
     if (hwnd == data->targetHwnd) {
-        return FALSE;
-    }
-
-    // Skip invisible or minimized windows
-    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) {
+        data->reachedTarget = TRUE;
         return TRUE;
     }
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
 
-    // Skip DWM-cloaked windows: suspended UWP apps, the lock-screen host and
-    // ghost ApplicationFrameHost shells report IsWindowVisible=TRUE while
-    // drawing nothing. Counting them as occluders makes the app believe the
-    // window is covered and suspend a WebView the user is looking at.
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    // These styles can expose the page through their bounding rectangle.
+    // Keeping it awake is safer than guessing at per-pixel opacity.
+    if (style & (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP)) return TRUE;
     DWORD cloaked = 0;
-    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked,
-                                        sizeof(cloaked))) && cloaked != 0) {
+    if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) || cloaked) {
         return TRUE;
     }
+    RECT rect;
+    // GetWindowRect includes invisible resize borders; never subtract them.
+    if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect))) ||
+        IsRectEmpty(&rect)) return TRUE;
 
-    // Skip windows with no area
-    RECT windowRect;
-    if (!GetWindowRect(hwnd, &windowRect)) {
+    // Location events are noisy system-wide. Subscribe only to processes
+    // with visible, potentially occluding windows, including those below us
+    // that may move above us later. Keep and reuse hooks between checks.
+    DWORD pid = 0;
+    if (!GetWindowThreadProcessId(hwnd, &pid) || !pid) {
+        data->uncertain = TRUE;
         return TRUE;
     }
-    if (windowRect.right <= windowRect.left || windowRect.bottom <= windowRect.top) {
-        return TRUE;
+    size_t i = 0;
+    while (i < data->processCount && data->processIds[i] != pid) ++i;
+    if (i == data->processCount) {
+        if (i == MAX_VISIBILITY_PROCESSES) data->uncertain = TRUE;
+        else data->processIds[data->processCount++] = pid;
     }
+    if (data->reachedTarget) return TRUE;
+    RECT overlap;
+    if (!IntersectRect(&overlap, &rect, &data->targetRect)) return TRUE;
 
-    // Subtract this window's rect from our visible region
-    HRGN windowRgn = CreateRectRgnIndirect(&windowRect);
-    if (windowRgn) {
-        CombineRgn(data->visibleRgn, data->visibleRgn, windowRgn, RGN_DIFF);
-        DeleteObject(windowRgn);
+    // An explicit region may have holes or rounded edges. Such a window's
+    // non-client opacity is uncertain, so do not use it to prove coverage.
+    int kind = GetWindowRgn(hwnd, data->scratchRgn);
+    if (kind != ERROR) return TRUE;
+    if (!SetRectRgn(data->scratchRgn, overlap.left, overlap.top, overlap.right, overlap.bottom) ||
+        CombineRgn(data->visibleRgn, data->visibleRgn, data->scratchRgn, RGN_DIFF) == ERROR) {
+        data->uncertain = TRUE;
     }
-
     return TRUE;
 }
 
-// Check if ANY part of the window is visible (not fully covered by other windows)
+// Sleep only when full coverage is known AND changes can wake us promptly.
+// Any uncertainty keeps a shown window rendering.
 static BOOL IsWindowActuallyVisible(HWND hwnd) {
-    if (!hwnd) return FALSE;
-    if (!IsWindowVisible(hwnd)) return FALSE;
-    if (IsIconic(hwnd)) return FALSE;
+    if (!hwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return FALSE;
+    if (!g_visibilityHooksAvailable) return TRUE;
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) {
+        return FALSE;
+    }
+    if (GetForegroundWindow() == hwnd) return TRUE;
 
-    RECT ourRect;
-    if (!GetWindowRect(hwnd, &ourRect)) return FALSE;
-    if (!MonitorFromRect(&ourRect, MONITOR_DEFAULTTONULL)) {
-        // Monitors are still being re-enumerated (common right after resume
-        // from hibernate, or during docking changes). Assume visible rather
-        // than suspending a WebView the user may be looking at.
+    OcclusionCheckData data = {0};
+    data.targetHwnd = hwnd;
+    if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                     &data.targetRect, sizeof(data.targetRect))) ||
+        IsRectEmpty(&data.targetRect) ||
+        !MonitorFromRect(&data.targetRect, MONITOR_DEFAULTTONULL)) return TRUE;
+    data.visibleRgn = CreateRectRgnIndirect(&data.targetRect);
+    data.scratchRgn = CreateRectRgn(0, 0, 0, 0);
+    if (!data.visibleRgn || !data.scratchRgn) {
+        if (data.visibleRgn) DeleteObject(data.visibleRgn);
+        if (data.scratchRgn) DeleteObject(data.scratchRgn);
         return TRUE;
     }
-
-    // Create a region representing our window
-    HRGN visibleRgn = CreateRectRgnIndirect(&ourRect);
-    if (!visibleRgn) return FALSE;
-
-    OcclusionCheckData data;
-    data.targetHwnd = hwnd;
-    data.visibleRgn = visibleRgn;
-
-    // EnumWindows enumerates top-level windows in z-order (top to bottom)
-    // We subtract each window above us until we reach our own window
-    EnumWindows(OcclusionEnumProc, (LPARAM)&data);
-
-    // Check if any part of our window is still visible
-    RECT boundingBox;
-    int rgnType = GetRgnBox(visibleRgn, &boundingBox);
-    DeleteObject(visibleRgn);
-
-    // NULLREGION means our window is completely covered
-    return (rgnType != NULLREGION);
+    BOOL enumerated = EnumWindows(OcclusionEnumProc, (LPARAM)&data);
+    BOOL observed = SyncVisibilityLocationHooks(data.processIds, data.processCount);
+    RECT bounds;
+    int kind = GetRgnBox(data.visibleRgn, &bounds);
+    DeleteObject(data.scratchRgn);
+    DeleteObject(data.visibleRgn);
+    return !enumerated || !data.reachedTarget || data.uncertain || !observed || kind != NULLREGION;
 }
 
-static void StartVisibilityTimer(HWND hwnd) {
-    SetTimer(hwnd, ID_TIMER_VISIBILITY_CHECK, VISIBILITY_CHECK_INTERVAL_MS, NULL);
-    DebugPrint(L"[INFO] Started visibility check timer\n");
+static void QueueVisibilityCheck(BOOL urgent) {
+    if (!g_hwnd || !g_visibilityTracking) return;
+    UINT delay = urgent ? VISIBILITY_WAKE_DELAY_MS : VISIBILITY_CHECK_INTERVAL_MS;
+    if (g_visibilityCheckDelay && g_visibilityCheckDelay <= delay) return;
+    if (SetTimer(g_hwnd, ID_TIMER_VISIBILITY_CHECK, delay, NULL)) {
+        g_visibilityCheckDelay = delay;
+    } else {
+        // Without a scheduled uncover check, do not allow occlusion sleep.
+        g_visibilityHooksAvailable = FALSE;
+        PostMessageW(g_hwnd, WM_APP_VISIBILITY_WAKE, 0, 0);
+    }
 }
 
-static void StopVisibilityTimer(HWND hwnd) {
+static void StopVisibilityTracking(HWND hwnd) {
+    g_visibilityTracking = FALSE;
+    g_visibilityHooksAvailable = FALSE;
     KillTimer(hwnd, ID_TIMER_VISIBILITY_CHECK);
-    DebugPrint(L"[INFO] Stopped visibility check timer\n");
+    g_visibilityCheckDelay = 0;
+    for (size_t i = 0; i < sizeof(g_visibilityHooks) / sizeof(g_visibilityHooks[0]); ++i) {
+        if (g_visibilityHooks[i]) UnhookWinEvent(g_visibilityHooks[i]);
+        g_visibilityHooks[i] = NULL;
+    }
+    ClearVisibilityLocationHooks();
+}
+
+static void StartVisibilityTracking(HWND hwnd) {
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) ||
+        (!g_sleepWhenInactive && !g_config.onHideJs[0] && !g_config.onShowJs[0])) {
+        StopVisibilityTracking(hwnd);
+        return;
+    }
+    if (g_visibilityTracking) return;
+    const DWORD events[][2] = {
+        {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND},
+        {EVENT_SYSTEM_CAPTUREEND, EVENT_SYSTEM_CAPTUREEND},
+        {EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND},
+        {EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND},
+        {EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH},
+        {EVENT_OBJECT_DESTROY, EVENT_OBJECT_REORDER},
+        {EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE},
+        {EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED}
+    };
+    for (size_t i = 0; i < sizeof(events) / sizeof(events[0]); ++i) {
+        g_visibilityHooks[i] = SetWinEventHook(events[i][0], events[i][1], NULL,
+            VisibilityWinEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+        if (!g_visibilityHooks[i]) {
+            StopVisibilityTracking(hwnd);
+            DebugPrint(L"[WARNING] Window events unavailable; sleep limited to hidden/minimized windows\n");
+            return;
+        }
+    }
+    g_visibilityHooksAvailable = TRUE;
+    g_visibilityTracking = TRUE;
 }
 
 static void UpdateJsVisibilityState(HWND hwnd) {
@@ -7196,7 +7371,13 @@ static void UpdateJsVisibilityState(HWND hwnd) {
     }
 
     if (newState == JS_VISIBILITY_SHOWN) {
+        if (g_jsVisibility == JS_VISIBILITY_HIDDEN) {
+            g_healthKicked = FALSE;
+            g_healthHealed = FALSE;
+        }
+        g_jsVisibility = newState;
         ActivateMainWebView();
+        ArmMainHealthCheck();
     }
 
     g_jsVisibility = newState;
@@ -7254,6 +7435,7 @@ static void ResetTargetPageIfNeeded(void) {
     HRESULT hr = g_webView->lpVtbl->get_Source(g_webView, &currentUrl);
     if (SUCCEEDED(hr) && currentUrl) {
         if (wcscmp(currentUrl, g_initialUrl) != 0) {
+            PrepareMainWebViewNavigation();
             g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
             DebugPrint(L"[INFO] Reset URL to configured target: %s (was: %s)\n",
                        g_initialUrl, currentUrl);
@@ -7264,6 +7446,7 @@ static void ResetTargetPageIfNeeded(void) {
         return;
     }
 
+    PrepareMainWebViewNavigation();
     g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
     DebugPrint(L"[INFO] Reset URL to configured target (couldn't check current): %s\n",
                g_initialUrl);
@@ -7276,53 +7459,48 @@ static void ResetTargetPageIfNeeded(void) {
 // When the WebView is not available, defer the reset to the next show instead.
 static void ResetTargetPageInBackground(void) {
     if (IsWebViewReady()) {
-        ResumeMainWebViewRuntime();
         ResetTargetPageIfNeeded();
     } else {
         InterlockedExchange(&g_resetUrlOnNextShow, TRUE);
     }
 }
 
-// --- On-open health verification ------------------------------------------
-//
-// The hidden-time power-resume recovery above can only prove the runtime
-// answers scripts; whether pixels actually reach the screen is unknowable
-// until the window is shown. So every show runs this check: for up to a
-// second (100 ms ticks, each first confirming the window is still up) the
-// page is asked for a frame heartbeat, and a container that cannot produce
-// one is torn down and rebuilt. Page CONTENT is deliberately irrelevant -
-// a 404 or a blank document heartbeats just as well as the real page.
-
-// Ask the page's compositor for proof of life. requestAnimationFrame only
-// fires when the renderer is producing frames for a visible page, so the
-// pong (posted back as a web message, see MainMsgHandler_Invoke) covers the
-// whole path from script execution to frame production.
+// Each health attempt requests one frame and arms one deadline. Navigation
+// completion restarts verification; a slow load is not a broken renderer.
 static void SendMainFrameProbe(void) {
-    ExecuteJavaScript(
-        L"requestAnimationFrame(function(){"
-        L"try{window.chrome.webview.postMessage('SystrayLauncher.framePong');}catch(e){}"
-        L"});");
+    wchar_t script[256];
+    swprintf_s(script, 256,
+        L"requestAnimationFrame(function(){try{window.chrome.webview.postMessage("
+        L"'SystrayLauncher.framePong.%I64u');}catch(e){}});", g_frameProbeId);
+    ExecuteJavaScript(script);
 }
 
-// Begin (or restart) the health poll. Called on every show, and again when a
-// rebuilt WebView comes up under a visible window; the caller manages
-// g_healthHealed so a rebuild that stays broken cannot loop.
+static void StopMainHealthCheck(void) {
+    if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_HEALTH_CHECK);
+    g_healthCheckPending = FALSE;
+    ++g_frameProbeId;
+}
+
 static void ArmMainHealthCheck(void) {
-    if (!g_hwnd) return;
-    g_healthTicks = 0;
-    g_healthTotalTicks = 0;
+    if (g_healthCheckPending) return;
+    StopMainHealthCheck();
+    if (!g_hwnd || !IsWebViewReady() || !g_webViewController || g_mainNavigationLoading ||
+        !IsWindowVisible(g_hwnd) || IsIconic(g_hwnd) || g_jsVisibility == JS_VISIBILITY_HIDDEN) return;
+    g_healthCheckPending = TRUE;
+    g_healthCheckDeadline = GetTickCount64() + HEALTH_CHECK_TIMEOUT_MS;
     InterlockedExchange(&g_framePongSeen, FALSE);
-    SetTimer(g_hwnd, ID_TIMER_HEALTH_CHECK, HEALTH_CHECK_INTERVAL_MS, NULL);
+    SetTimer(g_hwnd, ID_TIMER_HEALTH_CHECK, HEALTH_CHECK_TIMEOUT_MS, NULL);
+    SendMainFrameProbe();
 }
 
 // Detached-surface detector: after hibernate the renderer can keep producing
 // frames (so the heartbeat passes) into a composition surface that is no
 // longer attached to the window - the screen just shows a uniform white
 // rectangle. Sample a 4x4 interior grid of the client area straight from the
-// screen; a fully uniform color is treated as "not actually presenting".
+// screen; a fully uniform color can request a composition refresh.
 // Only called while this window is foreground, and only until one on-screen
 // verification after a power transition has passed, so a legitimately
-// uniform page can trigger at most one needless rebuild per resume.
+// uniform page can request a composition refresh, never a reload by itself.
 static BOOL IsClientAreaUniformColor(HWND hwnd) {
     RECT rc;
     if (!GetClientRect(hwnd, &rc)) return FALSE;
@@ -7353,6 +7531,40 @@ static BOOL IsClientAreaUniformColor(HWND hwnd) {
     }
     ReleaseDC(NULL, screen);
     return uniform;
+}
+
+static void CheckMainWebViewHealth(HWND hwnd) {
+    BOOL framesFlowing = g_framePongSeen;
+    StopMainHealthCheck();
+    if (!IsWebViewReady() || !g_webViewController || g_mainNavigationLoading) return;
+    if (!IsWindowActuallyVisible(hwnd)) {
+        UpdateJsVisibilityState(hwnd);
+        return;
+    }
+    // A visible title bar does not prove the WebView's client area is
+    // exposed. Chromium may legitimately throttle frames behind another
+    // app. Keep it resumed, and verify again when it gains focus.
+    if (!framesFlowing && GetForegroundWindow() != hwnd) return;
+    BOOL uniform = framesFlowing && g_presentationUnverified &&
+        GetForegroundWindow() == hwnd && IsClientAreaUniformColor(hwnd);
+    if ((!framesFlowing || uniform) && !g_healthKicked) {
+        g_healthKicked = TRUE;
+        KickMainWebViewComposition();
+        ArmMainHealthCheck();
+    } else if (framesFlowing) {
+        // A uniform page can be legitimate. Once composition has been
+        // refreshed, its color must never cause a destructive reload.
+        if (GetForegroundWindow() == hwnd) {
+            InterlockedExchange(&g_presentationUnverified, FALSE);
+        }
+        DebugPrint(L"[INFO] WebView2 frame verified\n");
+    } else if (!g_healthHealed) {
+        g_healthHealed = TRUE;
+        DebugPrint(L"[WARNING] WebView2 did not produce a frame after composition repair; rebuilding\n");
+        HandleUnexpectedBrowserExit(hwnd);
+    } else {
+        DebugPrint(L"[WARNING] WebView2 still unresponsive after rebuild; waiting for next activation\n");
+    }
 }
 
 // Compute the main window's configured rectangle. Maximized windows are
@@ -7420,10 +7632,11 @@ void ShowMainWindow(void) {
 
     // Verify the container actually renders now that it is on screen.
     g_healthHealed = FALSE;
+    g_healthKicked = FALSE;
     ArmMainHealthCheck();
 
-    // Start polling for visibility changes while window is shown
-    StartVisibilityTimer(g_hwnd);
+    // Observe window events only while the window is shown
+    StartVisibilityTracking(g_hwnd);
     UpdateJsVisibilityState(g_hwnd);
 
     RECT shownRect;
@@ -7439,9 +7652,9 @@ void ShowMainWindow(void) {
 void HideMainWindow(void) {
     if (!g_hwnd) return;
 
-    // Stop visibility polling when window is hidden
-    StopVisibilityTimer(g_hwnd);
-    KillTimer(g_hwnd, ID_TIMER_HEALTH_CHECK);
+    // A tray-hidden window needs no visibility hooks or checks
+    StopVisibilityTracking(g_hwnd);
+    StopMainHealthCheck();
 
     ShowWindow(g_hwnd, SW_HIDE);
     UpdateJsVisibilityState(g_hwnd);
@@ -7498,6 +7711,7 @@ void RefreshTrayIcon(void) {
 
 void ReloadTargetPage(void) {
     if (!g_webView) return;
+    PrepareMainWebViewNavigation();
 
     if (g_initialUrl[0]) {
         g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
@@ -7682,17 +7896,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             BOOL restoredFromTaskbar = g_mainWindowMinimized;
             if (wParam == SIZE_MINIMIZED) {
                 g_mainWindowMinimized = TRUE;
-                StopVisibilityTimer(hwnd);
-                KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
+                StopVisibilityTracking(hwnd);
+                StopMainHealthCheck();
                 UpdateJsVisibilityState(hwnd);
-                DeactivateMainWebView();
             } else if (IsWindowVisible(hwnd)) {
                 g_mainWindowMinimized = FALSE;
-                ActivateMainWebView();
+                SyncMainWebViewBounds();
+                QueueVisibilityCheck(g_jsVisibility != JS_VISIBILITY_SHOWN);
                 if (restoredFromTaskbar) {
                     // A restore through the taskbar bypasses ShowMainWindow,
                     // so resume the same visibility and health lifecycle here.
-                    StartVisibilityTimer(hwnd);
+                    StartVisibilityTracking(hwnd);
                     UpdateJsVisibilityState(hwnd);
                     g_healthHealed = FALSE;
                     ArmMainHealthCheck();
@@ -7703,11 +7917,33 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
             return 0;
         }
+
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) != WA_INACTIVE && IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
+                ActivateMainWebView();
+                StartVisibilityTracking(hwnd);
+                QueueVisibilityCheck(TRUE);
+                ArmMainHealthCheck();
+            }
+            break;
+
+        case WM_WINDOWPOSCHANGED:
+            if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
+                StartVisibilityTracking(hwnd);
+                QueueVisibilityCheck(g_jsVisibility != JS_VISIBILITY_SHOWN);
+            } else {
+                StopVisibilityTracking(hwnd);
+                StopMainHealthCheck();
+                UpdateJsVisibilityState(hwnd);
+            }
+            // DefWindowProc must still generate WM_SIZE and WM_MOVE.
+            break;
             
         case WM_DISPLAYCHANGE:
             DebugPrint(L"[INFO] Display change event received...\n");
             if (g_timerId) KillTimer(hwnd, g_timerId);
             g_timerId = SetTimer(hwnd, 1, RESOLUTION_CHANGE_DEBOUNCE_MS, NULL);
+            QueueVisibilityCheck(TRUE);
             return 0;
 
         case WM_DPICHANGED: {
@@ -7731,38 +7967,34 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 }
             } else if (wParam == ID_TIMER_INITIAL_HIDE_JS) {
                 KillTimer(hwnd, ID_TIMER_INITIAL_HIDE_JS);
-                // Initial JS sync. Occlusion polling is only useful while the
-                // window is shown (ShowMainWindow starts it): a hidden window
-                // cannot become visible on its own, so polling it would burn
-                // EnumWindows/DWM/WebView calls every tick forever.
+                StartVisibilityTracking(hwnd);
                 UpdateJsVisibilityState(hwnd);
-                if (IsWindowVisible(hwnd)) {
-                    StartVisibilityTimer(hwnd);
-                }
             } else if (wParam == ID_TIMER_VISIBILITY_CHECK) {
-                // Periodic check for window occlusion
-                UpdateJsVisibilityState(hwnd);
-                // Once the window is withdrawn only ShowMainWindow can bring
-                // it back, and that restarts the timer; stop polling until then.
-                if (!IsWindowVisible(hwnd)) {
-                    StopVisibilityTimer(hwnd);
+                // One shot, armed only by window events. No idle polling.
+                KillTimer(hwnd, ID_TIMER_VISIBILITY_CHECK);
+                if (g_visibilityCheckDelay) {
+                    g_visibilityCheckDelay = 0;
+                    UpdateJsVisibilityState(hwnd);
                 }
             } else if (wParam == ID_TIMER_WEBVIEW_PREWARM) {
                 KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
-                InterlockedExchange(&g_webViewPrewarmActive, FALSE);
-                if (IsWindowActuallyVisible(hwnd)) {
-                    ActivateMainWebView();
-                } else {
-                    DeactivateMainWebView();
+                if (g_webViewPrewarmActive) {
+                    ULONGLONG elapsed = GetTickCount64() - g_prewarmLastHoverTick;
+                    if (elapsed < WEBVIEW_PREWARM_MS && SetTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM,
+                            (UINT)(WEBVIEW_PREWARM_MS - elapsed), NULL)) return 0;
                 }
+                InterlockedExchange(&g_webViewPrewarmActive, FALSE);
+                UpdateJsVisibilityState(hwnd);
             } else if (wParam == ID_TIMER_WEBVIEW_PRELOAD) {
                 KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
-                // Initial preload has settled: suspend now if still hidden and
-                // not being kept warm by a tray-hover prewarm.
-                if (!IsWindowActuallyVisible(hwnd) &&
-                    InterlockedCompareExchange(&g_webViewPrewarmActive, TRUE, TRUE) != TRUE) {
-                    DeactivateMainWebView();
-                }
+                // KillTimer cannot remove a WM_TIMER already in the queue.
+                // An old navigation's timeout must not end a newer settle.
+                ULONGLONG now = GetTickCount64();
+                if (g_webViewSettlePending && now < g_preloadSettleDeadline &&
+                    SetTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD,
+                             (UINT)(g_preloadSettleDeadline - now), NULL)) return 0;
+                g_webViewSettlePending = FALSE;
+                UpdateJsVisibilityState(hwnd);
             } else if (wParam == ID_TIMER_URL_RESET) {
                 KillTimer(hwnd, ID_TIMER_URL_RESET);
                 // The window has stayed hidden past the grace period: put the
@@ -7772,69 +8004,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     ResetTargetPageInBackground();
                 }
             } else if (wParam == ID_TIMER_HEALTH_CHECK) {
-                // On-open health verification. Each tick first confirms the
-                // window is still up - closed/minimized/fully-covered windows
-                // end the check (a covered page legitimately stops producing
-                // frames, so there is nothing to measure).
-                if (!IsWindowVisible(hwnd) || IsIconic(hwnd) ||
-                    !IsWindowActuallyVisible(hwnd) ||
-                    ++g_healthTotalTicks > HEALTH_CHECK_LIFETIME_TICKS) {
-                    KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
-                } else if (!IsWebViewReady() || !g_webViewController) {
-                    // A rebuild is in flight; absence is not ill health. The
-                    // measurement restarts once the new WebView is up.
-                    g_healthTicks = 0;
-                    InterlockedExchange(&g_framePongSeen, FALSE);
-                } else {
-                    SendMainFrameProbe();
-                    g_healthTicks++;
-                    BOOL framesFlowing =
-                        InterlockedCompareExchange(&g_framePongSeen, TRUE, TRUE) == TRUE;
-                    BOOL unverified =
-                        InterlockedCompareExchange(&g_presentationUnverified, TRUE, TRUE) == TRUE;
-                    if (framesFlowing && !unverified) {
-                        // Frames are flowing and no power transition is in
-                        // question - verified, nothing further to prove.
-                        KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
-                    } else if (g_healthTicks >= HEALTH_CHECK_VERDICT_TICKS) {
-                        BOOL healthy = framesFlowing;
-                        if (healthy && unverified) {
-                            // Heartbeat passed, but this is the first look
-                            // since a power transition: also check that the
-                            // frames reach the screen. Only meaningful while
-                            // frontmost; otherwise accept the heartbeat and
-                            // keep the flag for the next open.
-                            if (GetForegroundWindow() == hwnd) {
-                                if (IsClientAreaUniformColor(hwnd)) {
-                                    healthy = FALSE;
-                                    DebugPrint(L"[WARNING] Container heartbeat OK but screen uniform after power resume\n");
-                                } else {
-                                    InterlockedExchange(&g_presentationUnverified, FALSE);
-                                }
-                            }
-                        }
-                        if (healthy) {
-                            KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
-                            DebugPrint(L"[INFO] Container verified healthy after open\n");
-                        } else if (!g_healthHealed) {
-                            // One heal per open: a full rebuild, the only
-                            // repair that covers every failure mode seen
-                            // after hibernate. The user just opened the
-                            // window, so bypass the burst limiter like any
-                            // manual tray action.
-                            g_healthHealed = TRUE;
-                            DebugPrint(L"[WARNING] Container unhealthy %d ms after open; rebuilding\n",
-                                       g_healthTicks * HEALTH_CHECK_INTERVAL_MS);
-                            g_rebuildBurstStartTick = 0;
-                            g_rebuildBurstCount = 0;
-                            HandleUnexpectedBrowserExit(hwnd);
-                            g_healthTicks = 0;
-                            InterlockedExchange(&g_framePongSeen, FALSE);
-                        } else {
-                            KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
-                            DebugPrint(L"[WARNING] Container still unhealthy after rebuild; waiting for next open\n");
-                        }
-                    }
+                ULONGLONG now = GetTickCount64();
+                if (g_healthCheckPending && now < g_healthCheckDeadline &&
+                    SetTimer(hwnd, ID_TIMER_HEALTH_CHECK,
+                             (UINT)(g_healthCheckDeadline - now), NULL)) return 0;
+                if (g_healthCheckPending) CheckMainWebViewHealth(hwnd);
+                else KillTimer(hwnd, ID_TIMER_HEALTH_CHECK);
+            } else if (wParam == ID_TIMER_WEBVIEW_RESUME_RETRY) {
+                KillTimer(hwnd, ID_TIMER_WEBVIEW_RESUME_RETRY);
+                if (g_webViewDesiredActive) {
+                    ResumeMainWebViewRuntime();
+                    SetMainWebViewControllerVisible(g_webViewDesiredVisible);
                 }
             } else if (wParam == ID_TIMER_POWER_RESUME) {
                 KillTimer(hwnd, ID_TIMER_POWER_RESUME);
@@ -7846,6 +8026,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             } else if (wParam == ID_TIMER_NAV_TITLE_WATCHDOG) {
                 KillTimer(hwnd, ID_TIMER_NAV_TITLE_WATCHDOG);
                 if (g_mainNavigationLoading) {
+                    ULONGLONG now = GetTickCount64();
+                    if (now < g_mainNavigationDeadline &&
+                        SetTimer(hwnd, ID_TIMER_NAV_TITLE_WATCHDOG,
+                                 (UINT)(g_mainNavigationDeadline - now), NULL)) return 0;
                     DebugPrint(L"[WARNING] Main navigation %I64u never completed; dropping loading title\n",
                                g_mainNavigationId);
                     g_mainNavigationLoading = FALSE;
@@ -7853,9 +8037,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     UpdateMainWindowTitle(hwnd);
                     // The in-flight navigation was also holding the page out
                     // of suspension; let the hidden-state policy settle now.
-                    if (!IsWindowActuallyVisible(hwnd)) {
-                        DeactivateMainWebView();
-                    }
+                    OnMainNavigationCompleted();
                 }
             } else if (wParam == ID_TIMER_AUTO_UPDATE) {
                 if (g_config.autoCheckForUpdates) StartUpdateCheck(TRUE);
@@ -7871,11 +8053,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 // the on-open health check.
                 InterlockedExchange(&g_powerResumePending, TRUE);
                 InterlockedExchange(&g_presentationUnverified, TRUE);
+                StopMainHealthCheck();
                 return TRUE;
             }
             if (wParam == PBT_APMQUERYSUSPENDFAILED) {
                 // The suspend was vetoed; there is nothing to recover from.
                 InterlockedExchange(&g_powerResumePending, FALSE);
+                UpdateJsVisibilityState(hwnd);
                 return TRUE;
             }
             if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND ||
@@ -7886,6 +8070,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 // first kick (see KickWebViewAfterPowerResume).
                 KillTimer(hwnd, ID_TIMER_POWER_RESUME);
                 KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
+                ++g_livenessRequestId;
+                g_controllerVisible = -1;
+                g_controllerBoundsKnown = FALSE;
                 InterlockedExchange(&g_webViewPingOutstanding, FALSE);
                 InterlockedExchange(&g_powerResumePending, TRUE);
                 InterlockedExchange(&g_presentationUnverified, TRUE);
@@ -7914,6 +8101,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
             
         case WM_DESTROY:
+            StopVisibilityTracking(hwnd);
+            StopMainHealthCheck();
+            ++g_suspendRequestId;
+            ++g_livenessRequestId;
+            KillTimer(hwnd, ID_TIMER_WEBVIEW_RESUME_RETRY);
             KillTimer(hwnd, ID_TIMER_WEBVIEW_PREWARM);
             KillTimer(hwnd, ID_TIMER_WEBVIEW_PRELOAD);
             KillTimer(hwnd, ID_TIMER_URL_RESET);
@@ -7927,7 +8119,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             
         case WM_APP_WEBVIEW_RECREATE:
             // The browser process died or stopped resuming; rebuild.
-            HandleUnexpectedBrowserExit(hwnd);
+            if ((UINT64)wParam == g_webViewGeneration) HandleUnexpectedBrowserExit(hwnd);
+            return 0;
+
+        case WM_APP_VISIBILITY_WAKE:
+            UpdateJsVisibilityState(hwnd);
             return 0;
 
         case WM_APP_HOST_ROUTE_CHANGED:
@@ -8318,7 +8514,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Cleanup. Close() the controller (as the rebuild paths do) so the
     // browser process shuts down and flushes its profile promptly instead of
     // waiting to notice the host process disappear.
-    if (g_hwnd) KillTimer(g_hwnd, ID_TIMER_AUTO_UPDATE);
+    if (g_hwnd) {
+        StopVisibilityTracking(g_hwnd);
+        StopMainHealthCheck();
+        KillTimer(g_hwnd, ID_TIMER_AUTO_UPDATE);
+    }
+    ++g_suspendRequestId;
+    ++g_livenessRequestId;
     if (g_updateCancelEvent) SetEvent(g_updateCancelEvent);
     DiscardUpdateTask((UpdateCheckTask*)InterlockedExchangePointer(
         (PVOID volatile*)&g_updatePostedResult, NULL));

@@ -816,8 +816,9 @@ export default function ConfigView({
             Sleep web container when inactive
           </Label>
           <p className="text-neutral-500 text-[11px] leading-snug">
-            Suspends the page to save CPU while the window is hidden. The page is
-            still preloaded at startup and wakes when you hover the tray icon.
+            Suspends the page while hidden, minimized, or fully covered. A
+            partially visible window stays awake. The page is preloaded at
+            startup and wakes when you hover the tray icon.
           </p>
         </div>
       </div>

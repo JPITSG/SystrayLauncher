@@ -16,8 +16,8 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 - **Lockdown Header** - Optionally stamp every request with a rolling, hour-keyed `X-Lockdown` token a gateway can require as an extra access layer
 - **Preloaded on Startup** - The page is loaded into the WebView at launch so it is ready the moment you open the window
 - **Hide Grace Period** - Re-opening within 60 seconds of hiding returns exactly where you left off; after that the page resets to the configured URL in the background, so the next open starts fresh with no visible reload
-- **Self-Healing Container** - Every time the window opens, the app verifies the embedded browser is actually rendering (frame heartbeat, plus a screen check after resume from sleep/hibernate) and automatically rebuilds it if it is not — no more permanently blank windows after hibernation
-- **Optional CPU Saving** - Opt-in "sleep when inactive" suspends the web container while hidden to save CPU on laptops, and pre-emptively wakes it when you hover the tray icon
+- **Self-Healing Container** - Checks for a frame after opening or waking, repairs composition after sleep/hibernate, and rebuilds an unresponsive foreground container after a bounded recovery attempt
+- **Optional CPU Saving** - Opt-in "sleep when inactive" suspends the web container while hidden, minimized, or fully covered. Partial exposure keeps it awake; Windows events detect uncovering without idle visibility polling. Tray hover prewarms a hidden page.
 - **Registry Storage** - Settings persist in Windows Registry (`HKCU\SOFTWARE\JPIT\SystrayLauncher`)
 - **Single Instance** - Only one instance can run at a time
 - **First-Launch Setup** - Configuration dialog appears automatically on first run
@@ -50,7 +50,7 @@ Settings available in the Configure dialog:
 | Allow listed HTTP origins on HTTPS pages | Lets an HTTPS page embed content from explicitly listed HTTP origins. Enter one origin per line (for example, `http://device.local:8080`). The option is disabled by default and restarts the launcher when changed. |
 | Send X-Lockdown header | Adds an `X-Lockdown` header to every request the embedded browser makes: the request's own User-Agent encrypted with a key derived from the current UTC hour and an optional shared secret (see [Lockdown Header](#lockdown-header)). Toggling applies immediately. Disabled by default. |
 | Open new windows in the default browser | When enabled, links that would open a new window or tab launch in the system default browser instead of a WebView2 popup. Only `http(s)` links are handed to the browser. Popups that must script back to the opening page (some login flows) may not work while enabled. Disabled by default. |
-| Sleep web container when inactive | When enabled, suspends the WebView to save CPU while the window is hidden, and pre-emptively wakes it on tray-icon hover. The page is always preloaded at startup regardless of this setting. Disabled by default. |
+| Sleep web container when inactive | Suspends the WebView while hidden, minimized, or fully covered, and wakes it on exposure or tray-icon hover. Partially visible windows stay awake. The page is always preloaded at startup. Disabled by default. |
 | Automatically check for updates | Checks at startup, whenever Configure opens, and every 60 minutes. A newer build opens Configure and its update prompt. Enabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (recovery attempts, web view rebuilds, power transitions) to `%LOCALAPPDATA%\SystrayLauncher\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
 
@@ -94,6 +94,29 @@ settings open. This checkbox starts unchecked for each confirmation and is not a
 saved preference; it does not apply to cancelled or failed updates. Cancelling
 the download, result dialog, or UAC prompt leaves the current version running. File size is used only to validate the download and enforce
 its safety limit.
+
+## Sleep and Visibility
+
+Sleep requires the entire window to be hidden, minimized, or covered. Merely
+losing keyboard focus does not suspend it. Transparent, shaped, or otherwise
+uncertain covering windows keep the page awake. If Windows event observation
+is unavailable, suspension is limited to hidden or minimized windows.
+
+Visibility checks are triggered by Windows events. Changes affecting an awake
+window share a single 10-second check; possible exposure of a sleeping window
+shares a 50 ms check. Focusing or restoring the window wakes it directly.
+There is no repeating visibility timer. Window hooks are removed while hidden
+or minimized, and when neither sleep nor visibility JavaScript hooks are used.
+
+Startup and background navigation finish loading and get 1.5 seconds to settle
+before sleeping. Tray hover keeps a hidden page warm until 60 seconds after the
+last hover. The separate 60-second URL reset leaves an already-correct page
+asleep. Health verification uses one frame request and one deadline per
+attempt; it waits for navigation and tries composition repair before rebuilding.
+A plain-colored page alone never causes a reload.
+
+See the [sleep audit and Windows validation matrix](docs/sleep-audit.md) for
+failure cases, automated coverage, and runtime validation limits.
 
 ## Static Host Mappings
 
