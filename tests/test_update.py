@@ -26,7 +26,7 @@ def function(name):
 
 
 class UpdateTests(unittest.TestCase):
-    def test_native_speed_and_relaunch(self):
+    def test_native_progress_and_relaunch(self):
         # Compile the actual functions with process/cleanup APIs mocked. Windows
         # wide printf uses %s where the host libc uses %ls; adapt only that API.
         prelude = r'''
@@ -46,7 +46,6 @@ typedef void *HANDLE;
 typedef void *LPVOID;
 #define TRUE 1
 #define FALSE 0
-#define MAXLONG INT32_MAX
 #define MAX_PATH 260
 #define ERROR_INVALID_PARAMETER 87
 #define ERROR_INSUFFICIENT_BUFFER 122
@@ -129,16 +128,17 @@ static void setCommand(LPCWSTR line) {
 '''
         main = r'''
 int main(void) {
-    assert(CalculateUpdateSpeedKbps(25600,250) == 100);
-    assert(CalculateUpdateSpeedKbps(25727,250) == 100);
-    assert(CalculateUpdateSpeedKbps(25728,250) == 101);
-    assert(CalculateUpdateSpeedKbps(1,1000) == 0);
-    assert(CalculateUpdateSpeedKbps(0,250) == 0);
-    assert(CalculateUpdateSpeedKbps(100,0) == 0);
-    assert(CalculateUpdateSpeedKbps(102400,1000) == 100);
-    assert(CalculateUpdateSpeedKbps(102400,2000) == 50);
-    assert(CalculateUpdateSpeedKbps(100ULL*1024*1024,250) == 409600);
-    assert(CalculateUpdateSpeedKbps(1ULL<<40,1) == MAXLONG);
+    assert(CalculateUpdateProgressPercent(0,1000) == 0);
+    assert(CalculateUpdateProgressPercent(9,1000) == 0);
+    assert(CalculateUpdateProgressPercent(10,1000) == 1);
+    assert(CalculateUpdateProgressPercent(1,3) == 33);
+    assert(CalculateUpdateProgressPercent(2,3) == 66);
+    assert(CalculateUpdateProgressPercent(999,1000) == 99);
+    assert(CalculateUpdateProgressPercent(1000,1000) == 100);
+    assert(CalculateUpdateProgressPercent(2000,1000) == 100);
+    assert(CalculateUpdateProgressPercent(5,0) == 0);
+    assert(CalculateUpdateProgressPercent(100ULL*1024*1024-1,100ULL*1024*1024) == 99);
+    assert(CalculateUpdateProgressPercent(100ULL*1024*1024,100ULL*1024*1024) == 100);
     for (int success = 0; success <= 1; ++success) {
         for (int choice = 0; choice <= 1; ++choice) {
             for (int token = 0; token <= 1; ++token) {
@@ -186,10 +186,10 @@ int main(void) {
     }
     tokenSucceeds = processSucceeds = FALSE;
     assert(!LaunchUpdateTarget(L"target",L"staged",L"helper",20,10,NULL,TRUE,TRUE));
-    puts("Native speed, handoff, token fallback, failure and unrelated-launch checks passed");
+    puts("Native progress, handoff, token fallback, failure and unrelated-launch checks passed");
 }
 '''
-        names = ['CalculateUpdateSpeedKbps', 'ParseUpdateProcessId',
+        names = ['CalculateUpdateProgressPercent', 'ParseUpdateProcessId',
                  'LaunchUpdateTarget', 'HandleUpdateCommandLine']
         with tempfile.TemporaryDirectory(prefix='systray-update-tests-') as tmp:
             source = pathlib.Path(tmp) / 'test.c'
@@ -207,10 +207,13 @@ int main(void) {
         self.assertIn('launchToken, FALSE, FALSE)', function('RestartAfterUpdateFailure'))
         self.assertIn('if (updateCompleted && reopenSettings)', SOURCE)
         download = function('DownloadUpdateFile')
-        self.assertIn('GetTickCount64()', download)
-        self.assertIn('speedWindowBytes += bytesRead', download)
-        self.assertIn('elapsed >= UPDATE_PROGRESS_INTERVAL_MS', download)
+        # 0% once the body transfer starts, then only when the percentage changes.
+        self.assertIn('PublishUpdateProgress(task, publishedPercent);\n    BYTE buffer', download)
+        self.assertIn('CalculateUpdateProgressPercent(totalWritten, expectedSize)', download)
+        self.assertIn('if (percent != publishedPercent)', download)
         self.assertIn('InterlockedCompareExchange(&g_updateProgressPosted, TRUE, FALSE)', function('PublishUpdateProgress'))
+        self.assertIn('g_configViewReady && percent >= 0', function('CfgSendCurrentUpdateProgress'))
+        self.assertIn('CfgSendCurrentUpdateProgress();', function('CfgMsgReceived_Invoke'))
 
 
 if __name__ == '__main__':

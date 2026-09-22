@@ -79,9 +79,9 @@ ignored version. Checks use the repository's
 
 The update check downloads the executable to the user's temporary directory
 and compares its embedded Windows file version with the running executable's
-version. While downloading, the button displays
-the current transfer speed rounded to whole kilobytes per second, such as
-**Checking (100kb/s)...**, and can be clicked again to stop the check and
+version. While downloading, the button displays how much of the download has
+completed, rounded down to a whole percentage, such as
+**Checking (42%)...**, and can be clicked again to stop the check and
 remove the partial download. The result dialog displays both version numbers.
 A newer build can be installed normally, while a matching build offers a
 **Force update** action to reinstall it; an older repository build is never
@@ -289,7 +289,7 @@ make
 ## Update regression checks
 
 On Linux, `python3 -m unittest discover -s tests -p test_update.py -v` runs
-native speed and updater handoff checks using a host C compiler and mocked
+native progress and updater handoff checks using a host C compiler and mocked
 Windows APIs. After building, `python3 -m unittest discover -s tests -p test_update_ui.py -v` exercises the configuration modal with Python Playwright
 and Chromium (set `CHROMIUM_EXECUTABLE` to use a custom browser).
 These checks do not perform a real update or replace Windows runtime testing.

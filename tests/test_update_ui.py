@@ -59,16 +59,16 @@ class UpdateUiTests(unittest.TestCase):
         return self.page.evaluate(
             'action => window.messages.filter(m => m.action === action).at(-1)', action)
 
-    def test_speed_style_and_cancellation(self):
+    def test_progress_style_and_cancellation(self):
         self.page.get_by_role('button', name='Update', exact=True).click()
         button = self.page.get_by_role('button', name='Stop update check and download')
         expect(button).to_have_text('Checking...')
         expect(button).to_have_class(re.compile('bg-red-600'))
-        for speed, expected in [(100, 100), (100.49, 100), (100.5, 101),
-                                (12345, 12345), (0, 0)]:
-            self.page.evaluate('speed => window.onUpdateProgress({kilobytesPerSecond: speed})', speed)
-            expect(button).to_have_text(f'Checking ({expected}kb/s)...')
-            expect(button).to_be_enabled()  # Existing click-to-cancel behavior.
+        for percent, expected in [(0, 0), (7, 7), (42.9, 42), (100, 100),
+                                  (150, 100), (-5, 0)]:
+            self.page.evaluate('percent => window.onUpdateProgress({percent})', percent)
+            expect(button).to_have_text(f'Checking ({expected}%)...')
+            expect(button).to_be_enabled()  # Clicking again stops the download.
         button.click()
         expect(button).to_have_text('Stopping...')
         expect(button).to_be_disabled()
