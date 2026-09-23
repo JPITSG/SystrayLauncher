@@ -36,8 +36,8 @@ Right-click the tray icon to access:
 ## Configuration
 
 Settings available in the Configure dialog. The dialog sizes itself to its
-content and cannot be resized or maximized; the main window stays freely
-resizable.
+content, cannot be resized, and has only a Close button; the main window keeps
+its usual title bar buttons and stays freely resizable.
 
 | Setting | Description |
 |---------|-------------|
@@ -298,9 +298,9 @@ Windows APIs. After building, `python3 -m unittest discover -s tests -p test_upd
 and Chromium (set `CHROMIUM_EXECUTABLE` to use a custom browser).
 `python3 -m unittest discover -s tests -p test_fixed_frame.py -v` compiles the
 configuration dialog's fixed-size frame handling against stubbed window calls
-(edge and corner drags, the Size and Maximize commands, and the track size that
-also stops Snap) and checks that every place the app sizes the dialog pins the
-size first.
+(the Close-only title bar and system menu, edge and corner drags, the Size and
+Maximize commands, and the track size that also stops Snap) and checks that
+every place the app sizes the dialog pins the size first.
 These checks do not perform a real update or replace Windows runtime testing.
 
 ## License
