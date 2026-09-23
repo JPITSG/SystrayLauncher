@@ -35,7 +35,9 @@ Right-click the tray icon to access:
 
 ## Configuration
 
-Settings available in the Configure dialog:
+Settings available in the Configure dialog. The dialog sizes itself to its
+content and cannot be resized or maximized; the main window stays freely
+resizable.
 
 | Setting | Description |
 |---------|-------------|
@@ -294,6 +296,11 @@ On Linux, `python3 -m unittest discover -s tests -p test_update.py -v` runs
 native progress and updater handoff checks using a host C compiler and mocked
 Windows APIs. After building, `python3 -m unittest discover -s tests -p test_update_ui.py -v` exercises the configuration modal with Python Playwright
 and Chromium (set `CHROMIUM_EXECUTABLE` to use a custom browser).
+`python3 -m unittest discover -s tests -p test_fixed_frame.py -v` compiles the
+configuration dialog's fixed-size frame handling against stubbed window calls
+(edge and corner drags, the Size and Maximize commands, and the track size that
+also stops Snap) and checks that every place the app sizes the dialog pins the
+size first.
 These checks do not perform a real update or replace Windows runtime testing.
 
 ## License

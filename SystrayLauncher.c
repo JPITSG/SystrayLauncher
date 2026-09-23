@@ -330,6 +330,7 @@ static ICoreWebView2Controller* g_cfgController = NULL;
 static ICoreWebView2* g_cfgWebView = NULL;
 static BOOL g_cfgSaved = FALSE;
 static BOOL g_cfgWindowShown = FALSE;
+static SIZE g_cfgFrameSize = {0, 0};
 static BOOL g_configViewReady = FALSE;
 static BOOL g_updateConfirmationPending = FALSE;
 static int g_cfgShowFallbackTries = 0;
@@ -3272,6 +3273,85 @@ static void cfg_sync_controller_bounds(void) {
     g_cfgController->lpVtbl->put_IsVisible(g_cfgController, TRUE);
 }
 
+// --- Fixed-size dialog frame -----------------------------------------------
+
+// The dialog keeps the standard overlapped frame, so Windows draws the
+// normal caption height, but only the app sizes it (to fit the page's
+// content); the user cannot. Edge and corner hits become caption or border
+// hits, Size and Maximize leave the system menu and are refused as commands,
+// and the track size is pinned to the size the app last chose, which also
+// keeps Aero Snap and the taskbar's window arrangements from stretching it.
+// Every size the app gives the window goes through FixedFrameSetPos.
+#define FIXED_FRAME_STYLE (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX)
+
+// Runs first in the dialog's window procedure; returns TRUE with *result
+// set for a message it answered.
+static BOOL FixedFrameMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                              SIZE *size, LRESULT *result) {
+    switch (msg) {
+        case WM_NCHITTEST:
+            *result = DefWindowProcW(hwnd, msg, wParam, lParam);
+            switch (*result) {
+                case HTTOP: case HTTOPLEFT: case HTTOPRIGHT:
+                    *result = HTCAPTION;
+                    break;
+                case HTLEFT: case HTRIGHT: case HTBOTTOM:
+                case HTBOTTOMLEFT: case HTBOTTOMRIGHT:
+                    *result = HTBORDER;
+                    break;
+            }
+            return TRUE;
+
+        case WM_SYSCOMMAND:
+            if ((wParam & 0xFFF0) != SC_SIZE && (wParam & 0xFFF0) != SC_MAXIMIZE) {
+                return FALSE;
+            }
+            *result = 0;
+            return TRUE;
+
+        case WM_GETMINMAXINFO: {
+            if (size->cx <= 0 || size->cy <= 0) return FALSE;
+            MINMAXINFO *info = (MINMAXINFO *)lParam;
+            if (info->ptMinTrackSize.x < size->cx) info->ptMinTrackSize.x = size->cx;
+            if (info->ptMinTrackSize.y < size->cy) info->ptMinTrackSize.y = size->cy;
+            info->ptMaxTrackSize = info->ptMinTrackSize;
+            *result = 0;
+            return TRUE;
+        }
+
+        case WM_NCDESTROY:
+            size->cx = size->cy = 0;
+            return FALSE;
+    }
+    return FALSE;
+}
+
+// Called once CreateWindowExW has returned: pins the size it gave the
+// window and takes Size and Maximize out of the system menu.
+static void FixedFrameInit(HWND hwnd, SIZE *size) {
+    RECT rect;
+    if (GetWindowRect(hwnd, &rect)) {
+        size->cx = rect.right - rect.left;
+        size->cy = rect.bottom - rect.top;
+    }
+    HMENU menu = GetSystemMenu(hwnd, FALSE);
+    if (menu) {
+        DeleteMenu(menu, SC_SIZE, MF_BYCOMMAND);
+        DeleteMenu(menu, SC_MAXIMIZE, MF_BYCOMMAND);
+    }
+}
+
+// SetWindowPos for the app's own sizing: the new size is pinned first, so
+// the track limits admit exactly it.
+static BOOL FixedFrameSetPos(HWND hwnd, SIZE *size, int x, int y, int width,
+                             int height, UINT flags) {
+    if (!(flags & SWP_NOSIZE)) {
+        size->cx = width;
+        size->cy = height;
+    }
+    return SetWindowPos(hwnd, NULL, x, y, width, height, flags);
+}
+
 static void webview_push_init_config(void) {
     wchar_t eUrl[4096], eTitle[512], eMailtoTargetUrl[4096];
     wchar_t eHide[8192], eShow[8192], eInsecureOrigins[4096];
@@ -3779,7 +3859,7 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
                 flags |= SWP_SHOWWINDOW;
                 KillTimer(g_cfgHwnd, ID_TIMER_CFG_SHOW_FALLBACK);
             }
-            SetWindowPos(g_cfgHwnd, NULL, posX, posY, windowW, newWindowH, flags);
+            FixedFrameSetPos(g_cfgHwnd, &g_cfgFrameSize, posX, posY, windowW, newWindowH, flags);
             g_cfgWindowShown = TRUE;
             cfg_sync_controller_bounds();
         }
@@ -3791,6 +3871,10 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
 
 // Config dialog window procedure
 static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    LRESULT frameResult;
+    if (FixedFrameMessage(hwnd, msg, wParam, lParam, &g_cfgFrameSize, &frameResult)) {
+        return frameResult;
+    }
     switch (msg) {
         case WM_APP_UPDATE_PROGRESS:
             InterlockedExchange(&g_updateProgressPosted, FALSE);
@@ -3810,10 +3894,10 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         case WM_DPICHANGED: {
             const RECT* suggested = (const RECT*)lParam;
-            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
-                         suggested->right - suggested->left,
-                         suggested->bottom - suggested->top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
+            FixedFrameSetPos(hwnd, &g_cfgFrameSize, suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         }
 
@@ -3931,15 +4015,17 @@ static void ShowConfigWebViewDialog(void) {
     int posX = workArea.left + ((workArea.right - workArea.left) - width) / 2;
     int posY = workArea.top + ((workArea.bottom - workArea.top) - height) / 2;
 
-    // Same frame styles as the main window so both get identical caption
-    // rendering; the fixed dialog frame used before drew a more compact
-    // title bar that looked out of place next to the main window.
+    // The main window's frame (without Maximize) so both get identical
+    // caption rendering; the fixed dialog frame used before drew a more
+    // compact title bar that looked out of place next to the main window.
+    // FixedFrameMessage keeps the user from resizing it instead.
     g_cfgHwnd = CreateWindowExW(0, L"SystrayLauncherCfgWnd", L"Configuration",
-        WS_OVERLAPPEDWINDOW,
+        FIXED_FRAME_STYLE,
         posX, posY, width, height,
         NULL, NULL, g_hInstance, NULL);
 
     if (!g_cfgHwnd) return;
+    FixedFrameInit(g_cfgHwnd, &g_cfgFrameSize);
     g_cfgWindowShown = FALSE;
     g_configViewReady = FALSE;
     g_cfgShowFallbackTries = 0;
