@@ -20,6 +20,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 - **Optional CPU Saving** - Opt-in "sleep when inactive" suspends the web container while hidden, minimized, or fully covered. Partial exposure keeps it awake; Windows events detect uncovering without idle visibility polling. Tray hover prewarms a hidden page.
 - **Registry Storage** - Settings persist in Windows Registry (`HKCU\SOFTWARE\JPIT\SystrayLauncher`)
 - **Single Instance** - Only one instance can run at a time
+- **Start with Windows** - Optionally launch in the tray when you sign in to Windows (per user, no administrator rights needed)
 - **First-Launch Setup** - Configuration dialog appears automatically on first run
 
 ## Context Menu Options
@@ -51,6 +52,7 @@ Settings available in the Configure dialog:
 | Send X-Lockdown header | Adds an `X-Lockdown` header to every request the embedded browser makes: the request's own User-Agent encrypted with a key derived from the current UTC hour and an optional shared secret (see [Lockdown Header](#lockdown-header)). Toggling applies immediately. Disabled by default. |
 | Open new windows in the default browser | When enabled, links that would open a new window or tab launch in the system default browser instead of a WebView2 popup. Only `http(s)` links are handed to the browser. Popups that must script back to the opening page (some login flows) may not work while enabled. Disabled by default. |
 | Sleep web container when inactive | Suspends the WebView while hidden, minimized, or fully covered, and wakes it on exposure or tray-icon hover. Partially visible windows stay awake. The page is always preloaded at startup. Disabled by default. |
+| Start with Windows | Launches in the tray when you sign in to Windows by adding a per-user `SystrayLauncher` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; no administrator rights are needed. An entry disabled in Task Manager's startup apps shows as off, and turning the option on re-enables it. Disabled by default. |
 | Automatically check for updates | Checks at startup, whenever Configure opens, and every 60 minutes. A newer build opens Configure and its update prompt. Enabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (recovery attempts, web view rebuilds, power transitions) to `%LOCALAPPDATA%\SystrayLauncher\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
 

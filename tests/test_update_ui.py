@@ -145,6 +145,25 @@ class UpdateUiTests(unittest.TestCase):
             'Fall back to standard DNS when all mapped addresses are unreachable', exact=True)
         ).not_to_be_checked()
 
+    def test_start_with_windows_placement_and_save(self):
+        toggle = self.page.get_by_label('Start with Windows', exact=True)
+        expect(toggle).not_to_be_checked()
+        expect(self.page.get_by_text(
+            'Launches in the tray when you sign in to Windows.', exact=True)).to_be_visible()
+        ids = self.page.evaluate(
+            "() => [...document.querySelectorAll('input[type=checkbox]')].map(e => e.id)")
+        self.assertEqual(ids[ids.index('startWithWindows') + 1], 'autoCheckForUpdates')
+        for checked in [True, False]:
+            toggle.set_checked(checked)
+            self.page.get_by_role('button', name='Save', exact=True).click()
+            self.assertIs(self.last_message('saveSettings')['startWithWindows'], checked)
+        # Reopening reflects the Windows state reported by the host.
+        saved = dict(self.last_message('saveSettings'), startWithWindows=True)
+        self.page.evaluate('window.onInit(null)')
+        expect(toggle).to_have_count(0)
+        self.page.evaluate('config => window.onInit({config, webView2Version: "test"})', saved)
+        expect(toggle).to_be_checked()
+
     def test_static_hosts_still_reject_invalid_entries(self):
         self.page.get_by_label('Resolve listed hostnames to static IP addresses', exact=True).check()
         mappings = self.page.get_by_label('Static host mappings', exact=True)

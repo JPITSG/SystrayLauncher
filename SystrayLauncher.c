@@ -106,6 +106,11 @@
 #define REG_APPLICATION_PATH \
     L"Software\\Classes\\Applications\\SystrayLauncher.exe"
 
+// Per-user sign-in launch entry, named APP_NAME in both keys.
+#define REG_STARTUP_RUN_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define REG_STARTUP_APPROVED_RUN_PATH \
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
+
 #define ID_TIMER_INITIAL_HIDE_JS 2
 #define INITIAL_HIDE_JS_DELAY_MS 2000
 #define ID_TIMER_VISIBILITY_CHECK 3
@@ -506,6 +511,8 @@ static void MarkAsConfigured(void);
 static void ApplyConfiguration(void);
 static BOOL IsValidHttpNavigationUrl(const wchar_t* url);
 static BOOL SetMailtoHandlerRegistration(BOOL enabled);
+static BOOL IsStartWithWindowsEnabled(void);
+static BOOL SetStartWithWindows(BOOL enabled);
 static MailtoDefaultAppsOpenResult OpenMailtoDefaultAppsSettings(void);
 static BOOL IsMailtoProtocolInvocation(void);
 static BOOL ForwardMailtoActivationToRunningInstance(void);
@@ -1169,6 +1176,13 @@ static BOOL DeleteRegistryTreeIfPresent(HKEY root, const wchar_t* subkey) {
            result == ERROR_PATH_NOT_FOUND;
 }
 
+static BOOL DeleteRegistryValueIfPresent(HKEY root, const wchar_t* subkey,
+                                         const wchar_t* valueName) {
+    LONG result = RegDeleteKeyValueW(root, subkey, valueName);
+    return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND ||
+           result == ERROR_PATH_NOT_FOUND;
+}
+
 static BOOL RemoveMailtoHandlerRegistration(void) {
     BOOL success = TRUE;
     HKEY registeredApps = NULL;
@@ -1319,6 +1333,56 @@ static BOOL SetMailtoHandlerRegistration(BOOL enabled) {
 
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
     return TRUE;
+}
+
+// A per-user Run entry launches this executable at sign-in. Task Manager and
+// Settings can disable that entry without deleting it (odd first byte of its
+// StartupApproved value), so a disabled entry counts as off.
+static BOOL GetStartupCommand(wchar_t* command, size_t commandCch) {
+    wchar_t path[MAX_PATH];
+    DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return FALSE;
+    return swprintf_s(command, commandCch, L"\"%s\"", path) > 0;
+}
+
+static BOOL IsStartWithWindowsEnabled(void) {
+    wchar_t expected[MAX_PATH + 2];
+    wchar_t actual[MAX_PATH + 2];
+    DWORD size = sizeof(actual);
+    if (!GetStartupCommand(expected, sizeof(expected) / sizeof(expected[0])) ||
+        RegGetValueW(HKEY_CURRENT_USER, REG_STARTUP_RUN_PATH, APP_NAME,
+                     RRF_RT_REG_SZ, NULL, actual, &size) != ERROR_SUCCESS ||
+        _wcsicmp(actual, expected) != 0) {
+        return FALSE;
+    }
+
+    BYTE approved[64];
+    size = sizeof(approved);
+    if (RegGetValueW(HKEY_CURRENT_USER, REG_STARTUP_APPROVED_RUN_PATH, APP_NAME,
+                     RRF_RT_REG_BINARY, NULL, approved, &size) != ERROR_SUCCESS ||
+        size == 0) {
+        return TRUE;  // No marker means enabled.
+    }
+    return (approved[0] & 1) == 0;
+}
+
+static BOOL SetStartWithWindows(BOOL enabled) {
+    if (enabled) {
+        wchar_t command[MAX_PATH + 2];
+        if (!GetStartupCommand(command, sizeof(command) / sizeof(command[0])) ||
+            !SetRegistryString(HKEY_CURRENT_USER, REG_STARTUP_RUN_PATH,
+                               APP_NAME, command)) {
+            return FALSE;
+        }
+    } else if (!DeleteRegistryValueIfPresent(HKEY_CURRENT_USER,
+                                             REG_STARTUP_RUN_PATH, APP_NAME)) {
+        return FALSE;
+    }
+
+    // Drop any disabled marker so turning the option on takes effect and
+    // turning it off leaves nothing behind.
+    return DeleteRegistryValueIfPresent(HKEY_CURRENT_USER,
+                                        REG_STARTUP_APPROVED_RUN_PATH, APP_NAME);
 }
 
 static MailtoDefaultAppsOpenResult OpenMailtoDefaultAppsSettings(void) {
@@ -3233,7 +3297,7 @@ static void webview_push_init_config(void) {
     wchar_t* script = (wchar_t*)malloc(scriptCch * sizeof(wchar_t));
     if (!script) return;
     int written = swprintf(script, scriptCch,
-        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"startMaximized\":%s,\"returnToTargetOnDoubleClick\":%s,\"showInTaskbar\":%s,\"handleMailtoLinks\":%s,\"mailtoTargetUrl\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"staticHostDnsFallback\":%s,\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
+        L"window.onInit({\"config\":{\"url\":\"%s\",\"windowTitle\":\"%s\",\"startMaximized\":%s,\"returnToTargetOnDoubleClick\":%s,\"showInTaskbar\":%s,\"handleMailtoLinks\":%s,\"mailtoTargetUrl\":\"%s\",\"onHideJs\":\"%s\",\"onShowJs\":\"%s\",\"sleepWhenInactive\":%s,\"openNewWindowsExternally\":%s,\"allowRunningInsecureContent\":%s,\"insecureContentOrigins\":\"%s\",\"useStaticHostMappings\":%s,\"staticHostMappings\":\"%s\",\"staticHostDnsFallback\":%s,\"lockdownHeader\":%s,\"lockdownSecret\":\"%s\",\"startWithWindows\":%s,\"autoCheckForUpdates\":%s,\"updateCheckPending\":%s,\"updatePromptPending\":%s,\"debugLog\":%s},\"webView2Version\":\"%s\",\"updateCompletedVersion\":\"%s\"})",
         eUrl, eTitle, g_config.startMaximized ? L"true" : L"false",
         g_config.returnToTargetOnDoubleClick ? L"true" : L"false",
         g_config.showInTaskbar ? L"true" : L"false",
@@ -3248,6 +3312,7 @@ static void webview_push_init_config(void) {
         g_config.staticHostDnsFallback ? L"true" : L"false",
         g_config.lockdownHeader ? L"true" : L"false",
         eLockdownSecret,
+        IsStartWithWindowsEnabled() ? L"true" : L"false",
         g_config.autoCheckForUpdates ? L"true" : L"false",
         (InterlockedCompareExchange(&g_updateCheckPending,
                                     FALSE, FALSE) == TRUE ||
@@ -3569,6 +3634,25 @@ static HRESULT STDMETHODCALLTYPE CfgMsgReceived_Invoke(
             SetMailtoHandlerRegistration(g_config.handleMailtoLinks);
         MarkAsConfigured();
         ApplyConfiguration();
+
+        // Only a changed toggle touches the Run entry, so an entry for another
+        // copy of the executable is left alone unless the user turns this on.
+        BOOL startWithWindowsEnabled = IsStartWithWindowsEnabled();
+        BOOL startWithWindows =
+            json_get_bool(msg, "startWithWindows", startWithWindowsEnabled);
+        if (startWithWindows != startWithWindowsEnabled &&
+            !SetStartWithWindows(startWithWindows)) {
+            DebugPrint(L"[WARNING] Could not %s start with Windows\n",
+                       startWithWindows ? L"enable" : L"disable");
+            MessageBoxW(
+                g_cfgHwnd,
+                startWithWindows
+                    ? L"The settings were saved, but SystrayLauncher could not "
+                      L"be set to start with Windows. Please try again."
+                    : L"The settings were saved, but SystrayLauncher could not "
+                      L"be removed from Windows startup. Please try again.",
+                APP_NAME, MB_OK | MB_ICONWARNING);
+        }
 
         g_cfgSaved = TRUE;
         PostMessage(g_cfgHwnd, WM_CLOSE, 0, 0);

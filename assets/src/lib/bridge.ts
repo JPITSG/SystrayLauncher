@@ -17,6 +17,7 @@ export interface ConfigData {
   staticHostDnsFallback: boolean;
   lockdownHeader: boolean;
   lockdownSecret: string;
+  startWithWindows: boolean;
   autoCheckForUpdates: boolean;
   updateCheckPending: boolean;
   updatePromptPending: boolean;
@@ -115,6 +116,7 @@ export function saveSettings(config: ConfigData) {
       staticHostDnsFallback: config.staticHostDnsFallback,
       lockdownHeader: config.lockdownHeader,
       lockdownSecret: config.lockdownSecret,
+      startWithWindows: config.startWithWindows,
       autoCheckForUpdates: config.autoCheckForUpdates,
       debugLog: config.debugLog,
     })
