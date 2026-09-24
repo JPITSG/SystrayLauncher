@@ -13,6 +13,23 @@ from playwright.sync_api import sync_playwright, expect
 
 ROOT = Path(__file__).resolve().parents[1]
 
+FULL_CONFIG = {
+    'url': 'https://example.com', 'windowTitle': 'Test',
+    'startMaximized': False, 'returnToTargetOnDoubleClick': True,
+    'showInTaskbar': False, 'handleMailtoLinks': True,
+    'mailtoTargetUrl': 'https://example.com/mail',
+    'onHideJs': 'pause();', 'onShowJs': 'resume();',
+    'sleepWhenInactive': False, 'openNewWindowsExternally': False,
+    'allowRunningInsecureContent': True,
+    'insecureContentOrigins': 'http://example.com,http://other.test',
+    'useStaticHostMappings': True,
+    'staticHostMappings': 'example.com:127.0.0.1,example.com:127.0.0.2',
+    'staticHostDnsFallback': False, 'lockdownHeader': True,
+    'lockdownSecret': 'test-secret', 'startWithWindows': False,
+    'autoCheckForUpdates': False, 'debugLog': False,
+    'updateCheckPending': False, 'updatePromptPending': False,
+}
+
 
 class UpdateUiTests(unittest.TestCase):
     @classmethod
@@ -30,6 +47,8 @@ class UpdateUiTests(unittest.TestCase):
 
     def setUp(self):
         self.page = self.browser.new_page(viewport={'width': 900, 'height': 1000})
+        self.errors = []
+        self.page.on('pageerror', lambda error: self.errors.append(str(error)))
         self.page.add_init_script('''
             window.messages = [];
             window.chrome = { webview: { postMessage(message) {
@@ -47,6 +66,35 @@ class UpdateUiTests(unittest.TestCase):
 
     def tearDown(self):
         self.page.close()
+        self.assertEqual(self.errors, [])
+
+    def reset_config(self, config=None):
+        if config is None:
+            self.page.reload()
+        else:
+            self.page.evaluate('window.onInit(null)')
+            expect(self.page.locator('#windowTitle')).to_have_count(0)
+            self.page.evaluate('''config => {
+                window.messages = [];
+                window.onInit({config, webView2Version: 'test', updateCompletedVersion: ''});
+            }''', config)
+        self.page.wait_for_function("window.messages.some(m => m.action === 'configReady')")
+
+    def close_actions(self):
+        return self.page.evaluate(
+            "window.messages.filter(m => ['close', 'saveSettings'].includes(m.action))")
+
+    def request_native_close(self):
+        self.page.evaluate('window.onCloseRequested()')
+
+    def expect_close_prompt(self):
+        dialog = self.page.get_by_role('alertdialog', name='Unsaved changes')
+        expect(dialog).to_be_visible()
+        expect(dialog.get_by_text('Save changes before closing?', exact=True)).to_be_visible()
+        expect(self.page.get_by_role('alertdialog')).to_have_count(1)
+        self.assertTrue(self.page.locator('#windowTitle').evaluate("el => !!el.closest('[inert]')"))
+        self.assertEqual(self.close_actions(), [])
+        return dialog
 
     def result(self, status='newer', automatic=False):
         self.page.evaluate('result => window.onUpdateResult(result)', {
@@ -173,6 +221,169 @@ class UpdateUiTests(unittest.TestCase):
             self.page.get_by_role('button', name='Save', exact=True).click()
             self.assertIsNone(self.last_message('saveSettings'))
             expect(mappings).to_have_class(re.compile('border-red-500'))
+
+    def test_unchanged_config_closes_without_prompt(self):
+        # Defaulted fields and comma-separated lists must not look edited on load.
+        for config in [None, FULL_CONFIG]:
+            for route in ['Cancel', 'native', 'Escape']:
+                with self.subTest(config=config, route=route):
+                    self.reset_config(config)
+                    if route == 'native':
+                        self.request_native_close()
+                    elif route == 'Escape':
+                        self.page.keyboard.press('Escape')
+                    else:
+                        self.page.get_by_role('button', name='Cancel', exact=True).click()
+                    self.assertEqual(self.close_actions(), [{'action': 'close'}])
+                    expect(self.page.get_by_role('alertdialog')).to_have_count(0)
+
+    def test_every_setting_guards_close_and_reverting_clears_changes(self):
+        for field, value in FULL_CONFIG.items():
+            if field in ['updateCheckPending', 'updatePromptPending']:
+                continue
+            with self.subTest(field=field):
+                self.reset_config(FULL_CONFIG)
+                control = self.page.locator('#' + field)
+                if isinstance(value, bool):
+                    control.set_checked(not value)
+                else:
+                    control.fill('changed')
+                self.request_native_close()
+                self.expect_close_prompt()
+                self.request_native_close()  # Repeated X must not force a close.
+                dialog = self.expect_close_prompt()
+                dialog.get_by_role('button', name='Keep editing', exact=True).click()
+                expect(self.page.get_by_role('alertdialog')).to_have_count(0)
+                self.assertEqual(self.close_actions(), [])
+                if isinstance(value, bool):
+                    expect(control).to_be_checked(checked=not value)
+                    control.set_checked(value)
+                else:
+                    expect(control).to_have_value('changed')
+                    control.fill(value.replace(',', '\n') if field in [
+                        'insecureContentOrigins', 'staticHostMappings'] else value)
+                self.page.get_by_role('button', name='Cancel', exact=True).click()
+                self.assertEqual(self.close_actions(), [{'action': 'close'}])
+                expect(self.page.get_by_role('alertdialog')).to_have_count(0)
+
+    def test_close_prompt_keyboard_overlay_and_discard(self):
+        for width in [900, 480]:
+            with self.subTest(width=width):
+                self.page.set_viewport_size({'width': width, 'height': 700})
+                self.reset_config()
+                self.page.locator('#startWithWindows').check()
+                cancel = self.page.get_by_role('button', name='Cancel', exact=True)
+                cancel.click()
+                dialog = self.expect_close_prompt()
+                keep = dialog.get_by_role('button', name='Keep editing', exact=True)
+                save = dialog.get_by_role('button', name='Save', exact=True)
+                expect(keep).to_be_focused()
+                self.page.keyboard.press('Tab')
+                self.page.keyboard.press('Tab')
+                expect(save).to_be_focused()
+                self.page.keyboard.press('Tab')
+                expect(keep).to_be_focused()
+                self.page.keyboard.press('Shift+Tab')
+                expect(save).to_be_focused()
+                self.assertFalse(self.page.locator('#url').evaluate(
+                    'el => { el.focus(); return document.activeElement === el; }'))
+                self.assertEqual(dialog.evaluate(
+                    'el => getComputedStyle(el.parentElement).backgroundColor'),
+                    'rgba(0, 0, 0, 0.35)')
+                box = dialog.bounding_box()
+                self.assertAlmostEqual(box['x'] + box['width'] / 2, width / 2, delta=1)
+                self.assertAlmostEqual(box['y'] + box['height'] / 2, 350, delta=1)
+                self.page.mouse.click(8, 8)
+                self.expect_close_prompt()
+                expect(save).to_be_focused()
+                self.page.keyboard.press('Escape')
+                expect(dialog).to_have_count(0)
+                expect(cancel).to_be_focused()
+                expect(self.page.locator('#startWithWindows')).to_be_checked()
+                self.page.keyboard.press('Escape')
+                dialog = self.expect_close_prompt()
+                self.page.keyboard.press('Enter')  # Keep editing is the safe default.
+                expect(dialog).to_have_count(0)
+                self.request_native_close()
+                dialog = self.expect_close_prompt()
+                dialog.get_by_role('button', name='Discard', exact=True).click()
+                self.assertEqual(self.close_actions(), [{'action': 'close'}])
+
+    def test_prompt_save_matches_normal_save(self):
+        saved = []
+        for through_prompt in [False, True]:
+            self.reset_config(FULL_CONFIG)
+            self.page.locator('#startWithWindows').check()
+            self.page.locator('#windowTitle').fill('Changed title')
+            self.page.locator('#staticHostMappings').fill(
+                'EXAMPLE.com:127.0.0.2\nexample.com:127.0.0.1\nexample.com:127.0.0.2')
+            scope = self.page
+            if through_prompt:
+                self.request_native_close()
+                scope = self.expect_close_prompt()
+            scope.get_by_role('button', name='Save', exact=True).click()
+            expected = {key: value for key, value in FULL_CONFIG.items()
+                        if key not in ['updateCheckPending', 'updatePromptPending']}
+            expected.update(action='saveSettings', startWithWindows=True,
+                            windowTitle='Changed title',
+                            staticHostMappings='example.com:127.0.0.2,example.com:127.0.0.1')
+            self.assertEqual(self.close_actions(), [expected])
+            saved.append(self.last_message('saveSettings'))
+        self.assertEqual(saved[0], saved[1])
+        # A newly opened configuration uses the saved values as its baseline.
+        self.reset_config(saved[1])
+        self.request_native_close()
+        self.assertEqual(self.close_actions(), [{'action': 'close'}])
+
+    def test_invalid_prompt_save_returns_to_the_invalid_field(self):
+        for field, value, message in [
+            ('url', '', 'URL cannot be empty.'),
+            ('mailtoTargetUrl', 'invalid', 'Enter a valid destination URL.'),
+            ('insecureContentOrigins', 'https://example.com', 'Only http:// origins are allowed: https://example.com'),
+            ('insecureContentOrigins', '', 'Add at least one HTTP origin to allow.'),
+            ('staticHostMappings', 'invalid', 'Use hostname:IP format: invalid'),
+            ('staticHostMappings', '', 'Add at least one hostname and IP address.'),
+        ]:
+            with self.subTest(field=field, value=value):
+                self.reset_config(FULL_CONFIG)
+                self.page.locator('#' + field).fill(value)
+                self.request_native_close()
+                dialog = self.expect_close_prompt()
+                dialog.get_by_role('button', name='Save', exact=True).click()
+                expect(dialog).to_have_count(0)
+                expect(self.page.get_by_text(message, exact=True)).to_be_visible()
+                expect(self.page.locator('#' + field)).to_be_focused()
+                self.assertEqual(self.close_actions(), [])
+
+    def test_unsaved_prompt_takes_priority_over_updates(self):
+        self.page.locator('#debugLog').check()
+        self.request_native_close()
+        self.expect_close_prompt()
+        self.result(automatic=True)
+        dialog = self.expect_close_prompt()
+        dialog.get_by_role('button', name='Keep editing', exact=True).click()
+        update = self.page.get_by_role('alertdialog', name='Update result')
+        expect(update).to_be_visible()
+        self.assertEqual(update.evaluate(
+            'el => getComputedStyle(el.parentElement).backgroundColor'),
+            'rgba(0, 0, 0, 0.35)')
+        self.request_native_close()
+        self.expect_close_prompt()
+        self.page.keyboard.press('Escape')
+        expect(update).to_be_visible()
+        self.page.keyboard.press('Escape')  # An update prompt consumes Escape.
+        expect(update).to_be_visible()
+        update.get_by_role('button', name='Cancel', exact=True).click()
+        expect(self.page.get_by_role('alertdialog')).to_have_count(0)
+        expect(self.page.locator('#debugLog')).to_be_checked()
+        self.assertEqual(self.close_actions(), [])
+
+    def test_update_state_is_not_an_unsaved_setting(self):
+        self.result()
+        self.page.get_by_label('Reopen settings after update').check()
+        self.request_native_close()
+        self.assertEqual(self.close_actions(), [{'action': 'close'}])
+        expect(self.page.get_by_role('alertdialog', name='Unsaved changes')).to_have_count(0)
 
 
 if __name__ == '__main__':

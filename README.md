@@ -39,6 +39,10 @@ Settings available in the Configure dialog. The dialog sizes itself to its
 content, cannot be resized, and has only a Close button; the main window keeps
 its usual title bar buttons and stays freely resizable.
 
+Closing with unsaved changes asks whether to **Save**, **Discard**, or **Keep editing**.
+This applies to Cancel, the Close button, Alt+F4, and Escape. The settings stay
+open behind a dark overlay until you choose; Escape returns to editing.
+
 | Setting | Description |
 |---------|-------------|
 | Window Title | Base title shown with the configured URL hostname when available, plus a loading indicator during navigation |
@@ -296,6 +300,10 @@ On Linux, `python3 -m unittest discover -s tests -p test_update.py -v` runs
 native progress and updater handoff checks using a host C compiler and mocked
 Windows APIs. After building, `python3 -m unittest discover -s tests -p test_update_ui.py -v` exercises the configuration modal with Python Playwright
 and Chromium (set `CHROMIUM_EXECUTABLE` to use a custom browser).
+The UI suite also covers unsaved settings, close routes, save/discard/keep editing,
+validation, keyboard focus, the dark overlay, and overlapping update prompts.
+`python3 -m unittest discover -s tests -p test_config_close.py -v` checks the
+native close gate and save/discard wiring with a host C compiler.
 `python3 -m unittest discover -s tests -p test_fixed_frame.py -v` compiles the
 configuration dialog's fixed-size frame handling against stubbed window calls
 (the Close-only title bar and system menu, edge and corner drags, the Size and

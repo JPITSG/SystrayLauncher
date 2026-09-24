@@ -54,6 +54,7 @@ type InitCallback = (data: InitData) => void;
 let initCallback: InitCallback | null = null;
 let updateResultCallback: ((result: UpdateResult) => void) | null = null;
 let updateProgressCallback: ((progress: UpdateProgress) => void) | null = null;
+let closeRequestedCallback: (() => void) | null = null;
 
 export function onInit(cb: InitCallback) {
   initCallback = cb;
@@ -80,6 +81,17 @@ export function onUpdateResult(cb: (result: UpdateResult) => void) {
   updateResultCallback = cb;
   return () => {
     if (updateResultCallback === cb) updateResultCallback = null;
+  };
+}
+
+(window as unknown as Record<string, unknown>).onCloseRequested = () => {
+  closeRequestedCallback?.();
+};
+
+export function onCloseRequested(cb: () => void) {
+  closeRequestedCallback = cb;
+  return () => {
+    if (closeRequestedCallback === cb) closeRequestedCallback = null;
   };
 }
 

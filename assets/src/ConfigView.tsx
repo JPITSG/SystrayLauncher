@@ -1,9 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import ConfigAlert from "./components/ConfigAlert";
 import {
   type ConfigData,
   type UpdateResult,
   saveSettings,
   closeDialog,
+  onCloseRequested,
   checkForUpdate,
   cancelUpdateCheck,
   configReady,
@@ -267,6 +269,51 @@ export default function ConfigView({
       : null
   );
   const automaticUpdateStarted = useRef(false);
+  const [closePrompt, setClosePrompt] = useState(false);
+  const hasChanges =
+    windowTitle !== config.windowTitle ||
+    url !== config.url ||
+    startMaximized !== (config.startMaximized ?? false) ||
+    returnToTargetOnDoubleClick !== (config.returnToTargetOnDoubleClick ?? true) ||
+    showInTaskbar !== (config.showInTaskbar ?? false) ||
+    handleMailtoLinks !== (config.handleMailtoLinks ?? false) ||
+    mailtoTargetUrl !== (config.mailtoTargetUrl ?? "") ||
+    onHideJs !== config.onHideJs ||
+    onShowJs !== config.onShowJs ||
+    sleepWhenInactive !== (config.sleepWhenInactive ?? false) ||
+    openNewWindowsExternally !== (config.openNewWindowsExternally ?? false) ||
+    allowRunningInsecureContent !== (config.allowRunningInsecureContent ?? false) ||
+    insecureContentOrigins !== (config.insecureContentOrigins ?? "").split(",").join("\n") ||
+    useStaticHostMappings !== (config.useStaticHostMappings ?? false) ||
+    staticHostMappings !== (config.staticHostMappings ?? "").split(",").join("\n") ||
+    staticHostDnsFallback !== (config.staticHostDnsFallback ?? false) ||
+    lockdownHeader !== (config.lockdownHeader ?? false) ||
+    lockdownSecret !== (config.lockdownSecret ?? "") ||
+    startWithWindows !== (config.startWithWindows ?? false) ||
+    autoCheckForUpdates !== (config.autoCheckForUpdates ?? true) ||
+    debugLog !== (config.debugLog ?? false);
+
+  const handleRequestClose = useCallback(() => {
+    if (hasChanges) {
+      setClosePrompt(true);
+    } else {
+      closeDialog();
+    }
+  }, [hasChanges]);
+
+  // Install before configReady, and keep native close requests in sync with edits.
+  useLayoutEffect(() => onCloseRequested(handleRequestClose), [handleRequestClose]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !closePrompt && !updateAlert) {
+        event.preventDefault();
+        handleRequestClose();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [closePrompt, updateAlert, handleRequestClose]);
 
   useEffect(() => {
     const removeResultListener = onUpdateResult((result) => {
@@ -353,10 +400,16 @@ export default function ConfigView({
     setUpdateAlert(null);
   }
 
+  function focusInvalidField(id: string) {
+    setClosePrompt(false);
+    requestAnimationFrame(() => document.getElementById(id)?.focus());
+  }
+
   function handleSave() {
     const trimmedUrl = url.trim();
     if (!trimmedUrl) {
       setUrlError("URL cannot be empty.");
+      focusInvalidField("url");
       return;
     }
 
@@ -368,6 +421,7 @@ export default function ConfigView({
         setMailtoTargetUrlError(
           error instanceof Error ? error.message : "Invalid destination URL."
         );
+        focusInvalidField("mailtoTargetUrl");
         return;
       }
     }
@@ -380,6 +434,7 @@ export default function ConfigView({
         setInsecureOriginsError(
           error instanceof Error ? error.message : "Invalid HTTP origin."
         );
+        focusInvalidField("insecureContentOrigins");
         return;
       }
     } else if (insecureContentOrigins.trim()) {
@@ -392,6 +447,7 @@ export default function ConfigView({
     }
     if (allowRunningInsecureContent && !normalizedInsecureOrigins) {
       setInsecureOriginsError("Add at least one HTTP origin to allow.");
+      focusInvalidField("insecureContentOrigins");
       return;
     }
 
@@ -403,6 +459,7 @@ export default function ConfigView({
         setStaticHostsError(
           error instanceof Error ? error.message : "Invalid static host mapping."
         );
+        focusInvalidField("staticHostMappings");
         return;
       }
     } else if (staticHostMappings.trim()) {
@@ -415,6 +472,7 @@ export default function ConfigView({
     }
     if (useStaticHostMappings && !normalizedStaticHosts) {
       setStaticHostsError("Add at least one hostname and IP address.");
+      focusInvalidField("staticHostMappings");
       return;
     }
 
@@ -450,7 +508,9 @@ export default function ConfigView({
   }
 
   return (
+    <>
     <div
+      inert={closePrompt || !!updateAlert}
       className="p-4 space-y-3"
       style={
         // maxWidth absorbs sub-pixel DPI rounding and scrollbar-width
@@ -920,7 +980,7 @@ export default function ConfigView({
             variant="outline"
             size="sm"
             className="min-w-[5rem]"
-            onClick={closeDialog}
+            onClick={handleRequestClose}
           >
             Cancel
           </Button>
@@ -930,26 +990,35 @@ export default function ConfigView({
         </div>
       </div>
 
-      {updateAlert && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4">
-          <div
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="update-alert-title"
-            aria-describedby="update-alert-message"
-            className="w-full max-w-sm space-y-3 rounded-lg border border-neutral-200 bg-white p-4 shadow-xl"
-          >
-            <div className="space-y-1">
-              <h2 id="update-alert-title" className="text-sm font-semibold">
-                {updateAlert.title}
-              </h2>
-              <p
-                id="update-alert-message"
-                className="text-xs leading-relaxed text-neutral-600"
-              >
-                {updateAlert.message}
-              </p>
-            </div>
+    </div>
+
+      {closePrompt ? (
+        <ConfigAlert
+          key="save"
+          id="save-alert"
+          title="Unsaved changes"
+          message="Save changes before closing?"
+          onEscape={() => setClosePrompt(false)}
+        >
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => setClosePrompt(false)}>
+              Keep editing
+            </Button>
+            <Button variant="outline" size="sm" onClick={closeDialog}>
+              Discard
+            </Button>
+            <Button size="sm" onClick={handleSave}>
+              Save
+            </Button>
+          </div>
+        </ConfigAlert>
+      ) : updateAlert && (
+        <ConfigAlert
+          key="update"
+          id="update-alert"
+          title={updateAlert.title}
+          message={updateAlert.message}
+        >
             {updateAlert.currentVersion && updateAlert.remoteVersion && (
               <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-1 rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs">
                 <dt className="text-neutral-500">Current version</dt>
@@ -1022,9 +1091,8 @@ export default function ConfigView({
                       : "OK"}
               </Button>
             </div>
-          </div>
-        </div>
+        </ConfigAlert>
       )}
-    </div>
+    </>
   );
 }
