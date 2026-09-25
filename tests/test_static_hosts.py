@@ -202,12 +202,18 @@ static void testRouting(void) {
     assert(connectRequest("AB") == 101); assert(m->activeAddress == 1);
     assert(strcmp(m->currentAddress, "3.4.5.6") == 0 && titleChanges == 1);
     assert(connectRequest("B") == 101); // Reuse the working route during cooldown.
+    // A failed working route retries every other address, earlier ones too.
     reachable[1] = FALSE;
-    assert(connectRequest("BC") == 102); assert(m->activeAddress == 2);
-    reachable[2] = FALSE;
-    assert(connectRequest("CD") == 200); assert(m->state == HOST_PROXY_FALLBACK);
+    assert(connectRequest("BAC") == 102); assert(m->activeAddress == 2);
+    reachable[2] = FALSE; reachable[0] = TRUE;
+    assert(connectRequest("CA") == 100); assert(m->activeAddress == 0);
+    reachable[0] = FALSE;
+    assert(connectRequest("ABCD") == 200); assert(m->state == HOST_PROXY_FALLBACK);
     assert(strcmp(m->currentAddress, "9.9.9.9") == 0);
     assert(connectRequest("D") == 200);
+    // A failed DNS route retries the mapped addresses in the same request.
+    dnsWorks = FALSE; reachable[1] = TRUE;
+    assert(connectRequest("DAB") == 101); assert(m->activeAddress == 1);
     resetRoute(); assert(connectRequest("ABCD") == 200);
     resetRoute(); dnsWorks = FALSE; assert(connectRequest("ABCD") == INVALID_SOCKET);
     resetRoute(); g_hostProxyDnsFallback = FALSE; reachable[1] = TRUE;
@@ -217,6 +223,40 @@ static void testRouting(void) {
     reachable[0] = TRUE; assert(connectRequest("A") == 100); // Retry without DNS.
     resetRoute(); g_hostProxyStopping = TRUE;
     assert(connectRequest("") == INVALID_SOCKET); assert(m->state == HOST_PROXY_UNTESTED);
+}
+static void testOutage(void) {
+    configure(L"domain.com:1.2.3.4,domain.com:3.4.5.6,domain.com:[2001:db8::1]");
+    HostProxyMapping *m = &g_hostProxyMappings[0];
+    // The machine wakes with no network while the first address was in use,
+    // then only the second answers. Nothing that failed during the outage
+    // may pin DNS or keep showing the dead address.
+    for (int fallback = 0; fallback <= 1; ++fallback) {
+        resetRoute(); g_hostProxyDnsFallback = fallback; reachable[0] = TRUE;
+        assert(connectRequest("A") == 100 && !titleChanges);
+        reachable[0] = FALSE; dnsWorks = FALSE;
+        const char *everything = fallback ? "ABCD" : "ABC";
+        assert(connectRequest(everything) == INVALID_SOCKET);
+        assert(m->state == HOST_PROXY_UNTESTED && !m->currentAddress[0]);
+        assert(titleChanges == 1);
+        assert(connectRequest(everything) == INVALID_SOCKET && titleChanges == 1);
+        reachable[1] = TRUE;
+        assert(connectRequest("AB") == 101 && m->state == HOST_PROXY_MAPPED_ACTIVE);
+        assert(strcmp(m->currentAddress, "3.4.5.6") == 0 && titleChanges == 2);
+    }
+    // Recovery moves established tunnels off the dead route; the outage itself
+    // does not, since there is nowhere better to go.
+    resetRoute(); reachable[1] = TRUE; assert(connectRequest("AB") == 101);
+    HostProxyTunnel stale = { .client = 9, .upstream = 10, .mappingIndex = 0, .route = 1 };
+    g_hostProxyTunnelList = &stale;
+    reachable[1] = FALSE; dnsWorks = FALSE;
+    assert(connectRequest("BACD") == INVALID_SOCKET); assert(!stale.abortRequested);
+    reachable[2] = TRUE;
+    assert(connectRequest("ABC") == 102); assert(stale.abortRequested && shut == 2);
+    g_hostProxyTunnelList = NULL;
+    // No route known: requests try everything themselves, so nothing probes.
+    resetRoute(); dnsWorks = FALSE; assert(connectRequest("ABCD") == INVALID_SOCKET);
+    ticks += HOST_PROXY_PROBE_INTERVAL_MS; HostProxyExpireFallbackCooldowns();
+    assert(connectRequest("ABCD") == INVALID_SOCKET && !pendingTask);
 }
 static void testProbes(void) {
     configure(L"domain.com:1.2.3.4,domain.com:3.4.5.6,domain.com:[2001:db8::1]");
@@ -250,6 +290,15 @@ static void testProbes(void) {
     ticks += HOST_PROXY_PROBE_INTERVAL_MS; threadFails = TRUE;
     assert(connectRequest("D") == 200); assert(!m->probeInFlight && !pendingTask);
     assert(!g_hostProxyWorkerCount); threadFails = FALSE;
+    // A probe that outlives a total failure still restores the route it found.
+    resetRoute(); reachable[1] = TRUE; assert(connectRequest("AB") == 101);
+    ticks += HOST_PROXY_PROBE_INTERVAL_MS;
+    assert(connectRequest("B") == 101); assert(pendingTask);
+    reachable[1] = FALSE; dnsWorks = FALSE;
+    assert(connectRequest("BACD") == INVALID_SOCKET); assert(m->state == HOST_PROXY_UNTESTED);
+    reachable[0] = TRUE; finishProbe("A");
+    assert(m->state == HOST_PROXY_MAPPED_ACTIVE && m->activeAddress == 0);
+    assert(strcmp(m->currentAddress, "1.2.3.4") == 0);
 }
 static void testStaleAndTunnels(void) {
     configure(L"domain.com:1.2.3.4,domain.com:3.4.5.6,domain.com:[2001:db8::1]");
@@ -258,17 +307,31 @@ static void testStaleAndTunnels(void) {
     ticks += HOST_PROXY_PROBE_INTERVAL_MS;
     assert(connectRequest("B") == 101); assert(pendingTask);
     reachable[1] = FALSE; reachable[2] = TRUE;
-    assert(connectRequest("BC") == 102); // Newer route supersedes pending probe.
+    assert(connectRequest("BAC") == 102); // Newer route supersedes pending probe.
     ULONGLONG generation = m->routeGeneration; reachable[0] = TRUE;
     finishProbe("A"); assert(m->activeAddress == 2 && m->routeGeneration == generation);
-    assert(!HostProxyUpdateRoute(m, generation - 1, 0, "1.2.3.4"));
+    assert(!HostProxyUpdateRoute(m, generation - 1, TRUE, 0, "1.2.3.4"));
     assert(strcmp(m->currentAddress, "2001:db8::1") == 0);
-    HostProxyTunnel other = { .client = 5, .upstream = 6, .mappingIndex = 1 };
-    HostProxyTunnel except = { .client = 3, .upstream = 4, .mappingIndex = 0, .next = &other };
-    HostProxyTunnel old = { .client = 1, .upstream = 2, .mappingIndex = 0, .next = &except };
+    // A stale failure cannot erase a newer route; a current one clears it,
+    // after which any working connection is accepted as fresh evidence.
+    assert(!HostProxyUpdateRoute(m, generation - 1, FALSE, 0, ""));
+    assert(m->state == HOST_PROXY_MAPPED_ACTIVE && m->currentAddress[0]);
+    titleChanges = 0;
+    assert(!HostProxyUpdateRoute(m, generation, FALSE, 0, ""));
+    assert(m->state == HOST_PROXY_UNTESTED && !m->currentAddress[0] && titleChanges == 1);
+    assert(HostProxyUpdateRoute(m, generation - 1, TRUE, 1, "3.4.5.6"));
+    assert(m->activeAddress == 1 && titleChanges == 2);
+    // Only established tunnels of this host on another route are moved.
+    HostProxyTunnel connecting = { .client = 7, .upstream = INVALID_SOCKET, .mappingIndex = 0 };
+    HostProxyTunnel other = { .client = 5, .upstream = 6, .mappingIndex = 1, .next = &connecting };
+    HostProxyTunnel current = { .client = 3, .upstream = 4, .mappingIndex = 0, .route = 1,
+                                .next = &other };
+    HostProxyTunnel old = { .client = 1, .upstream = 2, .mappingIndex = 0, .route = 2,
+                            .next = &current };
     g_hostProxyTunnelList = &old;
-    CloseHostTunnelsForMapping(0, &except);
-    assert(old.abortRequested && !except.abortRequested && !other.abortRequested && shut == 2);
+    CloseHostTunnelsForMapping(0, 1);
+    assert(old.abortRequested && !current.abortRequested && !other.abortRequested);
+    assert(!connecting.abortRequested && shut == 2);
     g_hostProxyTunnelList = NULL;
 }
 static void testBrowserRouting(void) {
@@ -297,6 +360,7 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     if (!strcmp(argv[1], "parser")) testParser();
     else if (!strcmp(argv[1], "routing")) testRouting();
+    else if (!strcmp(argv[1], "outage")) testOutage();
     else if (!strcmp(argv[1], "probes")) testProbes();
     else if (!strcmp(argv[1], "stale")) testStaleAndTunnels();
     else if (!strcmp(argv[1], "browser")) testBrowserRouting();
@@ -317,6 +381,9 @@ int main(int argc, char **argv) {
 
     def test_ordered_connections_and_optional_dns(self):
         subprocess.run([self.binary, 'routing'], check=True)
+
+    def test_outage_keeps_no_route_and_recovers_on_next_request(self):
+        subprocess.run([self.binary, 'outage'], check=True)
 
     def test_recovery_probes_cooldown_and_resume(self):
         subprocess.run([self.binary, 'probes'], check=True)

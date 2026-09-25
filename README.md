@@ -17,6 +17,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 - **Preloaded on Startup** - The page is loaded into the WebView at launch so it is ready the moment you open the window
 - **Hide Grace Period** - Re-opening within 60 seconds of hiding returns exactly where you left off; after that the page resets to the configured URL in the background, so the next open starts fresh with no visible reload
 - **Self-Healing Container** - Checks for a frame after opening or waking, repairs composition after sleep/hibernate, and rebuilds an unresponsive foreground container after a bounded recovery attempt
+- **Reconnect Retry** - A page that failed to load for lack of a connection loads again when Windows reports a network change or the window returns to the screen, without connectivity polling
 - **Optional CPU Saving** - Opt-in "sleep when inactive" suspends the web container while hidden, minimized, or fully covered. Partial exposure keeps it awake; Windows events detect uncovering without idle visibility polling. Tray hover prewarms a hidden page.
 - **Registry Storage** - Settings persist in Windows Registry (`HKCU\SOFTWARE\JPIT\SystrayLauncher`)
 - **Single Instance** - Only one instance can run at a time
@@ -126,6 +127,18 @@ A plain-colored page alone never causes a reload.
 See the [sleep audit and Windows validation matrix](docs/sleep-audit.md) for
 failure cases, automated coverage, and runtime validation limits.
 
+## Network Changes
+
+When a page fails to load because the server could not be reached, for
+example after waking with no network, it is loaded again when Windows reports
+a routing change, such as joining a network or connecting a VPN, and whenever
+the window returns to the screen. Routing changes are acted on once they have
+been quiet for 1.5 seconds, so the burst from a single connection produces one
+retry. A hidden page retries in the background and then goes back to sleep.
+The retry requests the failed address again rather than resubmitting a form.
+Certificate, sign-in and ordinary server error pages are left alone, and
+nothing polls for connectivity.
+
 ## Static Host Mappings
 
 When **Resolve listed hostnames to static IP addresses** is enabled, the main
@@ -161,7 +174,8 @@ for different hostnames are interleaved; identical mappings are deduplicated.
 When the configured URL's hostname is one of the mapped entries, the main
 window title shows the address currently used for it after the hostname, for
 example `device.local (192.168.1.20)`. With multiple addresses or DNS fallback,
-this switches live to the address actually used as the route changes.
+this switches live to the address actually used as the route changes, and
+shows `unreachable` while no configured route answers.
 
 This feature uses a Chromium browser switch rather than a stable WebView2 DNS
 API. Microsoft documents browser flags as development-oriented and not
@@ -178,14 +192,17 @@ for a nonresponsive proxy only when DNS fallback is checked. The proxy gives
 each mapped address an 800 ms TCP connection timeout before trying the next.
 TLS certificate errors and HTTP errors do not trigger address failover.
 
-The first reachable address is reused until a connection fails, at which point
-the remaining addresses are tried in order within the same request. While
+The first reachable address is reused until a connection to it fails. The
+same request then tries every other address in order, including earlier ones
+because the network may have changed, and DNS last if it is enabled. While
 using a later address or DNS, earlier addresses are probed in order at most
 once per minute, triggered by traffic, and immediately after resume from
-sleep. Probes do not delay requests on the current route; when a preferred
-address recovers, existing tunnels are closed so new connections return to
-it. If DNS fallback is off and no address works, the next request retries
-the full list. This suits mappings reachable only from certain networks.
+sleep or a network change. Probes do not delay requests on the current route;
+when a preferred address recovers, established tunnels on other routes are
+closed so new connections move to it. If nothing answers, for example while
+the machine is offline, no route is remembered: the next request tries the
+full list again, then DNS if enabled. This suits mappings reachable only from
+certain networks.
 Requests for hostnames that are not listed are refused by the proxy, HTTPS certificates
 are still validated against the hostname exactly as above, and if the proxy
 cannot start the launcher falls back to strict resolver rules using only the

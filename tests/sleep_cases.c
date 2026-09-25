@@ -248,11 +248,85 @@ static void health(void) {
     ArmMainHealthCheck(); expire_timer(ID_TIMER_HEALTH_CHECK);
     assert(rebuilds==1 && kicks==2); // Non-foreground frame throttling is not a dead renderer.
 }
+static void load_fails_again(void) {
+    // Production's completion keeps g_mainLoadFailed set for another failure.
+    g_mainNavigationLoading=FALSE; OnMainNavigationCompleted();
+    expire_timer(ID_TIMER_WEBVIEW_PRELOAD);
+}
+static void retry(void) {
+    init(); foreground=g_hwnd;
+    assert(IsConnectivityLoadFailure(COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN,0));
+    assert(IsConnectivityLoadFailure(COREWEBVIEW2_WEB_ERROR_STATUS_DISCONNECTED,0));
+    assert(IsConnectivityLoadFailure(COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN,502));
+    assert(!IsConnectivityLoadFailure(COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN,404));
+    assert(!IsConnectivityLoadFailure(COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN,200));
+    assert(!IsConnectivityLoadFailure(COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_IS_INVALID,0));
+    assert(!IsConnectivityLoadFailure(COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED,0));
+
+    // A burst of route changes queues one message and parameter refreshes
+    // none; every message restarts the one-shot quiet period.
+    unsigned before=posts, sets=timerSets;
+    OnNetworkRouteChange(NULL,NULL,MibParameterNotification); assert(posts==before);
+    for (int i=0;i<1000;++i) OnNetworkRouteChange(NULL,NULL,MibAddInstance);
+    assert(posts==before+1 && lastPost==WM_APP_NETWORK_CHANGED);
+    network_message();
+    assert(!g_networkChangePosted && timers[ID_TIMER_NETWORK_SETTLE]==1500 && timerSets==sets+1);
+    OnNetworkRouteChange(NULL,NULL,MibDeleteInstance); assert(posts==before+2);
+    network_message(); assert(timerSets==sets+2 && !cooldownExpiries && !navigations);
+
+    // Nothing failed: a network change only lets the proxy re-probe.
+    expire_timer(ID_TIMER_NETWORK_SETTLE); assert(!timers[ID_TIMER_NETWORK_SETTLE]);
+    assert(cooldownExpiries==1 && !navigations);
+    UpdateJsVisibilityState(g_hwnd); assert(!navigations);
+
+    // A failed page is fetched again from the URL it failed on, not reloaded
+    // or sent home, and a load in progress is never restarted.
+    wcscpy(currentUrl,L"https://example.com/deep"); g_mainLoadFailed=TRUE;
+    fire_timer(ID_TIMER_NETWORK_SETTLE);
+    assert(navigations==1 && g_mainNavigationLoading && rendered);
+    assert(!wcscmp(currentUrl,L"https://example.com/deep"));
+    fire_timer(ID_TIMER_NETWORK_SETTLE); UpdateJsVisibilityState(g_hwnd);
+    assert(navigations==1);
+
+    // Failing again, it waits for a trigger: staying on screen is not one,
+    // returning to it is.
+    load_fails_again();
+    UpdateJsVisibilityState(g_hwnd); assert(navigations==1);
+    foreground=NULL; UpdateJsVisibilityState(g_hwnd);
+    assert(g_jsVisibility==JS_VISIBILITY_HIDDEN && navigations==1);
+    finish_suspend(pendingCount-1,S_OK,TRUE); assert(g_webViewSuspended);
+    foreground=g_hwnd; UpdateJsVisibilityState(g_hwnd);
+    assert(navigations==2 && g_mainNavigationLoading && !g_webViewSuspended);
+
+    // Hidden and asleep: a network change retries in the background, and a
+    // page that then loads settles back to sleep with nothing left to retry.
+    load_fails_again();
+    foreground=NULL; UpdateJsVisibilityState(g_hwnd);
+    finish_suspend(pendingCount-1,S_OK,TRUE); assert(g_webViewSuspended);
+    fire_timer(ID_TIMER_NETWORK_SETTLE);
+    assert(navigations==3 && rendered && !g_webViewSuspended);
+    g_mainLoadFailed=FALSE; load_fails_again();
+    assert(!rendered && g_webViewSuspendPending);
+    fire_timer(ID_TIMER_NETWORK_SETTLE); assert(navigations==3);
+
+    // Home over an error page for the target itself loads it again, once.
+    wcscpy(currentUrl,g_initialUrl); g_mainLoadFailed=TRUE;
+    ResetTargetPageIfNeeded(); assert(navigations==4 && g_mainNavigationLoading);
+    ResetTargetPageIfNeeded(); assert(navigations==4);
+    g_mainNavigationLoading=FALSE; g_mainLoadFailed=FALSE;
+    ResetTargetPageIfNeeded(); assert(navigations==4);
+
+    // An unreadable URL falls back to the configured target.
+    g_mainNavigationLoading=FALSE; g_mainLoadFailed=TRUE; sourceFails=TRUE;
+    fire_timer(ID_TIMER_NETWORK_SETTLE); assert(targetReloads==1 && navigations==4);
+    sourceFails=FALSE;
+}
 int main(int argc, char **argv) {
     assert(argc==2);
     struct { const char *name; void (*fn)(void); } cases[]={
         {"coverage",coverage},{"geometry",geometry},{"events",events},{"lifecycle",lifecycle},
-        {"callbacks",callbacks},{"navigation",navigation},{"recovery",recovery},{"health",health}
+        {"callbacks",callbacks},{"navigation",navigation},{"recovery",recovery},{"health",health},
+        {"retry",retry}
     };
     BOOL found=FALSE;
     for (size_t i=0;i<sizeof(cases)/sizeof(cases[0]);++i) if (!strcmp(argv[1],cases[i].name)) {

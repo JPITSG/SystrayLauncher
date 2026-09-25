@@ -51,6 +51,7 @@ class SleepTests(unittest.TestCase):
             'UpdateJsVisibilityState', 'ResetTargetPageIfNeeded',
             'ResetTargetPageInBackground', 'SendMainFrameProbe',
             'StopMainHealthCheck', 'ArmMainHealthCheck', 'CheckMainWebViewHealth',
+            'RetryFailedMainLoad', 'IsConnectivityLoadFailure', 'OnNetworkRouteChange',
         ]
         definitions = [function(name) for name in names]
         declarations = '\n'.join(f[:f.index('{')].strip() + ';' for f in definitions)
@@ -61,7 +62,8 @@ class SleepTests(unittest.TestCase):
                               if re.match(r'#define (ID_TIMER_|VISIBILITY_|WEBVIEW_PRE|'
                                           r'WEBVIEW_RESUME|RESUME_FAILURE|MAX_VISIBILITY|'
                                           r'HEALTH_CHECK_TIMEOUT|WM_APP_WEBVIEW_RECREATE|'
-                                          r'WM_APP_VISIBILITY_WAKE)', line))
+                                          r'WM_APP_VISIBILITY_WAKE|WM_APP_NETWORK_CHANGED|'
+                                          r'NETWORK_CHANGE_SETTLE)', line))
         globals_ = '\n'.join(line for line in SOURCE.splitlines()
                              if re.match(r'static (?:volatile LONG|UINT64|ULONGLONG|BOOL|int|UINT|RECT) '
                                          r'g_(?:webView(?:Desired|Suspend|Generation|Settle)|'
@@ -70,17 +72,22 @@ class SleepTests(unittest.TestCase):
                                          r'framePongSeen|frameProbeId|health|controller|'
                                          r'visibility(?:Tracking|HooksAvailable|CheckDelay)|'
                                          r'suspendRequestId|livenessRequestId|prewarmLastHoverTick|preloadSettleDeadline|'
-                                         r'mainNavigationLoading|resetUrlOnNextShow|'
-                                         r'webViewPrewarmActive|webViewPingOutstanding)', line))
+                                         r'mainNavigationLoading|mainLoadFailed|resetUrlOnNextShow|'
+                                         r'webViewPrewarmActive|webViewPingOutstanding|'
+                                         r'networkChangePosted)', line))
         timer_ids = ['ID_TIMER_VISIBILITY_CHECK', 'ID_TIMER_WEBVIEW_PREWARM',
                      'ID_TIMER_WEBVIEW_PRELOAD', 'ID_TIMER_WEBVIEW_RESUME_RETRY',
-                     'ID_TIMER_HEALTH_CHECK']
+                     'ID_TIMER_HEALTH_CHECK', 'ID_TIMER_NETWORK_SETTLE']
         branches = []
         for timer in timer_ids:
             start = SOURCE.index('if (wParam == ' + timer + ')', SOURCE.index('LRESULT CALLBACK WindowProc'))
             branches.append(block(start))
         timers = 'static int fire_timer(UINT wParam) { HWND hwnd = g_hwnd;\n' + \
             ' else '.join(branches) + '\nreturn 0; }\n'
+        label = 'case WM_APP_NETWORK_CHANGED:'
+        start = SOURCE.index(label, SOURCE.index('LRESULT CALLBACK WindowProc')) + len(label)
+        timers += ('static int network_message(void) { HWND hwnd = g_hwnd;\n' +
+                   SOURCE[start:SOURCE.index('return 0;', start)] + 'return 0; }\n')
         harness = '\n'.join([
             (ROOT / 'tests/sleep_stubs.h').read_text(), constants, types, globals_,
             declarations, '\n'.join(definitions), timers,
@@ -118,3 +125,23 @@ class SleepTests(unittest.TestCase):
 
     def test_health_checks_wait_for_load_and_preserve_plain_pages(self):
         self.run_case('health')
+
+    def test_failed_loads_retry_on_network_change_and_return_only(self):
+        self.run_case('retry')
+
+    def test_route_notifications_are_released_and_load_outcomes_recorded(self):
+        main = SOURCE[SOURCE.index('int WINAPI WinMain('):]
+        registered = main.index('NotifyRouteChange2(AF_UNSPEC, OnNetworkRouteChange')
+        self.assertLess(registered, main.index('while (GetMessage(&msg'))
+        self.assertGreater(main.index('CancelMibChangeNotify2(g_networkChangeHandle)'),
+                           main.index('while (GetMessage(&msg'))
+        window_proc = SOURCE.index('LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, '
+                                   'WPARAM wParam, LPARAM lParam) {')
+        destroy = SOURCE.index('case WM_DESTROY:', window_proc)
+        self.assertIn('KillTimer(hwnd, ID_TIMER_NETWORK_SETTLE);',
+                      SOURCE[destroy:SOURCE.index('return 0;', destroy)])
+        completed = function('NavCompletedHandler_Invoke')
+        self.assertRegex(completed, r'webErrorStatus != COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED\)'
+                                    r'\s*\{\s*g_mainLoadFailed = !isSuccess &&\s*'
+                                    r'IsConnectivityLoadFailure\(webErrorStatus, httpStatusCode\);')
+        self.assertIn('g_mainLoadFailed = FALSE;', function('HandleUnexpectedBrowserExit'))

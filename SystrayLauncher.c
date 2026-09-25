@@ -9,6 +9,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <windows.h>
 #include <userenv.h>
 #include <stdlib.h>
@@ -158,6 +159,12 @@
 #define WEBVIEW_RESUME_RETRY_MS 1000
 #define RESUME_FAILURE_RECREATE_THRESHOLD 3
 
+// Quiet period after the last route change before acting on it: joining a
+// network or connecting a VPN produces a burst of route changes, and every
+// change restarts the wait, so a noisy route table never becomes periodic work.
+#define ID_TIMER_NETWORK_SETTLE 14
+#define NETWORK_CHANGE_SETTLE_MS 1500
+
 // Rate limit for automatic WebView rebuilds after unexpected browser-process
 // deaths, so a crash-looping runtime cannot spin rebuilds forever. A manual
 // tray Refresh/Open resets the limiter.
@@ -177,6 +184,8 @@
 // used for a mapped hostname changes, so the title can show the new route.
 #define WM_APP_HOST_ROUTE_CHANGED (WM_APP + 5)
 #define WM_APP_VISIBILITY_WAKE (WM_APP + 6)
+// Posted by the route-change callback (see OnNetworkRouteChange).
+#define WM_APP_NETWORK_CHANGED (WM_APP + 7)
 
 // Static host failover (see StartStaticHostProxy). A small loopback
 // forward proxy inside the launcher process; the browser reaches it through
@@ -316,6 +325,12 @@ static ULONGLONG g_rebuildBurstStartTick = 0;
 static LONG g_rebuildBurstCount = 0;
 static BOOL g_mainNavigationLoading = TRUE;
 static UINT64 g_mainNavigationId = 0;
+// The last main-page load failed for lack of a connection and the error page
+// is showing (see IsConnectivityLoadFailure and RetryFailedMainLoad).
+static BOOL g_mainLoadFailed = FALSE;
+// Route-change subscription; its callback only posts WM_APP_NETWORK_CHANGED.
+static HANDLE g_networkChangeHandle = NULL;
+static volatile LONG g_networkChangePosted = FALSE;
 static ULONGLONG g_mainNavigationDeadline = 0;
 static EventRegistrationToken g_browserExitedToken;
 static BOOL g_browserExitedRegistered = FALSE;
@@ -345,9 +360,9 @@ static volatile LONG g_updateProgressPosted = FALSE;
 
 // Static host failover proxy state.
 typedef enum {
-    HOST_PROXY_UNTESTED = 0,   // mapped addresses not yet tried this run
+    HOST_PROXY_UNTESTED = 0,   // no working route known; try every address
     HOST_PROXY_MAPPED_ACTIVE,  // one mapped address answered; keep using it
-    HOST_PROXY_FALLBACK        // all mapped addresses failed; DNS if enabled
+    HOST_PROXY_FALLBACK        // every mapped address failed; DNS answered
 } HostProxyBreakerState;
 
 typedef struct {
@@ -360,12 +375,13 @@ typedef struct {
     HostProxyAddress* addresses; // immutable, in configuration order
     size_t addressCount;
     HostProxyBreakerState state;  // guarded by g_hostProxyLock
-    size_t activeAddress;         // addressCount means no mapped route
+    size_t activeAddress;         // MAPPED_ACTIVE: index; FALLBACK: addressCount
     ULONGLONG routeGeneration;    // rejects stale connection/probe results
     ULONGLONG lastProbeTick;      // last route change or failed recovery probe
     BOOL probeInFlight;           // single-flight guard for side-car probes
     // Address most recently used to reach the host, shown in the window
-    // title; starts as the mapped address. Guarded by g_hostProxyLock.
+    // title; starts as the mapped address and is empty while nothing
+    // answers. Guarded by g_hostProxyLock.
     char currentAddress[64];
 } HostProxyMapping;
 
@@ -379,6 +395,7 @@ typedef struct HostProxyTunnel {
     SOCKET client;
     SOCKET upstream;       // INVALID_SOCKET until connected
     int mappingIndex;      // index into g_hostProxyMappings, -1 before parse
+    size_t route;          // address index, addressCount for DNS; set with upstream
     volatile LONG abortRequested;
     struct HostProxyTunnel* next;
     struct HostProxyTunnel* prev;
@@ -488,6 +505,7 @@ static BOOL SetMainWebViewControllerVisible(BOOL visible);
 static void PrewarmMainWebView(void);
 static void ResetTargetPageIfNeeded(void);
 static void ResetTargetPageInBackground(void);
+static void RetryFailedMainLoad(void);
 static void ArmMainHealthCheck(void);
 static void StopMainHealthCheck(void);
 static void CheckMainWebViewHealth(HWND hwnd);
@@ -1508,6 +1526,7 @@ static BOOL GetStaticHostDisplayAddress(const wchar_t* hostname,
         for (size_t i = 0; i < g_hostProxyMappingCount; i++) {
             if (strcmp(g_hostProxyMappings[i].host, narrowHost) != 0) continue;
             const char* current = g_hostProxyMappings[i].currentAddress;
+            if (!current[0]) current = "unreachable";  // no route answered
             size_t length = strlen(current);
             if (length > 0 && length < addressCch) {
                 for (size_t j = 0; j <= length; j++) {
@@ -4413,8 +4432,10 @@ static wchar_t* JoinBrowserArguments(LPCWSTR first, LPCWSTR second) {
 // is included only when DNS fallback is enabled. Per hostname, try addresses
 // in order and keep the first that answers. Earlier addresses are re-tried
 // at most once per HOST_PROXY_PROBE_INTERVAL_MS via a side-car probe that
-// never delays the request that triggered it. Standard DNS is tried only
-// after every mapped address has failed, and only if explicitly enabled.
+// never delays the request that triggered it, and in-band whenever the
+// working route fails. Standard DNS is tried only after every mapped address
+// has failed, and only if explicitly enabled. When nothing answers, no route
+// is kept: the next request tries every address again.
 
 static BOOL HostProxySendAll(SOCKET s, const char* data, int length) {
     int sent = 0;
@@ -4567,38 +4588,55 @@ static SOCKET HostProxyConnectViaDns(const char* host, unsigned short port,
     return s;
 }
 
-// Force the live tunnels of a mapping off their current path so traffic
-// migrates when the breaker flips. Only shuts the sockets down; the owning
-// connection threads notice, exit and clean up (see HostProxyTunnel).
-static void CloseHostTunnelsForMapping(int mappingIndex, HostProxyTunnel* except) {
+// Move established tunnels off every route except the newly published one
+// so the browser reconnects through it. Tunnels still connecting are left
+// alone: aborting them would fail requests that are about to succeed. Only
+// shuts the sockets down; the owning connection threads notice, exit and
+// clean up (see HostProxyTunnel).
+static void CloseHostTunnelsForMapping(int mappingIndex, size_t route) {
     EnterCriticalSection(&g_hostProxyLock);
     for (HostProxyTunnel* node = g_hostProxyTunnelList; node; node = node->next) {
-        if (node == except || node->mappingIndex != mappingIndex) continue;
+        if (node->mappingIndex != mappingIndex || node->upstream == INVALID_SOCKET ||
+            node->route == route) {
+            continue;
+        }
         InterlockedExchange(&node->abortRequested, TRUE);
         if (node->client != INVALID_SOCKET) shutdown(node->client, SD_BOTH);
-        if (node->upstream != INVALID_SOCKET) shutdown(node->upstream, SD_BOTH);
+        shutdown(node->upstream, SD_BOTH);
     }
     LeaveCriticalSection(&g_hostProxyLock);
 }
 
-// Publish a route only if no newer connection/probe has changed it. Returns
-// whether existing tunnels need to migrate; first use does not evict peers.
+// Publish a connection or probe outcome unless a newer one has already
+// changed the route; while no route is known, any working connection counts
+// as fresh evidence. When nothing answered, no route is kept: the title shows
+// the host as unreachable and the next request tries every address again
+// instead of trusting a path that just failed. Returns whether a new working
+// route was published; tunnels on other routes must then migrate to it.
 static BOOL HostProxyUpdateRoute(HostProxyMapping* mapping, ULONGLONG generation,
-                                 size_t selected, const char* address) {
-    BOOL migrate = FALSE, addressChanged = FALSE;
+                                 BOOL connected, size_t selected, const char* address) {
+    HostProxyBreakerState state = !connected ? HOST_PROXY_UNTESTED
+        : selected < mapping->addressCount ? HOST_PROXY_MAPPED_ACTIVE
+                                           : HOST_PROXY_FALLBACK;
+    if (!connected) {
+        selected = 0;
+        address = "";
+    }
+    BOOL changed = FALSE, addressChanged = FALSE;
     EnterCriticalSection(&g_hostProxyLock);
-    if (mapping->routeGeneration == generation &&
+    if ((mapping->routeGeneration == generation ||
+         (connected && mapping->state == HOST_PROXY_UNTESTED)) &&
         !InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE)) {
-        HostProxyBreakerState state = selected < mapping->addressCount
-            ? HOST_PROXY_MAPPED_ACTIVE : HOST_PROXY_FALLBACK;
         if (mapping->state != state || mapping->activeAddress != selected) {
-            migrate = mapping->state != HOST_PROXY_UNTESTED;
             mapping->state = state;
             mapping->activeAddress = selected;
             mapping->routeGeneration++;
             mapping->lastProbeTick = GetTickCount64();
+            changed = TRUE;
         }
-        if (address && address[0] && strlen(address) < sizeof(mapping->currentAddress) &&
+        // A DNS route whose numeric address could not be read keeps the last.
+        if ((address[0] || !connected) &&
+            strlen(address) < sizeof(mapping->currentAddress) &&
             strcmp(mapping->currentAddress, address) != 0) {
             strcpy(mapping->currentAddress, address);
             addressChanged = TRUE;
@@ -4608,7 +4646,14 @@ static BOOL HostProxyUpdateRoute(HostProxyMapping* mapping, ULONGLONG generation
     if (addressChanged && g_hwnd) {
         PostMessageW(g_hwnd, WM_APP_HOST_ROUTE_CHANGED, 0, 0);
     }
-    return migrate;
+    if (changed && connected) {
+        DebugPrint(L"[INFO] Static host '%S' now uses %S\n", mapping->host,
+                   address[0] ? address : "standard DNS");
+    } else if (changed) {
+        DebugPrint(L"[WARNING] Static host '%S' did not answer on any route\n",
+                   mapping->host);
+    }
+    return changed && connected;
 }
 
 typedef struct {
@@ -4625,11 +4670,9 @@ static DWORD WINAPI HostProxyProbeThread(LPVOID param) {
     SOCKET probe = HostProxyConnectMappedRange(mapping, task->port, 0, task->end, &selected);
     if (probe != INVALID_SOCKET) {
         closesocket(probe);
-        if (HostProxyUpdateRoute(mapping, task->generation, selected,
+        if (HostProxyUpdateRoute(mapping, task->generation, TRUE, selected,
                                   mapping->addresses[selected].address)) {
-            DebugPrint(L"[INFO] Static host '%S' returning to earlier mapped address %S\n",
-                       mapping->host, mapping->addresses[selected].address);
-            CloseHostTunnelsForMapping(task->mappingIndex, NULL);
+            CloseHostTunnelsForMapping(task->mappingIndex, selected);
         }
     }
     EnterCriticalSection(&g_hostProxyLock);
@@ -4682,46 +4725,62 @@ static void HostProxyStartProbeIfDue(int mappingIndex, unsigned short port) {
     }
 }
 
-// Retry the same request through the remaining mapped addresses in order,
-// then (only if enabled) standard DNS. Only TCP connect failures trigger
-// failover; TLS/HTTP errors and normal mid-stream closes must not trip it.
+// Try the working route first: the active mapped address, or DNS when that
+// is what answered last. When it fails, or no route is known, try every
+// mapped address in order - the network may have changed since the earlier
+// ones failed - then (only if enabled) standard DNS, all within this request.
+// Only TCP connect failures trigger failover; TLS/HTTP errors and normal
+// mid-stream closes must not trip it.
 static SOCKET HostProxyEstablishUpstream(HostProxyTunnel* tunnel, int mappingIndex,
                                          unsigned short port) {
     HostProxyMapping* mapping = &g_hostProxyMappings[mappingIndex];
     EnterCriticalSection(&g_hostProxyLock);
     tunnel->mappingIndex = mappingIndex;
     HostProxyBreakerState state = mapping->state;
-    size_t begin = state == HOST_PROXY_MAPPED_ACTIVE ? mapping->activeAddress : 0;
+    size_t active = mapping->activeAddress;
     ULONGLONG generation = mapping->routeGeneration;
     LeaveCriticalSection(&g_hostProxyLock);
 
     HostProxyStartProbeIfDue(mappingIndex, port);
-    size_t selected = mapping->addressCount;
+    size_t count = mapping->addressCount;
+    size_t selected = count;
+    size_t tried = count;  // mapped address already tried as the working route
+    BOOL dnsTried = FALSE;
     char usedAddress[64] = "";
     SOCKET upstream = INVALID_SOCKET;
-    if (state != HOST_PROXY_FALLBACK || !g_hostProxyDnsFallback) {
-        upstream = HostProxyConnectMappedRange(mapping, port, begin,
-                                                mapping->addressCount, &selected);
-        if (upstream != INVALID_SOCKET) {
-            strcpy(usedAddress, mapping->addresses[selected].address);
-        }
+    if (state == HOST_PROXY_MAPPED_ACTIVE) {
+        tried = active;
+        upstream = HostProxyConnectMappedRange(mapping, port, active, active + 1, &selected);
+    } else if (state == HOST_PROXY_FALLBACK && g_hostProxyDnsFallback) {
+        dnsTried = TRUE;
+        upstream = HostProxyConnectViaDns(mapping->host, port,
+                                          usedAddress, sizeof(usedAddress));
     }
-    if (upstream == INVALID_SOCKET && g_hostProxyDnsFallback &&
+    if (upstream == INVALID_SOCKET) {
+        upstream = HostProxyConnectMappedRange(mapping, port, 0, tried, &selected);
+    }
+    if (upstream == INVALID_SOCKET && tried < count) {
+        upstream = HostProxyConnectMappedRange(mapping, port, tried + 1, count, &selected);
+    }
+    if (upstream == INVALID_SOCKET && g_hostProxyDnsFallback && !dnsTried &&
         !InterlockedCompareExchange(&g_hostProxyStopping, FALSE, FALSE)) {
         upstream = HostProxyConnectViaDns(mapping->host, port,
                                           usedAddress, sizeof(usedAddress));
     }
-    if (HostProxyUpdateRoute(mapping, generation, selected, usedAddress)) {
-        DebugPrint(L"[INFO] Static host '%S' switched route (%S)\n", mapping->host,
-                   usedAddress[0] ? usedAddress : "no reachable address");
-        CloseHostTunnelsForMapping(mappingIndex, tunnel);
+    if (upstream != INVALID_SOCKET && selected < count) {
+        strcpy(usedAddress, mapping->addresses[selected].address);
+    }
+    if (HostProxyUpdateRoute(mapping, generation, upstream != INVALID_SOCKET,
+                             selected, usedAddress)) {
+        CloseHostTunnelsForMapping(mappingIndex, selected);
     }
     if (upstream != INVALID_SOCKET) {
         EnterCriticalSection(&g_hostProxyLock);
         tunnel->upstream = upstream;
+        tunnel->route = selected;
         LeaveCriticalSection(&g_hostProxyLock);
-        // An eviction that raced the connect above may have missed the new
-        // socket; make sure it observes the abort immediately.
+        // Shutdown may have flagged this tunnel before its upstream existed;
+        // make sure it observes the abort immediately.
         if (InterlockedCompareExchange(&tunnel->abortRequested, FALSE, FALSE)) {
             shutdown(upstream, SD_BOTH);
         }
@@ -5447,10 +5506,10 @@ static void StopStaticHostProxy(void) {
     g_hostProxyPort = 0;
 }
 
-// Power-resume hook: whatever the breaker believed before a suspend is
-// stale, so let the first request after resume re-probe immediately instead
-// of waiting out a cooldown started before the machine went down. Mappings
-// still on the first mapped address self-correct on their next connect.
+// Power-resume and route-change hook: whatever the breaker believed about
+// earlier addresses is stale, so let the next request re-probe them at once
+// instead of waiting out a cooldown. A route on the first mapped address, or
+// no route at all, is already retried in order by the next request itself.
 static void HostProxyExpireFallbackCooldowns(void) {
     if (g_hostProxyPort == 0) return;
     ULONGLONG now = GetTickCount64();
@@ -5842,6 +5901,7 @@ static void HandleUnexpectedBrowserExit(HWND hwnd) {
     g_webViewSettlePending = FALSE;
     g_mainNavigationLoading = TRUE;
     g_mainNavigationId = 0;
+    g_mainLoadFailed = FALSE;
     InterlockedExchange(&g_webViewDesiredActive, FALSE);
     InterlockedExchange(&g_webViewDesiredVisible, FALSE);
 
@@ -6376,6 +6436,29 @@ ULONG STDMETHODCALLTYPE NavCompletedHandler_Release(
     return refCount;
 }
 
+// Main-page load failures worth retrying once the network may be back:
+// nothing answered at all, or a gateway reported the server unreachable (the
+// static-host proxy's answer for plain-HTTP pages). Certificate,
+// authentication, redirect and cancellation outcomes are not connection
+// problems, and neither is any other page the server actually returned.
+static BOOL IsConnectivityLoadFailure(COREWEBVIEW2_WEB_ERROR_STATUS status,
+                                      int httpStatusCode) {
+    switch (status) {
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_COMMON_NAME_IS_INCORRECT:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_EXPIRED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CLIENT_CERTIFICATE_CONTAINS_ERRORS:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_REVOKED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_IS_INVALID:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_REDIRECT_FAILED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_VALID_AUTHENTICATION_CREDENTIALS_REQUIRED:
+        case COREWEBVIEW2_WEB_ERROR_STATUS_VALID_PROXY_AUTHENTICATION_REQUIRED:
+            return FALSE;
+        default:
+            return httpStatusCode == 0 || httpStatusCode == 502 || httpStatusCode == 504;
+    }
+}
+
 HRESULT STDMETHODCALLTYPE NavCompletedHandler_Invoke(
     ICoreWebView2NavigationCompletedEventHandler* This,
     ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) {
@@ -6386,24 +6469,38 @@ HRESULT STDMETHODCALLTYPE NavCompletedHandler_Invoke(
     BOOL navigationIdKnown =
         args && SUCCEEDED(args->lpVtbl->get_NavigationId(args, &navigationId));
 
-    // Read the outcome for the log. Failures land on an error page (or a
-    // server error body); the completion still ends the loading title either
-    // way, so a settled error is never presented as still loading.
+    // Failures land on an error page (or a server error body); the
+    // completion still ends the loading title either way, so a settled error
+    // is never presented as still loading.
     BOOL isSuccess = TRUE;
     COREWEBVIEW2_WEB_ERROR_STATUS webErrorStatus =
         COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+    int httpStatusCode = 0;
     if (args) {
         args->lpVtbl->get_IsSuccess(args, &isSuccess);
         args->lpVtbl->get_WebErrorStatus(args, &webErrorStatus);
+        ICoreWebView2NavigationCompletedEventArgs2* args2 = NULL;
+        if (!isSuccess &&
+            SUCCEEDED(args->lpVtbl->QueryInterface(
+                args, &IID_ICoreWebView2NavigationCompletedEventArgs2,
+                (void**)&args2)) && args2) {
+            args2->lpVtbl->get_HttpStatusCode(args2, &httpStatusCode);
+            args2->lpVtbl->Release(args2);
+        }
     }
     if (isSuccess) {
         DebugPrint(L"[INFO] Main navigation %I64u completed\n", navigationId);
     } else {
-        DebugPrint(L"[WARNING] Main navigation %I64u failed (WebErrorStatus %d)\n",
-                   navigationId, (int)webErrorStatus);
+        DebugPrint(L"[WARNING] Main navigation %I64u failed (WebErrorStatus %d, HTTP %d)\n",
+                   navigationId, (int)webErrorStatus, httpStatusCode);
     }
 
     if (FinishMainNavigationTitle(g_hwnd, navigationId, navigationIdKnown)) {
+        // A cancelled load leaves the previous page, maybe an error page, up.
+        if (isSuccess || webErrorStatus != COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED) {
+            g_mainLoadFailed = !isSuccess &&
+                IsConnectivityLoadFailure(webErrorStatus, httpStatusCode);
+        }
         OnMainNavigationCompleted();
     }
     return S_OK;
@@ -7561,12 +7658,15 @@ static void UpdateJsVisibilityState(HWND hwnd) {
     }
 
     if (newState == JS_VISIBILITY_SHOWN) {
-        if (g_jsVisibility == JS_VISIBILITY_HIDDEN) {
+        BOOL returning = (g_jsVisibility == JS_VISIBILITY_HIDDEN);
+        if (returning) {
             g_healthKicked = FALSE;
             g_healthHealed = FALSE;
         }
         g_jsVisibility = newState;
         ActivateMainWebView();
+        // Back on screen over a page that failed to load: try it again now.
+        if (returning) RetryFailedMainLoad();
         ArmMainHealthCheck();
     }
 
@@ -7624,7 +7724,9 @@ static void ResetTargetPageIfNeeded(void) {
     LPWSTR currentUrl = NULL;
     HRESULT hr = g_webView->lpVtbl->get_Source(g_webView, &currentUrl);
     if (SUCCEEDED(hr) && currentUrl) {
-        if (wcscmp(currentUrl, g_initialUrl) != 0) {
+        // An error page reports the URL it failed to load; load it again.
+        if (wcscmp(currentUrl, g_initialUrl) != 0 ||
+            (g_mainLoadFailed && !g_mainNavigationLoading)) {
             PrepareMainWebViewNavigation();
             g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
             DebugPrint(L"[INFO] Reset URL to configured target: %s (was: %s)\n",
@@ -7640,6 +7742,26 @@ static void ResetTargetPageIfNeeded(void) {
     g_webView->lpVtbl->Navigate(g_webView, g_initialUrl);
     DebugPrint(L"[INFO] Reset URL to configured target (couldn't check current): %s\n",
                g_initialUrl);
+}
+
+// Retry a main-page load that failed for lack of a connection. An error page
+// reports the URL it failed to load; navigating there (a GET, unlike Reload,
+// which could resubmit a failed form post) requests it again. Runs only when
+// something suggests the connection may be back - a network change, or the
+// window returning to the screen - never on a timer of its own. A retry that
+// fails again waits for the next such event.
+static void RetryFailedMainLoad(void) {
+    if (!g_mainLoadFailed || g_mainNavigationLoading || !IsWebViewReady()) return;
+    LPWSTR url = NULL;
+    if (FAILED(g_webView->lpVtbl->get_Source(g_webView, &url)) || !url || !url[0]) {
+        if (url) CoTaskMemFree(url);
+        ReloadTargetPage();
+        return;
+    }
+    DebugPrint(L"[INFO] Retrying the page that failed to load: %s\n", url);
+    PrepareMainWebViewNavigation();
+    g_webView->lpVtbl->Navigate(g_webView, url);
+    CoTaskMemFree(url);
 }
 
 // Reset the hidden page to the configured URL without showing anything: wake
@@ -8055,6 +8177,21 @@ void ShowContextMenu(HWND hwnd) {
     DestroyMenu(hMenu);
 }
 
+// Route additions and removals are what change reachability: a network
+// joined or left, a VPN connected or dropped. Parameter updates, such as
+// IPv6 route lifetime refreshes, are ignored. Runs on a system thread, so it
+// only queues one message per burst; the UI thread does the rest.
+static VOID WINAPI OnNetworkRouteChange(PVOID context, PMIB_IPFORWARD_ROW2 row,
+                                        MIB_NOTIFICATION_TYPE type) {
+    (void)context;
+    (void)row;
+    if (type != MibAddInstance && type != MibDeleteInstance) return;
+    if (InterlockedExchange(&g_networkChangePosted, TRUE)) return;
+    if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_NETWORK_CHANGED, 0, 0)) {
+        InterlockedExchange(&g_networkChangePosted, FALSE);
+    }
+}
+
 // Window procedure
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
@@ -8225,6 +8362,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 }
             } else if (wParam == ID_TIMER_AUTO_UPDATE) {
                 if (g_config.autoCheckForUpdates) StartUpdateCheck(TRUE);
+            } else if (wParam == ID_TIMER_NETWORK_SETTLE) {
+                KillTimer(hwnd, ID_TIMER_NETWORK_SETTLE);
+                // Routes changed and have settled: earlier static-host
+                // addresses may answer again, and a page that failed to load
+                // may load now.
+                DebugPrint(L"[INFO] Network routes changed\n");
+                HostProxyExpireFallbackCooldowns();
+                RetryFailedMainLoad();
             }
             return 0;
 
@@ -8298,6 +8443,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             KillTimer(hwnd, ID_TIMER_WEBVIEW_LIVENESS);
             KillTimer(hwnd, ID_TIMER_NAV_TITLE_WATCHDOG);
             KillTimer(hwnd, ID_TIMER_AUTO_UPDATE);
+            KillTimer(hwnd, ID_TIMER_NETWORK_SETTLE);
             PostQuitMessage(0);
             return 0;
             
@@ -8311,9 +8457,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
 
         case WM_APP_HOST_ROUTE_CHANGED:
-            // The fallback proxy switched between the mapped address and
-            // DNS resolution for a mapped hostname; refresh the title.
+            // The fallback proxy switched the route for a mapped hostname,
+            // or found none; refresh the title.
             UpdateMainWindowTitle(hwnd);
+            return 0;
+
+        case WM_APP_NETWORK_CHANGED:
+            InterlockedExchange(&g_networkChangePosted, FALSE);
+            // Every change restarts the quiet period (see
+            // NETWORK_CHANGE_SETTLE_MS); nothing runs until it expires.
+            SetTimer(hwnd, ID_TIMER_NETWORK_SETTLE, NETWORK_CHANGE_SETTLE_MS, NULL);
             return 0;
 
         case WM_TRAYICON:
@@ -8687,6 +8840,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     SetTimer(g_hwnd, ID_TIMER_AUTO_UPDATE, AUTO_UPDATE_INTERVAL_MS, NULL);
     if (g_config.autoCheckForUpdates) StartUpdateCheck(TRUE);
+
+    // Network changes re-check static-host routes and retry a page that
+    // failed to load. Windows calls back only when routes change; nothing
+    // polls.
+    if (NotifyRouteChange2(AF_UNSPEC, OnNetworkRouteChange, NULL, FALSE,
+                           &g_networkChangeHandle) != NO_ERROR) {
+        g_networkChangeHandle = NULL;
+        DebugPrint(L"[WARNING] Network change notifications unavailable\n");
+    }
     
     // Message loop
     MSG msg;
@@ -8698,6 +8860,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Cleanup. Close() the controller (as the rebuild paths do) so the
     // browser process shuts down and flushes its profile promptly instead of
     // waiting to notice the host process disappear.
+    if (g_networkChangeHandle) {
+        CancelMibChangeNotify2(g_networkChangeHandle);
+        g_networkChangeHandle = NULL;
+    }
     if (g_hwnd) {
         StopVisibilityTracking(g_hwnd);
         StopMainHealthCheck();
