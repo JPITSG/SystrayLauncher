@@ -5,6 +5,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 ## Features
 
 - **System Tray Integration** - Runs in the system tray; double-click to open and optionally return to the configured URL, close to hide, and optionally minimize to the taskbar
+- Tray icon registration retries while Explorer is starting and recovers automatically after an Explorer restart, preserving the current icon and tooltip; retries stop as soon as registration succeeds
 - **WebView2 Browser** - Uses Microsoft Edge WebView2 for modern web compatibility
 - **Configurable** - Set custom URL, window title, and JavaScript hooks via GUI
 - **JavaScript Hooks** - Execute custom JavaScript when the window is shown or hidden (useful for pausing/resuming web app activity)
@@ -327,6 +328,13 @@ configuration dialog's fixed-size frame handling against stubbed window calls
 Maximize commands, and the track size that also stops Snap) and checks that
 every place the app sizes the dialog pins the size first.
 These checks do not perform a real update or replace Windows runtime testing.
+
+## Tray recovery checks
+
+Tray startup/recovery regression checks: `python3 tests/test_tray_registration.py`.
+These simulate delayed Explorer readiness, taskbar recreation, current icon/tooltip
+recovery, and shutdown with a retry already queued; a live sign-in/restart smoke
+test requires Windows.
 
 ## License
 
