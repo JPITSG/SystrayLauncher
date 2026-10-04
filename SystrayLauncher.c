@@ -3914,6 +3914,46 @@ static BOOL RequestConfigClose(void) {
     return TRUE;
 }
 
+// --- Pointer visibility during modal loops ---------------------------------
+
+// WebView2 places its browser-process windows inside ours, so Windows
+// attaches that process's input thread to our UI thread's input queue - and
+// the ShowCursor display counter belongs to the input queue, not the window.
+// Chromium's own "hide pointer while typing" lowers that shared counter with
+// ShowCursor(FALSE) and raises it again only when one of its windows sees a
+// real mouse move. A modal loop on our thread (the system menu from
+// Alt+Space, the tray menu, a title-bar drag) takes the mouse, so Chromium
+// never sees that move and the pointer stays invisible over our windows,
+// including the menu itself. Make the counter visible for the length of the
+// loop and give back exactly what was raised when it ends, so Chromium's own
+// hide/show bookkeeping stays balanced. UI thread only: ShowCursor acts on
+// the calling thread's queue, which is the one shared with WebView2.
+#define MODAL_CURSOR_MAX_RAISES 16
+static int g_modalCursorRaises = 0;  // ShowCursor(TRUE) calls still owed back
+
+static void ModalLoopCursorBegin(void) {
+    // Without a mouse the counter rests at -1 by design.
+    if (g_modalCursorRaises > 0 || !GetSystemMetrics(SM_MOUSEPRESENT)) return;
+    int count = ShowCursor(TRUE);
+    if (count > 0) {
+        ShowCursor(FALSE);  // The pointer was already visible; owe nothing.
+        return;
+    }
+    int raises = 1;
+    while (count < 0 && raises < MODAL_CURSOR_MAX_RAISES) {
+        count = ShowCursor(TRUE);
+        raises++;
+    }
+    g_modalCursorRaises = raises;
+}
+
+static void ModalLoopCursorEnd(void) {
+    while (g_modalCursorRaises > 0) {
+        ShowCursor(FALSE);
+        g_modalCursorRaises--;
+    }
+}
+
 // Config dialog window procedure
 static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     LRESULT frameResult;
@@ -3969,6 +4009,17 @@ static LRESULT CALLBACK CfgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 // Otherwise keep waiting: the periodic timer fires again.
                 return 0;
             }
+            break;
+
+        // See ModalLoopCursorBegin; the loops still run as usual.
+        case WM_ENTERMENULOOP:
+        case WM_ENTERSIZEMOVE:
+            ModalLoopCursorBegin();
+            break;
+
+        case WM_EXITMENULOOP:
+        case WM_EXITSIZEMOVE:
+            ModalLoopCursorEnd();
             break;
 
         case WM_CLOSE:
@@ -8481,6 +8532,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
             return TRUE;
             
+        // System menu, tray menu (TrackPopupMenu is owned by this window)
+        // and move/size loops: see ModalLoopCursorBegin. Not swallowed.
+        case WM_ENTERMENULOOP:
+        case WM_ENTERSIZEMOVE:
+            ModalLoopCursorBegin();
+            break;
+
+        case WM_EXITMENULOOP:
+        case WM_EXITSIZEMOVE:
+            ModalLoopCursorEnd();
+            break;
+
         case WM_SYSCOMMAND:
             if ((wParam & 0xFFF0) == SC_MINIMIZE) {
                 if (!g_config.showInTaskbar) {
