@@ -862,12 +862,12 @@ export default function ConfigView({
         />
         <div className="space-y-0.5">
           <Label htmlFor="openNewWindowsExternally" className="cursor-pointer">
-            Open new windows in the default browser
+            Open new-tab links in the default browser
           </Label>
           <p className="text-neutral-500 text-[11px] leading-snug">
-            Links that would open a new window or tab launch in your system
-            browser instead of a WebView2 popup. Popups that need to talk back
-            to the page (some login flows) may not work while this is on.
+            When enabled, links that request a new tab open in your system
+            browser. When disabled, they open in WebView2. Popup windows
+            always stay in WebView2.
           </p>
         </div>
       </div>

@@ -9,7 +9,7 @@ A lightweight Windows system tray application that hosts a WebView2 browser wind
 - **WebView2 Browser** - Uses Microsoft Edge WebView2 for modern web compatibility
 - **Configurable** - Set custom URL, window title, and JavaScript hooks via GUI
 - **JavaScript Hooks** - Execute custom JavaScript when the window is shown or hidden (useful for pausing/resuming web app activity)
-- **External Link Handling** - Optionally open new windows/tabs (`target="_blank"`, `window.open`) in the system default browser instead of a WebView2 popup
+- **External Link Handling** - Optionally open new-tab links (`target="_blank"`, `window.open` without popup features) in the system default browser; popup windows always stay in WebView2
 - **Email Link Routing** - Optionally register as a `mailto:` handler and route email links to a configured page in the main window
 - **Static Host Mappings** - Optionally resolve listed hostnames to configured IP addresses inside the embedded browser without changing system DNS
 - **Optional Mixed Content** - Explicitly allow an HTTPS page to load HTTP content from configured legacy origins
@@ -58,11 +58,19 @@ open behind a dark overlay until you choose; Escape returns to editing.
 | Resolve listed hostnames to static IP addresses | Bypasses normal DNS for explicitly listed hostnames inside the main web container. Enter one `hostname:IP` mapping per line (for example, `device.local:192.168.1.20`). The option is disabled by default and restarts the launcher when changed. |
 | Allow listed HTTP origins on HTTPS pages | Lets an HTTPS page embed content from explicitly listed HTTP origins. Enter one origin per line (for example, `http://device.local:8080`). The option is disabled by default and restarts the launcher when changed. |
 | Send X-Lockdown header | Adds an `X-Lockdown` header to every request the embedded browser makes: the request's own User-Agent encrypted with a key derived from the current UTC hour and an optional shared secret (see [Lockdown Header](#lockdown-header)). Toggling applies immediately. Disabled by default. |
-| Open new windows in the default browser | When enabled, links that would open a new window or tab launch in the system default browser instead of a WebView2 popup. Only `http(s)` links are handed to the browser. Popups that must script back to the opening page (some login flows) may not work while enabled. Disabled by default. |
+| Open new-tab links in the default browser | Controls ordinary new-tab requests from the main page, including `target="_blank"` links and `window.open(url)` without popup features. When enabled, their `http(s)` URLs open in the system default browser; when disabled, they open in WebView2. Popup windows always stay in WebView2 regardless of this setting. Disabled by default. |
 | Sleep web container when inactive | Suspends the WebView while hidden, minimized, or fully covered, and wakes it on exposure or tray-icon hover. Partially visible windows stay awake. The page is always preloaded at startup. Disabled by default. |
 | Start with Windows | Launches in the tray when you sign in to Windows by adding a per-user `SystrayLauncher` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; no administrator rights are needed. An entry disabled in Task Manager's startup apps shows as off, and turning the option on re-enables it. Disabled by default. |
 | Automatically check for updates | Checks at startup, whenever Configure opens, and every 60 minutes. A newer build opens Configure and its update prompt. Enabled by default. |
 | Enable debug logging | Appends timestamped diagnostic events (recovery attempts, web view rebuilds, power transitions) to `%LOCALAPPDATA%\SystrayLauncher\debug.log` (rotated at ~1 MB). Useful when reporting issues. Disabled by default. |
+
+WebView2's window features distinguish popup requests from ordinary new-tab
+requests. For example, `window.open(url, "_blank", "popup,width=600,height=500")`
+always stays in WebView2, while `window.open(url, "_blank")` follows the checkbox.
+Blank windows such as `about:blank` also stay in WebView2 so scripts can populate
+them. If window features cannot be read, the request stays in WebView2. This
+routing applies to the main page; WebView2 manages links inside its automatic
+popup windows itself.
 
 The footer displays the application and WebView2 runtime versions together as
 `v<application version> / <WebView2 version>`.

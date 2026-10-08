@@ -1679,7 +1679,7 @@ static void ApplyConfiguration(void) {
     InterlockedExchange(&g_sleepWhenInactive, g_config.sleepWhenInactive ? TRUE : FALSE);
     if (g_hwnd) StartVisibilityTracking(g_hwnd);
 
-    // Sync the new-window handling setting (read live by the handler, so a
+    // Sync the new-tab link setting (read live by the handler, so a
     // toggle applies without restarting the WebView)
     InterlockedExchange(&g_openNewWindowsExternally, g_config.openNewWindowsExternally ? TRUE : FALSE);
 
@@ -6592,12 +6592,12 @@ static void RegisterMainNavigationCompletedHandler(ICoreWebView2* webview2) {
     handler->lpVtbl->Release((ICoreWebView2NavigationCompletedEventHandler*)handler);
 }
 
-// New-window requests (target="_blank", window.open, "open in new tab"):
-// when the setting is enabled, suppress the default WebView2 popup and hand
-// the URL to the system default browser instead. Only http(s) URLs are passed
-// to the shell so a page cannot make the app launch other schemes. Requests
-// without a usable URL (e.g. about:blank popups that get scripted afterwards)
-// fall through to the default popup, where such flows still work.
+// Popup requests always stay in WebView2 so the opening page can use them.
+// The setting only redirects ordinary new-tab requests (target="_blank",
+// window.open without popup features, "open in new tab") to the default
+// browser. Only http(s) URLs are passed to the shell. Requests without a
+// usable URL (e.g. about:blank windows that get scripted afterwards) or
+// readable window features fall through to WebView2.
 typedef struct {
     ICoreWebView2NewWindowRequestedEventHandlerVtbl* lpVtbl;
     LONG refCount;
@@ -6634,6 +6634,23 @@ static HRESULT STDMETHODCALLTYPE NewWindowHandler_Invoke(
     (void)This; (void)sender;
 
     if (InterlockedCompareExchange(&g_openNewWindowsExternally, TRUE, TRUE) != TRUE) {
+        return S_OK;
+    }
+
+    // Since runtime 98, the display flags reflect the browser's popup
+    // classification: all false for popups, all true for ordinary windows.
+    // This also covers explicit "popup" features without a size or position.
+    // If classification fails, keep the request in WebView2.
+    ICoreWebView2WindowFeatures* features = NULL;
+    HRESULT hr = args->lpVtbl->get_WindowFeatures(args, &features);
+    if (FAILED(hr) || !features) {
+        if (features) features->lpVtbl->Release(features);
+        return S_OK;
+    }
+    BOOL shouldDisplayToolbar = FALSE;
+    hr = features->lpVtbl->get_ShouldDisplayToolbar(features, &shouldDisplayToolbar);
+    features->lpVtbl->Release(features);
+    if (FAILED(hr) || !shouldDisplayToolbar) {
         return S_OK;
     }
 
